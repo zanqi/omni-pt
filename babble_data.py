@@ -4,10 +4,17 @@ Build babble-noise slurp dataset for conversational-repair training.
 Babble is mixed from BABBLE_SPEAKERS utterances at a randomly
 sampled SNR -- "clean" or uniform in [0, 20] dB.
 
-The base model (Qwen2.5-Omni-3B) transcribes it, and an alignment
-judge compares the transcript vs ground-truth sentence:
-  answer: nothing lost and nothing hallucinated
-  repair: an essential detail was lost (deleted or substituted)
+Scheme: For each noisy probe, the omni base model produce an ASR
+transcript and a task response. The LLM  sees (original sentence, 
+transcript, response) and labels the probe:
+- "answer":     every detail needed to perform the task survived the noise;
+                filler only loss
+- "repair":     exactly ONE key piece was lost or misheard;
+                the rest can be trusted
+- "repair_full":    more than one key piece lost, or the transcript
+                    can't be trusted at all.
+
+The same LLM then generates the sft target for each kind.
 
 Probing continues (fresh SNR + fresh babble each draw, up to
 MAX_PROBES) until the utterance produces 1 audio of each kind.
@@ -19,29 +26,25 @@ Contamination guards:
   - babble come from the same split but never include the utterance
 """
 
-import difflib
 import itertools
 import json
 import logging
 import os
 import random
 import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import soundfile as sf
 import torch
 from datasets import Audio, Dataset, DatasetDict, load_dataset
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem import PorterStemmer
 from openai import OpenAI
 from qwen_omni_utils import process_mm_info
 from tqdm import tqdm
 from transformers import (
     Qwen2_5OmniProcessor,
     Qwen2_5OmniThinkerForConditionalGeneration,
-    WhisperTokenizer,
 )
-from collections import Counter
 
 skip = Counter()
 
@@ -60,14 +63,19 @@ def log(*args):
 
 
 AUDIO_SAMPLING_RATE = 16000
-MAX_AUDIO_SECONDS = 30  # TODO: needed?
+
+# defend against single long audio causing oom
+MAX_AUDIO_SECONDS = 30
 
 N_TRAIN_TRIPLETS = 1000
 N_TEST_TRIPLETS = 50
 
 BASE_MODEL_ID = "Qwen/Qwen2.5-Omni-3B"
-OPENAI_MODEL = "gpt-4o"
-REPO_ID = "keylazy/slurp-babble-Qwen2.5-Omni-3B"
+# Classification + Target generation are served by the local vLLM judge 
+# box. Its slurm job records the node it landed on in VLLM_HOST_FILE.
+TARGET_MODEL = "Qwen3.6-35B-A3B-FP8"
+VLLM_HOST_FILE = "/gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt"
+REPO_ID = "keylazy/slurp-babble-Qwen2.5-Omni-3B-v3"
 MASK_DS_ID = "keylazy/slurp-ear-sft"
 OUT_DIR = "babble_audio"
 SEED = 42
@@ -85,60 +93,22 @@ SLOT_SNR = {
     "repair_full": (0.0, 4.0),
 }
 SLOT_WEIGHTS = {"answer": 1, "repair": 2, "repair_full": 2}
-FULL_REPEAT_MIN_LOST = 2
-LOST_FRACTION_FULL = 0.5
 
+CLASSIFY_TEMPERATURE = 0.0
+CLASSIFY_MAX_TOKENS = 4096
+CLASSIFY_WORKERS = 8 # parallel classifier calls to vLLM
 
-nltk.download("stopwords")
-STOPWORDS = set(stopwords.words("english")) - {
-    "am",
-    "pm",
-    "no",
-    "not",
-    "nor",
-    "on",
-    "off",
-    "up",
-    "down",
-    "what",
-    "when",
-    "where",
-    "who",
-    "which",
-    "how",
-    "why",
-    "all",
-    "now",
-    "again",
-}
-STOPWORDS.update(["please"])
-
-
-def _is_content(tok):
-    return tok not in STOPWORDS
-
-
-def _content_words(tokens):
-    return [t for t in tokens if _is_content(t)]
-
-
-def kind_of(lost_spans, untrusted, sentence):
-    if not lost_spans:
-        return None if untrusted else "answer"
-    if len(lost_spans) >= FULL_REPEAT_MIN_LOST:
-        return "repair_full"
-    n_total = len(_content_words(sentence_tokens(sentence)))
-    n_lost = sum(len(_content_words(s.split())) for s in lost_spans)
-    if n_total and n_lost / n_total >= LOST_FRACTION_FULL:
-        return "repair_full"
-    return "repair" if not untrusted else "repair_full"
+RESP_MAX_NEW_TOKENS = 96    # task response from base omni model
 
 
 random.seed(SEED)
 np.random.seed(SEED)
 os.makedirs(OUT_DIR, exist_ok=True)
 
-client = OpenAI()
+with open(VLLM_HOST_FILE) as _f:
+    _vllm_host = _f.read().strip()
+client = OpenAI(base_url=f"http://{_vllm_host}:8000/v1", api_key="EMPTY")
+print(f"target model: {TARGET_MODEL} @ http://{_vllm_host}:8000/v1")
 
 base_processor = Qwen2_5OmniProcessor.from_pretrained(BASE_MODEL_ID)
 base_model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
@@ -149,33 +119,6 @@ base_model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
 ).eval()
 IM_END_ID = base_processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
 print("base models loaded")
-
-
-_wtok = WhisperTokenizer.from_pretrained("openai/whisper-tiny")
-_stem = PorterStemmer().stem
-
-
-def sentence_tokens(sentence):
-    return _wtok.normalize(sentence).split()
-
-
-def _stems(tokens):
-    return {_stem(t) for t in tokens}
-
-
-def lost_content_words(sentence, transcript):
-    heard = _stems(sentence_tokens(transcript))
-    return {
-        w for w in sentence_tokens(sentence) if _stem(w) not in heard and _is_content(w)
-    }
-
-
-def leaks(sentence, transcript, repair_text):
-    """
-    True if the repair text contains the lost words.
-    """
-    rep = _stems(sentence_tokens(repair_text))
-    return bool(_stems(lost_content_words(sentence, transcript)) & rep)
 
 
 # ---
@@ -236,7 +179,7 @@ def synthesize_noisy_audio(clean, pool, snr_db, exclude_slurp_id):
 
 
 # ---
-# base model ASR
+# base model: ASR + task response
 # ---
 
 ASR_SYSTEM_PROMPT = "You are a speech recognition model."
@@ -257,7 +200,8 @@ def _asr_conv(audio):
 
 
 @torch.inference_mode()
-def base_transcribe_batch(audios, max_new_tokens=64):
+def base_transcribe_batch(audios, max_new_tokens=64, temperature=None):
+    """Greedy ASR by default; pass a temperature to sample instead."""
     convs = [_asr_conv(a) for a in audios]
     texts = base_processor.apply_chat_template(
         convs, add_generation_prompt=True, tokenize=False
@@ -274,7 +218,8 @@ def base_transcribe_batch(audios, max_new_tokens=64):
     out = base_model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
-        do_sample=False,
+        do_sample=temperature is not None,
+        temperature=temperature,
         eos_token_id=IM_END_ID,
         pad_token_id=IM_END_ID,
     )
@@ -285,29 +230,36 @@ def base_transcribe_batch(audios, max_new_tokens=64):
 
 
 # ---
-# GPT target generation
+# Target generation (vLLM judge server, OpenAI-compatible API)
 # ---
 
 
 def gpt_json(prompt, temperature, max_tokens):
+    raw = None
     try:
         resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=TARGET_MODEL,
             temperature=temperature,
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
         )
-        raw = resp.choices[0].message.content
+        msg = resp.choices[0].message
+        raw = (msg.content or "").strip()
+        if not raw:
+            # reasoning models may leave the answer in reasoning_content
+            raw = (getattr(msg, "reasoning_content", None) or "").strip()
         return json.loads(raw.replace("```json", "").replace("```", "").strip())
     except Exception as e:
-        log(f"gpt error: {e}")
+        log(f"target-model error: {e}\nraw: {raw}")
         return None
 
 
 def diff(sentence, transcript):
     """
-    Return lost_spans: list[str], new_toks: set[str]
+    Return lost_spans: list[str], new_toks: set[str], span_substs: list[set]
+    (span_substs[i] = content tokens the recognizer swapped in-place for
+    lost_spans[i], e.g. "joe" misheard as "joel"; empty for deletions)
     """
     s_toks = sentence_tokens(sentence)
     t_toks = sentence_tokens(transcript)
@@ -319,23 +271,29 @@ def diff(sentence, transcript):
     raw_spans, new_toks = [], set()
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag in ("delete", "replace"):
-            raw_spans.append([i1, i2])
+            subst = (
+                {w for w in t_toks[j1:j2] if _is_content(w)}
+                if tag == "replace"
+                else set()
+            )
+            raw_spans.append([i1, i2, subst])
         if tag in ("replace", "insert"):
             new_toks.update(w for w in t_toks[j1:j2] if _is_content(w))
     # merge adjacent spans seperated only by matched stopwords
     # (filler bridging: contA, filler, contB -> "contA filler contB")
     merged = []
-    for i1, i2 in raw_spans:
+    for i1, i2, subst in raw_spans:
         if merged and all(not _is_content(t) for t in s_toks[merged[-1][1] : i1]):
             merged[-1][1] = i2
+            merged[-1][2] |= subst
         else:
-            merged.append([i1, i2])
-    lost_spans = [
-        " ".join(s_toks[i1:i2])
-        for i1, i2 in merged
-        if any(_is_content(t) for t in s_toks[i1: i2])
-    ]
-    return lost_spans, new_toks
+            merged.append([i1, i2, subst])
+    lost_spans, span_substs = [], []
+    for i1, i2, subst in merged:
+        if any(_is_content(t) for t in s_toks[i1:i2]):
+            lost_spans.append(" ".join(s_toks[i1:i2]))
+            span_substs.append(subst)
+    return lost_spans, new_toks, span_substs
 
 
 TARGET_PROMPT = """You are writing training targets for a smart voice \
@@ -401,7 +359,9 @@ def generate_targets(sentence, repair_probe, full_probe, retries=3):
 
     answer = None
     for attempt in range(retries):
-        obj = gpt_json(prompt, temperature=0.7, max_tokens=300)
+        # generous budget: the vLLM target model is a reasoning model, and
+        # its thinking tokens count against max_tokens before the JSON appears
+        obj = gpt_json(prompt, temperature=0.7, max_tokens=4096)
         if obj is None:
             time.sleep(2**attempt)
             continue
@@ -417,6 +377,27 @@ def generate_targets(sentence, repair_probe, full_probe, retries=3):
 # ---
 # SNR probing -> judge kind
 # ---
+
+
+def probe_is_stable(audio, sentence, kind, informative_spans):
+    """
+    Guard against borderline audio: re-transcribe with sampling and require
+    the label to survive. 'answer' must stay clean in a majority of draws;
+    a repair kind's lost words must stay lost in EVERY draw — if even one
+    draw recovers a word, a model listening end-to-end could plausibly hear
+    it, and the judge would score its correct answer as hallucination.
+    """
+    transcripts = base_transcribe_batch(
+        [audio] * VERIFY_K, temperature=VERIFY_TEMPERATURE
+    )
+    if kind == "answer":
+        clean = 0
+        for t in transcripts:
+            lost, untrusted, _ = diff(sentence, t)
+            clean += not lost and not untrusted
+        return 2 * clean >= VERIFY_K
+    lost_stems = _span_stems(informative_spans)
+    return all(not (lost_stems & _stems(sentence_tokens(t))) for t in transcripts)
 
 
 def sample_snr(target_slots):
@@ -445,7 +426,7 @@ def make_probe_batch(clean, pool, slurp_id, missing, include_clean):
     return audios, snrs
 
 
-def probe_triplet(clean, pool, slurp_id, sentence):
+def probe_triplet(clean, pool, slurp_id, sentence, entity_stems):
     """
     Return {"answer": ..., "repair": ..., "repair_full": ...}
     or None if the budget ran out.
@@ -466,21 +447,27 @@ def probe_triplet(clean, pool, slurp_id, sentence):
             return None
         transcripts = base_transcribe_batch(audios)
         for snr, noisy, transcript in reversed(list(zip(snrs, audios, transcripts))):
-            lost, untrusted = diff(sentence, transcript)
+            lost, untrusted, substs = diff(sentence, transcript)
             if snr is None and (lost or untrusted):
                 # model can't transcribe clean audio correctly
                 # -> skip bad recording
                 return None
-            kind = kind_of(lost, untrusted, sentence)
+            kind, informative, swapped = kind_of(
+                lost, untrusted, sentence, entity_stems, substs
+            )
             if kind is None:
                 continue
-            if results[kind] is None:
+            if results[kind] is None and probe_is_stable(
+                noisy, sentence, kind, informative
+            ):
                 results[kind] = {
                     "snr_db": snr,
                     "audio": noisy,
                     "transcript": transcript,
-                    "lost": lost,
-                    "untrusted": sorted(untrusted)
+                    "lost": informative,
+                    "lost_raw": lost,
+                    "swapped": swapped,
+                    "untrusted": sorted(untrusted),
                 }
 
     if any(v is None for v in results.values()):
@@ -491,18 +478,6 @@ def probe_triplet(clean, pool, slurp_id, sentence):
 # ---
 # Main triplet-building loop
 # ---
-
-
-def collect_existing_ids(repo_id):
-    ids = set()
-    for split in ("train", "test"):
-        ds = load_dataset(repo_id, split=split, streaming=True)
-        ds = ds.select_columns(["slurp_id"])
-        for r in ds:
-            ids.add(r["slurp_id"])
-
-    return ids
-
 
 def build_triplets(source_split, n_triplets, tag, seen_slurp_ids):
     pool = collect_babble_pool(source_split, BABBLE_POOL_SIZE)
@@ -525,10 +500,22 @@ def build_triplets(source_split, n_triplets, tag, seen_slurp_ids):
             skip["seen/short"] += 1
             continue
 
+        # Stems of all [slot : phrase] entity words tagged in the annotation.
+        entity_stems = set()
+        for _, phrase in re.findall(r"\[(.*?) : (.*?)\]", row["annotation"]):
+            entity_stems.update(
+                _stem(t) for t in sentence_tokens(phrase) if _is_content(t)
+            )
+
+        if not entity_stems:
+            # no [slot : phrase] entities -> no slot-critical loss possible
+            skip["no-entity"] += 1
+            continue
+
         clean = row["audio"]["array"].astype(np.float32)
         clean = clean[: MAX_AUDIO_SECONDS * AUDIO_SAMPLING_RATE]
 
-        triplet = probe_triplet(clean, pool, slurp_id, sentence)
+        triplet = probe_triplet(clean, pool, slurp_id, sentence, entity_stems)
         if triplet is None:
             skip["probe"] += 1
             continue
@@ -560,6 +547,8 @@ def build_triplets(source_split, n_triplets, tag, seen_slurp_ids):
                     "snr_db": probe["snr_db"],
                     "asr_transcript": probe["transcript"],
                     "lost": probe["lost"],
+                    "lost_raw": probe["lost_raw"],
+                    "swapped": probe["swapped"],
                     "untrusted": probe["untrusted"],
                     "slurp_id": slurp_id,
                     "sentence": sentence,
@@ -576,9 +565,16 @@ def build_triplets(source_split, n_triplets, tag, seen_slurp_ids):
 
 
 if __name__ == "__main__":
-    seen = collect_existing_ids(MASK_DS_ID)
-    test_rows = build_triplets("test", N_TEST_TRIPLETS, "test", seen)
-    train_rows = build_triplets("train", N_TRAIN_TRIPLETS, "train", seen)
+
+    seen_ids = set()
+    for split in ("train", "test"):
+        ds = load_dataset(MASK_DS_ID, split=split, streaming=True)
+        ds = ds.select_columns(["slurp_id"])
+        for r in ds:
+            seen_ids.add(r["slurp_id"])
+
+    test_rows = build_triplets("test", N_TEST_TRIPLETS, "test", seen_ids)
+    train_rows = build_triplets("train", N_TRAIN_TRIPLETS, "train", seen_ids)
 
     def to_hf(rows):
         return Dataset.from_list(rows).cast_column(

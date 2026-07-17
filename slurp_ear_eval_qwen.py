@@ -36,6 +36,11 @@ from datasets import load_dataset, Audio
 
 AUDIO_SAMPLING_RATE = 16000
 
+# --answerable-token experiment: models SFT-ed with slurp_sft_qwen25.py
+# --answerable-token emit this literal string on answerable audio; answer rows
+# are then scored by exact match instead of the LLM judge.
+ANSWERABLE_TOKEN = "<|answerable|>"
+
 # Default system prompt from the Qwen2.5-Omni HF page.
 # Qwen3-Omni's HF page says NO system prompt should be set for eval benchmarks,
 # so it is only used for the qwen2.5 family.
@@ -362,6 +367,14 @@ def main():
         help="Which Qwen Omni family to load. 'auto' infers from --model-path.",
     )
     ap.add_argument("--judge-model", default="gpt-4o")
+    ap.add_argument(
+        "--answerable-token",
+        action="store_true",
+        help=(
+            f"Score kind=='answer' rows by exact match against "
+            f"{ANSWERABLE_TOKEN!r} instead of the LLM judge."
+        ),
+    )
     ap.add_argument("--num-rows", type=int, default=100)
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument(
@@ -384,7 +397,8 @@ def main():
     if out_path is None:
         name_src = args.adapter_path or args.model_path
         model_name = name_src.rstrip("/").split("/")[-1]
-        out_path = f"ear_results_{model_name}_slurp.jsonl"
+        suffix = "_anstok" if args.answerable_token else ""
+        out_path = f"ear_results_{model_name}{suffix}_slurp.jsonl"
 
     ds = load_dataset(args.dataset, split=args.split)
 
@@ -411,7 +425,11 @@ def main():
             resp = run_model(model, processor, family, arr, sr, args.max_new_tokens)
 
             if kind == "answer":
-                score, reason = eval_task_competence(judge_fn, sentence, resp)
+                if args.answerable_token:
+                    score = 1.0 if resp.strip() == ANSWERABLE_TOKEN else 0.0
+                    reason = f"exact match vs {ANSWERABLE_TOKEN!r} (no judge)"
+                else:
+                    score, reason = eval_task_competence(judge_fn, sentence, resp)
                 total_c += score
                 n_c += 1
             elif kind == "repair":
@@ -463,6 +481,7 @@ def main():
                     "model": args.model_path,
                     "adapter": args.adapter_path,
                     "model_family": family,
+                    "answerable_token": args.answerable_token,
                     "answer_rows": n_c,
                     "repair_rows": n_r,
                     "C": C,

@@ -21,6 +21,10 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 AUDIO_SAMPLING_RATE = 16000
 MAX_AUDIO_SECONDS = 30
 
+# --answerable-token experiment: answer rows are trained to emit this literal
+# string instead of a natural-language reply (eval side matches it exactly).
+ANSWERABLE_TOKEN = "<|answerable|>"
+
 QWEN25_SYSTEM_PROMPT = "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
 
 TASK_PROMPT = (
@@ -47,17 +51,21 @@ class Qwen2_5OmniForSFT(Qwen2_5OmniForConditionalGeneration):
         return self.thinker(**kwargs)
 
 class SlurpDataset(torch.utils.data.Dataset):
-    def __init__(self, hf_ds) -> None:
+    def __init__(self, hf_ds, answerable_token=False) -> None:
         self.ds = hf_ds
+        self.answerable_token = answerable_token
 
     def __len__(self):
         return len(self.ds)
 
     def __getitem__(self, i) -> Any:
         row = self.ds[i]
+        target = row["target"]
+        if self.answerable_token and row["kind"] == "answer":
+            target = ANSWERABLE_TOKEN
         return {
             "audio": get_audio(row["audio"]),
-            "target": row["target"],
+            "target": target,
             "kind": row["kind"],
         }
 
@@ -248,6 +256,11 @@ def main():
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--grad-accum", type=int, default=1)
     ap.add_argument("--qlora", action="store_true")  # TODO: what?
+    ap.add_argument(
+        "--answerable-token",
+        action="store_true",
+        help=f"Replace the target of kind=='answer' rows with {ANSWERABLE_TOKEN!r}.",
+    )
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--push", action="store_true")
     ap.add_argument("--hub-id", default="keylazy/Qwen2.5-Omni-3B-bab-sft-adapter")
@@ -256,12 +269,14 @@ def main():
 
     print(f"Loading SFT dataset {args.ds_id} ...")
     train_hf = load_ds_split(args.ds_id, args.train_split)
-    train_ds = SlurpDataset(train_hf)
+    train_ds = SlurpDataset(train_hf, answerable_token=args.answerable_token)
+    if args.answerable_token:
+        print(f"answerable-token mode: answer targets -> {ANSWERABLE_TOKEN!r}")
 
     eval_ds = None
     if not args.no_eval and not args.smoke:
         eval_hf = load_ds_split(args.ds_id, args.eval_split)
-        eval_ds = SlurpDataset(eval_hf)
+        eval_ds = SlurpDataset(eval_hf, answerable_token=args.answerable_token)
 
     processor = Qwen2_5OmniProcessor.from_pretrained(args.model_id)
     model = load_model(args.model_id, args.qlora)
