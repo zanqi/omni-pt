@@ -2,7 +2,7 @@
 Build babble-noise slurp dataset for conversational-repair training.
 
 Scheme: For each noisy probe, the omni base model produce an ASR
-transcript and a task response. The LLM  sees (original sentence, 
+transcript and a task response. The LLM  sees (original sentence,
 transcript, response) and labels the probe:
 - "answer":     every detail needed to perform the task survived the noise;
                 filler only loss
@@ -28,14 +28,13 @@ from datasets import Audio, Dataset, DatasetDict, load_dataset
 from openai import OpenAI
 from qwen_omni_utils import process_mm_info
 from tqdm import tqdm
-
 from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
 
 skip = Counter()
 
 
-def _drop(r):
-    return "audio output may not work" not in r.getMessage()
+def _drop(record):
+    return "audio output may not work" not in record.getMessage()
 
 
 root = logging.getLogger()
@@ -55,12 +54,11 @@ MAX_AUDIO_SECONDS = 30
 N_TRAIN_TRIPLETS = 1000
 N_TEST_TRIPLETS = 50
 
-DEFAULT_OMNI_PATH = "Qwen/Qwen2.5-Omni-3B"
 # Classification + Target generation are served by the local vLLM judge
 # box. Its slurm job records the node it landed on in VLLM_HOST_FILE.
 TARGET_MODEL = "Qwen/Qwen3.5-122B-A10B-FP8"
 VLLM_HOST_FILE = "/gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt"
-REPO_TMPL = "keylazy/slurp-babble-{}-v3"
+REPO_TMPL = "keylazy/slurp-babble-{}-v1"
 MASK_DS_ID = "keylazy/slurp-ear-sft"
 OUT_DIR = "babble_audio"
 SEED = 42
@@ -82,10 +80,10 @@ SLOT_WEIGHTS = {"answer": 1, "repair": 2, "repeat": 2}
 CLASSIFY_TEMPERATURE = 0.0
 CLASSIFY_MAX_TOKENS = 1024
 TARGET_MAX_TOKENS = 1024
-CLASSIFY_WORKERS = 8 # parallel classifier calls to vLLM
+CLASSIFY_WORKERS = 8  # parallel classifier calls to vLLM
 
 ASR_MAX_NEW_TOKENS = 64
-RESP_MAX_NEW_TOKENS = 96    # task response from base omni model
+RESP_MAX_NEW_TOKENS = 96  # task response from base omni model
 
 KINDS = ("answer", "repair", "repeat")
 
@@ -106,71 +104,6 @@ base_family = None
 IM_END_ID = None
 
 
-def init_base_model(model_path):
-    global base_model, base_processor, base_family, IM_END_ID
-    base_family = detect_model_family(model_path)
-    base_model, base_processor = load_model(model_path, base_family, thinker_only=True)
-    IM_END_ID = base_processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
-    print("base models loaded")
-
-
-# ---
-# Babble synthesis
-# ---
-
-
-def collect_babble_pool(source_split, size):
-    stream = load_dataset("qmeeus/slurp", split=source_split, streaming=True)
-    stream = stream.cast_column("audio", Audio(sampling_rate=AUDIO_SAMPLING_RATE))
-    max_len = BABBLE_CLIP_MAX_SEC * AUDIO_SAMPLING_RATE
-    pool = []
-    for row in stream:
-        arr = row["audio"]["array"].astype(np.float32)[:max_len]
-        if len(arr) > AUDIO_SAMPLING_RATE:
-            # only add clips longer than 1 sec
-            pool.append((row["slurp_id"], arr))
-        if len(pool) >= size:
-            break
-    log(f"[{source_split}] babble pool: {len(pool)} clips")
-    return pool
-
-
-def make_babble(pool, length, exclude_slurp_id):
-    candidates = [arr for sid, arr in pool if sid != exclude_slurp_id]
-    picks = random.sample(candidates, BABBLE_SPEAKERS)
-    mixed = np.zeros(length, dtype=np.float32)
-    for b in picks:
-        if len(b) < length:
-            b = np.pad(b, (0, length - len(b)), "wrap")
-        else:
-            start = random.randint(0, len(b) - length)
-            b = b[start : start + length]
-        mixed += b
-    return mixed / BABBLE_SPEAKERS
-
-
-def synthesize_noisy_audio(clean, pool, snr_db, exclude_slurp_id):
-    """
-    Mix babble into `clean` at `snr_db`.
-    SNR = 10*log10(clean_power / babble_power)
-      -> target_babble_power = clean_power / 10^(SNR/10)
-      -> amplitude scale = sqrt(target_power / current_power)
-    """
-    babble = make_babble(pool, len(clean), exclude_slurp_id)
-    clean_power = float(np.mean(clean**2))
-    babble_power = float(np.mean(babble**2))
-    if babble_power < 1e-10 or clean_power < 1e-10:
-        return None
-    target_babble_power = clean_power / (10 ** (snr_db / 10))
-    scale = np.sqrt(target_babble_power / babble_power)
-    noisy = clean + scale * babble
-    peak = float(np.max(np.abs(noisy)))
-    if peak > 1.0:
-        # avoid clipping on save; rescaling do not change SNR
-        noisy = noisy / peak
-    return noisy.astype(np.float32)
-
-
 # ---
 # base model: ASR + task response
 # ---
@@ -185,7 +118,8 @@ TASK_PROMPT = (
     "accounts, devices, information, and the internet. Listen to the user's "
     "spoken request. First write 'Heard:' followed by the request exactly as "
     "you heard it, word for word. Then write 'Reply:' followed by your "
-    "response to the request in one short sentence."
+    "response, addressing everything the request asks for as concisely as "
+    "natural."
 )
 
 
@@ -220,7 +154,7 @@ def base_generate_batch(convs, max_new_tokens):
         videos=videos,
         return_tensors="pt",
         padding=True,
-    ).to(base_model.device)
+    ).to(base_model.device, dtype=base_model.dtype)
     out = base_model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
@@ -232,17 +166,6 @@ def base_generate_batch(convs, max_new_tokens):
     return [
         t.strip() for t in base_processor.batch_decode(gen, skip_special_tokens=True)
     ]
-
-
-def base_transcribe_batch(audios, max_new_tokens=ASR_MAX_NEW_TOKENS):
-    sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-    convs = [_conv(a, sysp, ASR_PROMPT) for a in audios]
-    return base_generate_batch(convs, max_new_tokens)
-
-def base_respond_batch(audios, max_new_tokens=RESP_MAX_NEW_TOKENS):
-    sysp = QWEN25_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-    convs = [_conv(a, sysp, TASK_PROMPT) for a in audios]
-    return base_generate_batch(convs, max_new_tokens)
 
 
 # ---
@@ -347,38 +270,39 @@ being misheard as wrong word(s), not deletion. Quote the misheard word(s). \
 Otherwise, it will be empty."""
 
 
-def parse_classifier_resp(obj):
-    if obj is None:
-        return None
-    kind = str(obj.get("kind", "")).strip().lower()
-    if kind not in KINDS:
-        return None
-    missing = [str(s).strip() for s in obj.get("missing", []) if str(s).strip()]
-    misheard = str(obj.get("misheard_as", "")).strip()
-    reason = str(obj.get("reason", "")).strip()
-    if kind == "answer" and missing:
-        return None
-    if kind == "repair" and len(missing) != 1:
-        return None
-    return {"kind": kind, "missing": missing, "misheard_as": misheard, "reason": reason}
-
-
-def classify(sentence, transcript, response, retries=2):
-    prompt = CLASSIFY_PROMPT.format(
-        sentence=sentence, transcript=transcript, response=response
-    )
-    for attempt in range(retries + 1):
-        obj = gpt_json(
-            prompt, temperature=CLASSIFY_TEMPERATURE, max_tokens=CLASSIFY_MAX_TOKENS
-        )
-        label = parse_classifier_resp(obj)
-        if label is not None:
-            return label
-        time.sleep(2**attempt)
-    return None
-
-
 def classify_many(items, workers=CLASSIFY_WORKERS):
+    def classify(sentence, transcript, response, retries=2):
+        prompt = CLASSIFY_PROMPT.format(
+            sentence=sentence, transcript=transcript, response=response
+        )
+        for attempt in range(retries + 1):
+            obj = gpt_json(
+                prompt, temperature=CLASSIFY_TEMPERATURE, max_tokens=CLASSIFY_MAX_TOKENS
+            )
+
+            # parse classifier response
+            if obj is None:
+                return None
+            kind = str(obj.get("kind", "")).strip().lower()
+            if kind not in KINDS:
+                return None
+            missing = [str(s).strip() for s in obj.get("missing", []) if str(s).strip()]
+            misheard = str(obj.get("misheard_as", "")).strip()
+            reason = str(obj.get("reason", "")).strip()
+            if (kind == "answer" and missing) or (
+                kind == "repair" and len(missing) != 1
+            ):
+                time.sleep(2**attempt)
+                continue
+            return {
+                "kind": kind,
+                "missing": missing,
+                "misheard_as": misheard,
+                "reason": reason,
+            }
+
+        return None
+
     with ThreadPoolExecutor(max_workers=workers) as ex:
         return list(ex.map(lambda it: classify(*it), items))
 
@@ -394,16 +318,27 @@ The user's spoken command was:
 "{sentence}"
 
 Return ONLY valid JSON in exactly this shape:
-{{"answer": "<one short sentence>", "repair": "<one short question>", \
+{{"answer": "<a short natural response, covering every part of the request>", \
+"repair": "<one short question>", \
 "repeat": "<one short request>"}}
 
 Rules for "answer": despite background chatter, the full command was heard correctly.
+    - If the command asks for more than one distinct thing (e.g. two \
+questions joined by "and", asked back-to-back, or a request plus a \
+follow-up question), your response must address EVERY part — never answer \
+only the first part and drop the rest.
     - If the request asks for information (time, weather, facts) \
-and you know the answer, use ONE short natural sentence that DIRECTLY answers the question with the correct fact. Otherwise, say you are looking it up, but ground the response in what was heard: refer to the request so it is clear the assistant followed everything.
-    - If the request is a task request, in ONE short natural sentence, \
-confirm the assistant is carrying out the request. Use present or future \
+and you know the answer, answer DIRECTLY with the correct fact(s), using as \
+few natural sentences as it takes to cover every part asked (often one, \
+sometimes two). Otherwise, say you are looking it up, but ground the \
+response in what was heard: refer to each part of the request so it is \
+clear the assistant followed everything.
+    - If the request is a task request, confirm the assistant is carrying \
+out the request in one or two natural sentences. Use present or future \
 tense ("I'm setting...", "I'll remind you...")
     - never claim the action is already done.
+    - Stay natural and concise — don't pad with extra sentences beyond what \
+covering the full request requires.
 
 Rules for "repair": the device heard the command over loud background chatter, \
 and its speech recognition produced:
@@ -443,7 +378,7 @@ def generate_targets(sentence, repair_probe, repeat_probe, retries=3):
     swap_note = ""
     if repair_probe["swapped"]:
         swap_note = (
-            f' Note: in place of the missing piece, the recognizer heard '
+            f" Note: in place of the missing piece, the recognizer heard "
             f'"{repair_probe["swapped"][0]}".'
         )
     prompt = TARGET_PROMPT.format(
@@ -474,41 +409,66 @@ def generate_targets(sentence, repair_probe, repeat_probe, retries=3):
 # ---
 
 
-def sample_snr(target_slots):
-    weights = [SLOT_WEIGHTS[k] for k in target_slots]
-    slot = random.choices(target_slots, weights=weights, k=1)[0]
-    # round to 1 decimal digit
-    return round(random.uniform(*SLOT_SNR[slot]), 1)
+def make_probe_batch(clean, pool, missing):
+    def make_babble(pool, length):
+        picks = random.sample(pool, BABBLE_SPEAKERS)
+        mixed = np.zeros(length, dtype=np.float32)
+        for b in picks:
+            if len(b) < length:
+                b = np.pad(b, (0, length - len(b)), "wrap")
+            else:
+                start = random.randint(0, len(b) - length)
+                b = b[start : start + length]
+            mixed += b
+        return mixed / BABBLE_SPEAKERS
 
-
-def make_probe_batch(clean, pool, slurp_id, missing):
-    """
-    Build 1 batch of probe audios.
-    Returns (audios, snrs) or (None, None) if failed
-    """
     audios, snrs = [], []
     while len(audios) < PROBE_BATCH_SIZE:
-        snr = sample_snr(missing)
-        noisy = synthesize_noisy_audio(clean, pool, snr, slurp_id)
-        if noisy is None:
-            return None, None
+        # sample snr
+        weights = [SLOT_WEIGHTS[k] for k in missing]
+        slot = random.choices(missing, weights=weights, k=1)[0]
+        # round to 1 decimal digit
+        snr = round(random.uniform(*SLOT_SNR[slot]), 1)
+
+        # synthesize noisy audio
+        # SNR = 10*log10(clean_power / babble_power)
+        #   -> target_babble_power = clean_power / 10^(SNR/10)
+        #   -> scale babble = sqrt(target_power / current_power)
+        babble = make_babble(pool, len(clean))
+        clean_power = float(np.mean(clean**2))
+        current_babble_power = float(np.mean(babble**2))
+        target_babble_power = clean_power / (10 ** (snr / 10))
+        scale = np.sqrt(target_babble_power / current_babble_power)
+        noisy = clean + scale * babble
+        peak = float(np.max(np.abs(noisy)))
+        if peak > 1.0:
+            # avoid clipping on save; rescaling do not change SNR
+            noisy = noisy / peak
+        noisy = noisy.astype(np.float32)
+
         audios.append(noisy)
         snrs.append(snr)
     return audios, snrs
 
 
-def probe_triplet(clean, pool, slurp_id, sentence):
-    results = {k: None for k in KINDS}
+def probe_triplet(clean, pool, sentence):
+    results: dict[str, dict | None] = {k: None for k in KINDS}
     for _ in range(MAX_PROBES):
         missing_slots = [k for k, v in results.items() if v is None]
         if not missing_slots:
             break
-        audios, snrs = make_probe_batch(clean, pool, slurp_id, missing_slots)
-        if audios is None:
-            # clean or pool is quiet
-            return None
-        transcripts = base_transcribe_batch(audios)
-        responses = base_respond_batch(audios)
+        audios, snrs = make_probe_batch(clean, pool, missing_slots)
+
+        # get batch omni asr respond
+        sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
+        convs = [_conv(a, sysp, ASR_PROMPT) for a in audios]
+        transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
+
+        # get batch omni assistant respond
+        sysp = QWEN25_SYSTEM_PROMPT if base_family == "qwen2.5" else None
+        convs = [_conv(a, sysp, TASK_PROMPT) for a in audios]
+        responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)
+
         labels = classify_many(
             [(sentence, t, r) for t, r in zip(transcripts, responses)]
         )
@@ -535,12 +495,24 @@ def probe_triplet(clean, pool, slurp_id, sentence):
 
 
 # ---
-# Main triplet-building loop
+# triplet-building loop
 # ---
 
 
 def build_triplets(source_split, n_triplets, tag, seen_slurp_ids):
-    pool = collect_babble_pool(source_split, BABBLE_POOL_SIZE)
+    # collect babble pool
+    stream = load_dataset("qmeeus/slurp", split=source_split, streaming=True)
+    stream = stream.cast_column("audio", Audio(sampling_rate=AUDIO_SAMPLING_RATE))
+    max_len = BABBLE_CLIP_MAX_SEC * AUDIO_SAMPLING_RATE
+    pool = []
+    for row in stream:
+        arr = row["audio"]["array"].astype(np.float32)[:max_len]
+        if len(arr) > AUDIO_SAMPLING_RATE:
+            # only add clips longer than 1 sec
+            pool.append((row["slurp_id"], arr))
+        if len(pool) >= BABBLE_POOL_SIZE:
+            break
+    log(f"[{source_split}] babble pool: {len(pool)} clips")
 
     stream = load_dataset("qmeeus/slurp", split=source_split, streaming=True)
     stream = stream.cast_column("audio", Audio(sampling_rate=AUDIO_SAMPLING_RATE))
@@ -552,7 +524,7 @@ def build_triplets(source_split, n_triplets, tag, seen_slurp_ids):
         if done >= n_triplets:
             break
         scanned += 1
-        pbar.set_postfix(scanned=scanned, **skip, refresh=False)
+        pbar.set_postfix({**skip, "scanned": scanned}, refresh=False)
 
         slurp_id = row["slurp_id"]
         sentence = row["sentence"]
@@ -563,7 +535,9 @@ def build_triplets(source_split, n_triplets, tag, seen_slurp_ids):
         clean = row["audio"]["array"].astype(np.float32)
         clean = clean[: MAX_AUDIO_SECONDS * AUDIO_SAMPLING_RATE]
 
-        triplet = probe_triplet(clean, pool, slurp_id, sentence)
+        triplet = probe_triplet(
+            clean, [arr for sid, arr in pool if sid != slurp_id], sentence
+        )
         if triplet is None:
             skip["probe"] += 1
             continue
@@ -614,12 +588,18 @@ def build_triplets(source_split, n_triplets, tag, seen_slurp_ids):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--omni-path", default=DEFAULT_OMNI_PATH)
+    ap.add_argument("--omni-path", default="Qwen/Qwen2.5-Omni-3B")
     args = ap.parse_args()
 
-    init_base_model(args.omni_path)
-    repo_id = REPO_TMPL.format(args.omni_path.rstrip("/").split("/")[-1])
+    # init base omni model
+    base_family = detect_model_family(args.omni_path)
+    base_model, base_processor = load_model(
+        args.omni_path, base_family, thinker_only=True
+    )
+    IM_END_ID = base_processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
+    print("base models loaded")
 
+    # find used slurp ids to avoid
     seen_ids = set()
     for split in ("train", "test"):
         ds = load_dataset(MASK_DS_ID, split=split, streaming=True)
@@ -630,15 +610,16 @@ if __name__ == "__main__":
     test_rows = build_triplets("test", N_TEST_TRIPLETS, "test", seen_ids)
     train_rows = build_triplets("train", N_TRAIN_TRIPLETS, "train", seen_ids)
 
-    def to_hf(rows):
+    def list2ds(rows):
         return Dataset.from_list(rows).cast_column(
             "audio", Audio(sampling_rate=AUDIO_SAMPLING_RATE)
         )
 
-    DatasetDict({"train": to_hf(train_rows), "test": to_hf(test_rows)}).push_to_hub(
+    # push to hub
+    repo_id = REPO_TMPL.format(args.omni_path.rstrip("/").split("/")[-1])
+    DatasetDict({"train": list2ds(train_rows), "test": list2ds(test_rows)}).push_to_hub(
         repo_id
     )
-
     log(
         f"Pushed {len(train_rows)} train / {len(test_rows)} test rows " f"to {repo_id}."
     )

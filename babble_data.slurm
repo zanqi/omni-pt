@@ -17,7 +17,7 @@
 #SBATCH --output=babble_data_%j.log
 #SBATCH --export=all
 source ~/.bashrc
-conda activate qwen25omni
+conda activate qwen3omni
 # export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # fail fast if the vLLM judge (target-generation) server isn't reachable
@@ -30,6 +30,6 @@ fi
 echo "judge OK at http://${JUDGE_HOST}:8000/v1"
 
 # -u: unbuffered stdout so errors/progress show up in the log immediately
-python -u babble_data.py
+python -u babble_data.py --omni-path Qwen/Qwen3-Omni-30B-A3B-Instruct
 
 # sbatch /gscratch/sciencehub/zanqil/projects/omni-pt/babble_data.slurm

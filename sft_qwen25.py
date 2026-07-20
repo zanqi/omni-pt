@@ -1,5 +1,12 @@
 """
-SFT for Qwen2.5 Omni on the slurp ear dataset (slurp_sft_data.py)
+SFT for Qwen2.5-Omni / Qwen3-Omni on the slurp babble/ear datasets.
+
+Model family (qwen2.5 vs qwen3) is auto-detected from --omni-path (see
+util.detect_model_family); pass --model-family explicitly for fine-tuned
+checkpoint paths whose name doesn't contain either family string. Each
+conda env (qwen25omni / qwen3omni) only ships its own family's transformers
+classes, so those classes are imported lazily once the family is known —
+mirrors babble_data.py's use of util.py.
 """
 
 import argparse
@@ -10,13 +17,9 @@ import torch.nn as nn
 from datasets import Audio, load_dataset
 from qwen_omni_utils import process_mm_info
 import torch.utils.data.dataset
-from transformers import (
-    Qwen2_5OmniForConditionalGeneration,
-    Qwen2_5OmniProcessor,
-    Trainer,
-    TrainingArguments,
-)
+from transformers import Trainer, TrainingArguments
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from util import QWEN25_SYSTEM_PROMPT, detect_model_family
 
 AUDIO_SAMPLING_RATE = 16000
 MAX_AUDIO_SECONDS = 30
@@ -25,12 +28,10 @@ MAX_AUDIO_SECONDS = 30
 # string instead of a natural-language reply (eval side matches it exactly).
 ANSWERABLE_TOKEN = "<|answerable|>"
 
-QWEN25_SYSTEM_PROMPT = "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, capable of perceiving auditory and visual inputs, as well as generating text and speech."
-
 TASK_PROMPT = (
     "You are a smart voice device with full access to the user's apps, "
     "accounts, devices, information, and the internet. Listen to the user's spoken request "
-    "and respond in one short sentence."
+    "and respond naturally and concisely, addressing everything it asks."
 )
 
 
@@ -42,13 +43,6 @@ def get_audio(field):
     arr = arr.numpy().astype("float32")
     return arr[: MAX_AUDIO_SECONDS * AUDIO_SAMPLING_RATE]
 
-class Qwen2_5OmniForSFT(Qwen2_5OmniForConditionalGeneration):
-    """Full Omni model with a trainable forward (delegates to the thinker).
-    Training LoRA on this class saves keys with the `thinker.` prefix,
-    matching what PeftModel.from_pretrained expects at eval time."""
-
-    def forward(self, num_items_in_batch=None, **kwargs):
-        return self.thinker(**kwargs)
 
 class SlurpDataset(torch.utils.data.Dataset):
     def __init__(self, hf_ds, answerable_token=False) -> None:
@@ -79,15 +73,19 @@ def load_ds_split(ds_id, split, limit=None):
 
 
 class OmniSFTCollator:
-    def __init__(self, processor) -> None:
+    def __init__(self, processor, system_prompt=None) -> None:
         self.processor = processor
+        # Qwen3-Omni's HF page says NO system prompt should be set; only
+        # qwen2.5 gets QWEN25_SYSTEM_PROMPT (see main()).
+        self.system_prompt = system_prompt
 
     def _conv(self, audio, answer=None):
-        conv = [
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": QWEN25_SYSTEM_PROMPT}],
-            },
+        conv = []
+        if self.system_prompt is not None:
+            conv.append(
+                {"role": "system", "content": [{"type": "text", "text": self.system_prompt}]}
+            )
+        conv.append(
             {
                 "role": "user",
                 "content": [
@@ -95,8 +93,8 @@ class OmniSFTCollator:
                     {"type": "audio", "audio": audio},
                     {"type": "text", "text": TASK_PROMPT},
                 ],
-            },
-        ]
+            }
+        )
 
         if answer is not None:
             conv.append(
@@ -124,7 +122,7 @@ class OmniSFTCollator:
             tokenize=False,
         )
 
-        # full_convs contains the audio narrays; process_mm_info 
+        # full_convs contains the audio narrays; process_mm_info
         # passes them through unchanged.
         audios, images, videos = process_mm_info(full_convs, use_audio_in_video=False)
 
@@ -169,6 +167,16 @@ PROJ_SUFFIXES = (
 
 
 def find_lm_linear_names(model):
+    """Collect thinker Linear layers to LoRA-target.
+
+    Covers attention (q/k/v/o_proj) and dense-MLP (gate/up/down_proj) on
+    both families. Qwen3-Omni's MoE thinker stores its expert FFN weights
+    (gate_up_proj/down_proj) as raw nn.Parameter tensors rather than
+    nn.Linear modules on most layers, so those are NOT picked up here —
+    Qwen3 LoRA ends up attention-only (+ whatever dense layers exist under
+    config.mlp_only_layers). This is a deliberate scope choice, not a bug:
+    covering the MoE experts would need peft's target_parameters instead.
+    """
     names = []
     for name, module in model.named_modules():
         if (
@@ -182,12 +190,44 @@ def find_lm_linear_names(model):
     return names
 
 
-def load_model(model_id, use_qlora):
+def get_sft_model_cls(family):
+    """Full Omni model with a trainable forward (delegates to the thinker).
+    LoRA on this class saves keys with the `thinker.` prefix, matching what
+    PeftModel.from_pretrained expects at eval time. Imported lazily since a
+    given conda env only ships one family's transformers classes."""
+    if family == "qwen3":
+        from transformers import Qwen3OmniMoeForConditionalGeneration as Base
+    else:
+        from transformers import Qwen2_5OmniForConditionalGeneration as Base
+
+    class OmniForSFT(Base):
+        def forward(self, num_items_in_batch=None, **kwargs):
+            return self.thinker(**kwargs)
+
+    return OmniForSFT
+
+
+def load_processor(omni_path, family):
+    if family == "qwen3":
+        from transformers import Qwen3OmniMoeProcessor as Processor
+    else:
+        from transformers import Qwen2_5OmniProcessor as Processor
+    return Processor.from_pretrained(omni_path)
+
+
+def load_model(omni_path, family, use_qlora):
+    model_cls = get_sft_model_cls(family)
+
     kwargs = dict(
-        torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
         device_map={"": 0},
     )
+    # qwen3's from_pretrained uses the newer `dtype` kwarg name; qwen2.5
+    # (older transformers Qwen2_5Omni code) still expects `torch_dtype`.
+    if family == "qwen3":
+        kwargs["dtype"] = torch.bfloat16
+    else:
+        kwargs["torch_dtype"] = torch.bfloat16
 
     if use_qlora:
         from transformers import BitsAndBytesConfig
@@ -199,13 +239,19 @@ def load_model(model_id, use_qlora):
             bnb_4bit_use_double_quant=True,
         )
 
-    model = Qwen2_5OmniForSFT.from_pretrained(model_id, **kwargs)
+    model = model_cls.from_pretrained(omni_path, **kwargs)
     model.disable_talker()
     model.thinker.config.use_cache = False # TODO: ?
     model.thinker.enable_input_require_grads()  # TODO: ?
 
     if use_qlora:
         model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+    if family == "qwen3":
+        print(
+            "note: qwen3 LoRA targets attention proj only — MoE expert FFN "
+            "weights are nn.Parameter, not nn.Linear (see find_lm_linear_names)."
+        )
 
     peft_config = LoraConfig(
         r=16,
@@ -220,9 +266,9 @@ def load_model(model_id, use_qlora):
     return model
 
 
-def run_smoke(model, processor, dataset, batch_size):
+def run_smoke(model, processor, dataset, batch_size, system_prompt):
     print("\n=== SMOKE TEST ===")
-    coll = OmniSFTCollator(processor)
+    coll = OmniSFTCollator(processor, system_prompt=system_prompt)
     n = min(batch_size, len(dataset))
     exs = [dataset[i] for i in range(n)]
     for ex in exs:
@@ -250,7 +296,14 @@ def main():
     ap.add_argument("--train-split", default="train")
     ap.add_argument("--eval-split", default="test")
     ap.add_argument("--no-eval", action="store_true")
-    ap.add_argument("--model-id", default="Qwen/Qwen2.5-Omni-3B")
+    ap.add_argument("--omni-path", default="Qwen/Qwen2.5-Omni-3B")
+    ap.add_argument(
+        "--model-family",
+        choices=["qwen2.5", "qwen3"],
+        default=None,
+        help="Override family auto-detection (needed for fine-tuned "
+        "checkpoint paths that don't contain 'qwen2.5'/'qwen3').",
+    )
     ap.add_argument("--epochs", type=float, default=3.0)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--batch-size", type=int, default=16)
@@ -263,9 +316,18 @@ def main():
     )
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--push", action="store_true")
-    ap.add_argument("--hub-id", default="keylazy/Qwen2.5-Omni-3B-bab-sft-adapter")
-    ap.add_argument("--out", default="./Qwen2.5-Omni-3B-bab-sft")
+    ap.add_argument("--hub-id", default=None, help="Defaults to keylazy/<omni-path basename>-bab-sft-adapter.")
+    ap.add_argument("--out", default=None, help="Defaults to ./<omni-path basename>-bab-sft.")
     args = ap.parse_args()
+
+    family = args.model_family or detect_model_family(args.omni_path)
+    print(f"model family: {family}")
+
+    model_name = args.omni_path.rstrip("/").split("/")[-1]
+    hub_id = args.hub_id or f"keylazy/{model_name}-bab-sft-adapter"
+    out = args.out or f"./{model_name}-bab-sft"
+
+    system_prompt = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
 
     print(f"Loading SFT dataset {args.ds_id} ...")
     train_hf = load_ds_split(args.ds_id, args.train_split)
@@ -278,17 +340,17 @@ def main():
         eval_hf = load_ds_split(args.ds_id, args.eval_split)
         eval_ds = SlurpDataset(eval_hf, answerable_token=args.answerable_token)
 
-    processor = Qwen2_5OmniProcessor.from_pretrained(args.model_id)
-    model = load_model(args.model_id, args.qlora)
+    processor = load_processor(args.omni_path, family)
+    model = load_model(args.omni_path, family, args.qlora)
 
     if args.smoke:
-        run_smoke(model, processor, train_ds, args.batch_size)
+        run_smoke(model, processor, train_ds, args.batch_size, system_prompt)
         return
 
-    logging_dir = os.path.join(args.out, "runs")
+    logging_dir = os.path.join(out, "runs")
 
     training_args = TrainingArguments(
-        output_dir=args.out,
+        output_dir=out,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
@@ -313,28 +375,28 @@ def main():
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        data_collator=OmniSFTCollator(processor),
+        data_collator=OmniSFTCollator(processor, system_prompt=system_prompt),
     )
 
     print("starting training ...")
     trainer.train()
-    trainer.save_model(args.out)
-    processor.save_pretrained(args.out)
-    print(f"saved adapter to {args.out}")
+    trainer.save_model(out)
+    processor.save_pretrained(out)
+    print(f"saved adapter to {out}")
 
     if args.push:
-        model.push_to_hub(args.hub_id)
-        processor.push_to_hub(args.hub_id)
+        model.push_to_hub(hub_id)
+        processor.push_to_hub(hub_id)
 
         from huggingface_hub import upload_folder
 
         upload_folder(
-            repo_id=args.hub_id,
+            repo_id=hub_id,
             folder_path=logging_dir,
             path_in_repo="runs",
             repo_type="model",
         )
-        print(f"pushed adapter + training graphs to {args.hub_id}")
+        print(f"pushed adapter + training graphs to {hub_id}")
 
 
 if __name__ == "__main__":

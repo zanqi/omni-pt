@@ -35,7 +35,7 @@ AUDIO_SAMPLING_RATE = 16000
 TASK_PROMPT = (
     "You are a smart voice device with full access to the user's apps, "
     "accounts, devices, information, and the internet. Listen to the user's spoken request "
-    "and respond in one short sentence."
+    "and respond naturally and concisely, addressing everything it asks."
 )
 
 JUDGED_TYPES = ("answer", "repair", "repeat", "bad")
