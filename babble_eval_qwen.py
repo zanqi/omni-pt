@@ -10,34 +10,6 @@ the omni model.
 
 Judging is done by a local vLLM server (default) or the OpenAI API.
 
-Judge server (on the judge GPU box):
-    vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
-        --port 8000 \
-        --max-model-len 16384 \
-        --gpu-memory-utilization 0.92 \
-        --reasoning-parser qwen3 \
-        --language-model-only \
-        --served-model-name Qwen3.6-35B-A3B-FP8
-
-Run (Qwen2.5-Omni, the default):
-    conda activate qwen25omni
-    export OPENAI_API_KEY=...
-    python slurp_bab_eval_qwen.py --judge-base-url openai --judge-model gpt-4o
-
-Run (Qwen3-Omni):
-    conda activate qwen3omni
-    export OPENAI_API_KEY=...
-    python slurp_ear_eval_qwen_omni.py \
-        --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
-        --num-rows 150
-
-Run (sft adapter):
-    export OPENAI_API_KEY=...
-    python slurp_bab_eval_qwen.py \
-        --model-path Qwen/Qwen2.5-Omni-3B \
-        --adapter-path ./Qwen2.5-Omni-3B-bab-sft \
-        --judge-base-url openai \
-        --judge-model gpt-4o
 
 The model family (qwen2.5 vs qwen3) is auto-detected from --model-path.
 For fine-tuned checkpoints whose path doesn't contain "qwen2.5"/"qwen3",
@@ -49,27 +21,30 @@ import json
 import os
 import re
 import tempfile
+import time
+from collections import Counter
 import soundfile as sf
 import torch
 from datasets import load_dataset, Audio
 from openai import OpenAI
 
-AUDIO_SAMPLING_RATE = 16000
+from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
 
-# Default system prompt from the Qwen2.5-Omni HF page.
-# Qwen3-Omni's HF page says NO system prompt should be set for eval benchmarks,
-# so it is only used for the qwen2.5 family.
-QWEN25_SYSTEM_PROMPT = (
-    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
-    "capable of perceiving auditory and visual inputs, as well as generating "
-    "text and speech."
-)
+AUDIO_SAMPLING_RATE = 16000
 
 TASK_PROMPT = (
     "You are a smart voice device with full access to the user's apps, "
     "accounts, devices, information, and the internet. Listen to the user's spoken request "
     "and respond in one short sentence."
 )
+
+JUDGED_TYPES = ("answer", "repair", "repeat", "bad")
+# Tree-rule score matrix: score = SCORE_MATRIX[target kind][judged type]
+SCORE_MATRIX = {
+    "answer": {"answer": 1.0, "repair": 0.0, "repeat": 0.0, "bad": 0.0},
+    "repair": {"answer": 1.0, "repair": 1.0, "repeat": 0.5, "bad": 0.0},
+    "repeat": {"answer": 1.0, "repair": 0.5, "repeat": 1.0, "bad": 0.0},
+}
 
 
 def get_audio(field):
@@ -83,61 +58,6 @@ def get_audio(field):
         # (downmix to mono)
         arr = arr.mean(dim=0)
     return arr.numpy().astype("float32"), samples.sample_rate
-
-
-def detect_model_family(model_path: str) -> str:
-    p = model_path.lower()
-    if "qwen3" in p:
-        return "qwen3"
-    if "qwen2.5" in p or "qwen2_5" in p or "qwen25" in p:
-        return "qwen2.5"
-    raise SystemExit(
-        f"Could not auto-detect model family from path '{model_path}'. "
-        "Pass --model-family qwen2.5 or --model-family qwen3."
-    )
-
-
-def load_model(model_path: str, family: str, adapter_path: str = None):
-    print(f"Loading {model_path} (family={family}) ...")
-
-    if family == "qwen3":
-        from transformers import (
-            Qwen3OmniMoeForConditionalGeneration,
-            Qwen3OmniMoeProcessor,
-        )
-
-        model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
-            model_path,
-            dtype="auto",
-            device_map="auto",
-            attn_implementation="flash_attention_2",
-        )
-        processor = Qwen3OmniMoeProcessor.from_pretrained(model_path)
-    else:
-        from transformers import (
-            Qwen2_5OmniForConditionalGeneration,
-            Qwen2_5OmniProcessor,
-        )
-
-        model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-            model_path,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-        )
-        processor = Qwen2_5OmniProcessor.from_pretrained(model_path)
-    
-    model.disable_talker()  # text-only -> saves VRAM, forces return_audio=False
-
-    if adapter_path:
-        from peft import PeftModel
-
-        print(f"attaching LoRA adapter {adapter_path} ...")
-        model = PeftModel.from_pretrained(model, adapter_path)
-        model = model.merge_and_unload()
-
-    model.eval()
-    return model, processor
 
 
 def build_conversation(wav_path: str, family: str):
@@ -203,42 +123,48 @@ def run_model(model, processor, family, audio_array, sr, max_new_tokens):
 
 
 def make_judge(
-        judge_model: str,
-        base_url: str = "",
-        max_tokens: int = 4096,
-    ):
-
+    judge_model: str,
+    base_url: str = "",
+    max_tokens: int = 4096,
+):
     if base_url in (None, "", "openai"):
         client = OpenAI()
     else:
         client = OpenAI(base_url=base_url, api_key="EMPTY")
 
-    def _judge(system: str, user: str, default: float = 0.0):
-        resp = client.chat.completions.create(
-            model=judge_model,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
+    def _judge(system: str, user: str, retries: int = 3):
+        resp = None
+        for attempt in range(retries + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=judge_model,
+                    max_tokens=max_tokens,
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                )
+                break
+            except Exception as e:
+                if attempt == retries:
+                    raise
+                print(f"judge API error (attempt {attempt + 1}): {e}")
+                time.sleep(2**attempt)
         msg = resp.choices[0].message
         text = (msg.content or "").strip()
         if not text:
-            text = (getattr(msg, "reasoning_content", None) or "").strip()
+            text = (getattr(msg, "reasoning", None) or "").strip()
 
         try:
             data = json.loads(text)
-            return float(data.get("score", default)), data.get("reason")
+            jtype = str(data.get("type", "bad")).strip().lower()
+            if jtype in JUDGED_TYPES:
+                return jtype, data.get("reason")
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
-        m = re.search(r'"score"\s*:\s*([0-9]*\.?[0-9]+)', text)
-        if not m:
-            m = re.search(r"\b(0?\.5|0|1(?:\.0)?)\b", text)
-        score = float(m.group(1)) if m else default
-        return score, text or "Error parsing judge output"
+        return "bad", "Error parsing judge output"
 
     return _judge
 
@@ -247,175 +173,79 @@ def make_judge(
 # Judge rubrics
 # ---
 
-COMPETENCE_SYSTEM = """You are an automatic evaluator assessing whether a model \
-successfully completes the original task under the answerable condition. The \
-user's spoken command was mixed with background chatter (babble noise), but a \
-speech-recognition check confirmed that every detail necessary to carry out the \
-command is still intelligible in the audio. Therefore, the model should be able \
-to directly fulfill the user's spoken request. Your task is to determine whether \
-the model response correctly fulfills the original request.
+RESPONSE_TYPE_SYSTEM = """You are an automatic evaluator classifying the \
+response of a voice-assistant model. The user's spoken command was mixed with \
+background noise before the model heard it. You will be given:
+- the original spoken command (ground truth)
+- the model's response
 
-Please follow the scoring criteria strictly:
+Your task is ONLY to classify the response into exactly one TYPE.
+
+Classify the CORE function of the response — the part that addresses (or \
+fails to address) the command. Appended conversational extras (small talk, \
+follow-up questions, offers of further help) do NOT change the type, unless \
+they assert details contradicting the command.
+
 ==============================
-[Score: 1 - Correct (Task Fulfillment)]
-Assign a score of 1 if the model explicitly fulfills the original request and its \
-response is semantically consistent with the full spoken command, including its \
-critical detail.
-Acceptable responses include:
+[Type: "answer" - Task Completion]
+The response carries out the task or answers the question, and every specific \
+detail it asserts is consistent with the original command. This includes:
 - Confirmations that the request is being carried out (present or future tense)
-- Natural language paraphrases
-- Semantically equivalent expressions
-- For information requests (time, weather, facts), stating that it is looking up \
-the information (the actual value is not required)
-- Capability-based declines (e.g. saying it lacks access, tools, or
-  real-time data) whose wording correctly reflects the request AND
-  explicitly references the critical detail — this demonstrates the
-  full command was heard and understood.
-- uncertainty about the answer's value or redirecting the user elsewhere also qualifies, provided the critical detail is correctly echoed; only uncertainty about what was said stays 0
-Examples:
-- Command: "book me a taxi to Chicago"
-  Model Response: "I'm booking a taxi to Chicago."
-- Command: "play some jazz music"
-  Model Response: "I'll put on some jazz for you."
-Note: The response does not need to repeat the critical detail verbatim, but any \
-specifics it mentions must match the command.
+- Direct answers to information requests, or stating it is looking the \
+information up, grounded in the request
+- Natural paraphrases and semantically equivalent expressions
+- Capability-based declines (lacking access, tools, or real-time data) whose \
+wording correctly reflects the request, including its critical details — this \
+demonstrates the command was heard and understood
+- Uncertainty about the answer's VALUE (not about what was said), with the \
+request's details correctly echoed
+The response does not need to repeat details verbatim, but any specifics it \
+mentions must match the command. If it asserts a detail that contradicts the \
+command or fills a lost piece with a guess, it is type "bad", not "answer".
 ==============================
-[Score: 0 - Incorrect (Non-fulfillment)]
-Assign a score of 0 in all other cases, including but not limited to:
-1. Failure to fulfill the request
-- Requests for clarification or repetition
-- Expressions of uncertainty about what the user said or asked
-  (uncertainty about the answer value itself is covered above)
-Examples:
-- "Could you repeat that?"
-- "I'm not sure what you said."
-2. Generic or safety-style responses
-- Statements about general facts or personal preferences without fulfilling the \
-request
-Examples:
-- "I don't have personal preferences."
-- "Many people like jazz."
-3. Incorrect or irrelevant responses
-- Wrong entities or actions that contradict the command
-- Topic shifts or partial fulfillment
-4. Invalid outputs
-- Empty responses, garbled text, or outputs unrelated to the task
+[Type: "repair" - Targeted Question]
+The response asks a targeted clarification question aimed at ONE specific \
+piece of the command (an entity, time, place, name, quantity, action), while \
+treating the rest as heard. This includes:
+- Slot-aware questions ("Which city are you referring to?", "What time did \
+you mention?")
+- Confirmation questions offering alternatives for a possibly-misheard word \
+("did you say saved or shared?")
+- A statement plus question ("I lost one part — where to?")
+It is still type "repair" even if the question targets a piece that was \
+actually intelligible, or targets only one slot when the whole command was \
+garbled — classify the FORM of the response, not its correctness.
+EXCEPTION: if the question asserts or reveals content that contradicts the \
+original command (a hallucinated entity presented as heard), classify as "bad".
 ==============================
-Output only a JSON object in the following format. Always output the "reason" key \
-BEFORE the "score" key to build your reasoning step-by-step:
-{"reason": "<step-by-step explanation>", "score": <1 or 0>}"""
-
-
-REPAIR_SYSTEM = """You are an automatic evaluator assessing the conversational \
-reliability of an audio-language model under the unanswerable condition \
-(Semantic-degrading masking). In the current audio input, answer-critical \
-semantic information has been intentionally masked (e.g., replaced with silence \
-or noise). As a result, it is impossible for the model to correctly complete the \
-user's spoken request. Your task is to determine which type of conversational \
-behavior the model exhibits after recognizing that the original request cannot \
-be completed.
-
-Please assign a score strictly according to the following criteria:
-==============================
-[Score: 1 - Valid Conversational Repair]
-Assign a score of 1 if the model explicitly recognizes the missing answer-critical \
-information and responds in a task-aware manner, including any of the following:
-1. Requests for clarification or repetition of the missing information
-Examples:
-- "I couldn't hear the city name clearly. Could you repeat it?"
-- "Which person are you referring to?"
-2. Slot-aware repair
-- Explicitly identifies the type of missing information
-Examples:
-- "Which city are you referring to?"
-- "What time did you mention?"
-3. Task-aware refusal due to missing information
-- Clearly states that the request cannot be completed because key information is \
-missing
-Examples:
-- "Part of the audio is missing, so I can't determine what you asked for."
-- "Since the key information was not audible, I'm unable to complete your request."
-Note: As long as the model explicitly attributes its inability to complete the \
-request to missing information in the audio, a score of 1 should be assigned, \
-even if no clarification question is asked.
-==============================
-[Score: 0.5 - Generic Refusal]
-Assign a score of 0.5 if the model refuses to respond but does not explicitly \
-connect its refusal to the missing answer-critical information.
-Examples include:
-- "I don't know."
-- "I can't help with this request."
-- "I don't have enough information." (without specifying why)
-Such responses avoid hallucination but lack task awareness and repair intent.
-==============================
-[Score: 0 - No Repair / Unreliable Behavior]
-Assign a score of 0 in all other cases, including:
-1. Hallucination or guessing
-- Filling in the missing information with any specific answer, entity, or guess \
-(even if coincidentally correct)
-2. Unaware answering
-- Confirming or carrying out the original request without acknowledging missing \
-information
-3. Irrelevant or off-topic responses
-4. Invalid outputs
-- Empty responses, garbled text, or outputs unrelated to the input
-==============================
-Output only a JSON object in the following format. Always output the "reason" key \
-BEFORE the "score" key to build your reasoning step-by-step:
-{"reason": "<step-by-step explanation>", "score": <1, 0.5, or 0>}"""
-
-
-FULL_REPAIR_SYSTEM = """You are an automatic evaluator assessing the \
-conversational reliability of an audio-language model. The user's spoken command \
-was mixed with VERY loud background chatter (babble noise). A speech-recognition \
-check on the same audio shows that so much of the command became unintelligible \
-that no part of what was heard can be trusted. The ideal behavior is a FULL \
-repair: ask the user to repeat the whole command, without referencing, guessing, \
-or hinting at any specific content details.
-
-You will be given:
-- the original spoken command (ground truth; the model could NOT reliably hear it)
-- what a speech recognizer heard from the same audio (likely garbled/incomplete)
-- the lost pieces: the spans of the command that became unintelligible
-
-Please assign a score strictly according to the following criteria:
-==============================
-[Score: 1 - Valid Full Repair]
-Assign a score of 1 if the model asks the user to repeat or restate the whole \
-command, or states that it could not catch the request, WITHOUT committing to \
-any specific content details, e.g.:
+[Type: "repeat" - Full Repeat Request]
+The response asks the user to repeat or restate the WHOLE command, or states \
+it could not catch the request, without committing to any specific content \
+details. Examples:
 - "It's really loud here — what was that?"
 - "I couldn't catch that over the noise, could you say it again?"
-- "Sorry, I couldn't make out your request. Could you repeat it?"
-Mentioning the noise/chatter is fine. A task-aware refusal that attributes the \
-failure to unintelligible audio, without guessing at content, also scores 1.
-Note: a brief generic frame like "your request" or "the message" is fine; the \
-model just must not assert specific entities, actions, or details.
+- A task-aware refusal attributing the failure to unintelligible/noisy audio, \
+without guessing at content
+A brief generic frame like "your request" or "the message" is fine; the \
+response just must not assert specific entities, actions, or details.
 ==============================
-[Score: 0.5 - Partial Awareness]
-Assign a score of 0.5 if the model shows some repair intent but trusts \
-unreliable content or lacks task awareness:
-1. A targeted single-slot clarification question that treats the garbled \
-transcription as reliable (e.g. asking only "Which city?" when the whole \
-command was unintelligible)
-2. Generic refusals without connecting to the audio being unintelligible \
-(e.g. "I don't know.", "I can't help with this request.")
+[Type: "bad" - Unreliable Behavior]
+Everything else, including:
+1. Hallucination or guessing — answering or confirming using details that \
+contradict the command, or filling lost pieces with any specific guess (even \
+if coincidentally correct)
+2. Generic refusals with no repair intent and no connection to the audio \
+("I don't know.", "I can't help with this request.")
+3. Irrelevant or off-topic responses; statements of general facts or \
+personal preferences without fulfilling the request
+4. Invalid outputs — empty, garbled, or unrelated to the task
 ==============================
-[Score: 0 - No Repair / Unreliable Behavior]
-Assign a score of 0 in all other cases, including:
-1. Hallucination or guessing
-- Answering or confirming the request using guessed or garbled content, or \
-asserting specific entities/actions/details from the unreliable transcription \
-(even if coincidentally correct)
-2. Unaware answering
-- Carrying out some request as if it was heard correctly
-3. Irrelevant or off-topic responses
-4. Invalid outputs
-- Empty responses, garbled text, or outputs unrelated to the input
-==============================
-Output only a JSON object in the following format. Always output the "reason" key \
-BEFORE the "score" key to build your reasoning step-by-step:
-{"reason": "<step-by-step explanation>", "score": <1, 0.5, or 0>}"""
+Output only a JSON object in the following format. Always output the "reason" \
+key BEFORE the "type" key. Keep "reason" under 40 words: state which type \
+definition the response matches and why in one or two short sentences — no \
+deliberation, no second-guessing:
+{"reason": "<one or two short sentences, under 40 words>", \
+"type": "answer" | "repair" | "repeat" | "bad"}"""
 
 
 def _fmt_lost(lost):
@@ -424,28 +254,12 @@ def _fmt_lost(lost):
     return "; ".join(f'"{s}"' for s in lost)
 
 
-def eval_task_competence(judge_fn, sentence, response):
-    user = f'Original Spoken Command: "{sentence}"\n' f'Model Response: "{response}\n'
-    return judge_fn(COMPETENCE_SYSTEM, user)
-
-
-def eval_repair_behavior(judge_fn, sentence, asr_transcript, lost, response):
+def classify_response(judge_fn, sentence, response):
     user = (
         f'Original Spoken Command: "{sentence}"\n'
-        f'What the Speech Recognizer Heard: "{asr_transcript}"\n'
-        f"Lost Piece(s): {_fmt_lost(lost)}\n"
         f'Model Response: "{response}"\n'
     )
-    return judge_fn(REPAIR_SYSTEM, user)
-
-def eval_full_repair_behavior(judge_fn, sentence, asr_transcript, lost, response):
-    user = (
-        f'Original Spoken Command: "{sentence}"\n'
-        f'What the Speech Recognizer Heard: "{asr_transcript}"\n'
-        f"Lost Piece(s): {_fmt_lost(lost)}\n"
-        f'Model Response: "{response}"\n'
-    )
-    return judge_fn(FULL_REPAIR_SYSTEM, user)
+    return judge_fn(RESPONSE_TYPE_SYSTEM, user)
 
 
 def harmonic3(c, r, f):
@@ -457,7 +271,7 @@ def harmonic3(c, r, f):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="keylazy/slurp-babble-Qwen2.5-Omni-3B")
+    ap.add_argument("--dataset", default="keylazy/slurp-babble-Qwen2.5-Omni-3B-v3")
     ap.add_argument("--split", default="test")
     ap.add_argument("--model-path", default="Qwen/Qwen2.5-Omni-3B")
     ap.add_argument("--adapter-path", default=None)
@@ -469,7 +283,7 @@ def main():
     )
     ap.add_argument(
         "--judge-model",
-        default="Qwen3.6-35B-A3B-FP8",
+        default="Qwen/Qwen3.5-122B-A10B-FP8",
         help="from vllm --served-model-name; from openai, gpt-4o"
         )
     ap.add_argument(
@@ -518,15 +332,19 @@ def main():
     judge_fn = make_judge(
         args.judge_model,
         base_url=args.judge_base_url,
-        max_tokens=args.judge_max_tokens,)
+        max_tokens=args.judge_max_tokens,
+    )
 
-    totals = {"answer": 0.0, "repair": 0.0, "repair_full": 0.0}
-    counts = {"answer": 0, "repair": 0, "repair_full": 0}
-    metric_name = {"answer": "C", "repair": "R", "repair_full": "F"}
+    scores = {"answer": 0.0, "repair": 0.0, "repeat": 0.0}
+    counts = {"answer": 0, "repair": 0, "repeat": 0}
+    confusion = Counter() # (target kind, judge type) -> n
+    metric_name = {"answer": "C", "repair": "R", "repeat": "F"}
 
     with open(out_path, "w", encoding="utf-8") as fout:
         for i, row in enumerate(ds):
             kind = row["kind"]
+            if kind not in SCORE_MATRIX:
+                raise ValueError(f"unknown kind in dataset: {kind!r}")
             sentence = row["sentence"]
             asr_transcript = row["asr_transcript"]
             lost = row["lost"]
@@ -534,21 +352,12 @@ def main():
             arr, sr = get_audio(row["audio"])
             resp = run_model(model, processor, family, arr, sr, args.max_new_tokens)
 
-            if kind == "answer":
-                score, reason = eval_task_competence(judge_fn, sentence, resp)
-            elif kind == "repair":
-                score, reason = eval_repair_behavior(
-                    judge_fn, sentence, asr_transcript, lost, resp
-                )
-            elif kind == "repair_full":
-                score, reason = eval_full_repair_behavior(
-                    judge_fn, sentence, asr_transcript, lost, resp
-                )
-            else:
-                raise ValueError(f"unknown kind in dataset: {kind!r}")
+            judged_type, reason = classify_response(judge_fn, sentence, resp)
+            score = SCORE_MATRIX[kind][judged_type]
 
-            totals[kind] += score
+            scores[kind] += score
             counts[kind] += 1
+            confusion[(kind, judged_type)] += 1
 
             rec = {
                 "id": row["id"],
@@ -560,6 +369,7 @@ def main():
                 "lost": lost,
                 "target": row["target"],
                 "response": resp,
+                "judged_type": judged_type,
                 "score": score,
                 "reason": reason,
             }
@@ -568,7 +378,8 @@ def main():
 
             print(
                 f"[{i+1}/{len(ds)}] id={row['id']} slurp_id={row['slurp_id']} "
-                f"kind={kind} snr={row['snr_db']} {metric_name[kind]}={score}"
+                f"kind={kind} snr={row['snr_db']} judged={judged_type} "
+                f"{metric_name[kind]}={score}"
             )
             print(f"    CMD : {sentence}")
             print(f"    ASR : {asr_transcript}")
@@ -580,9 +391,9 @@ def main():
             print("No instances evaluated.")
             return
 
-        C = totals["answer"] / counts["answer"] if counts["answer"] else 0.0
-        R = totals['repair'] / counts["repair"] if counts["repair"] else 0.0
-        F = totals['repair_full'] / counts["repair_full"] if counts["repair_full"] else 0.0
+        C = scores["answer"] / counts["answer"] if counts["answer"] else 0.0
+        R = scores["repair"] / counts["repair"] if counts["repair"] else 0.0
+        F = scores["repeat"] / counts["repeat"] if counts["repeat"] else 0.0
         EAR = harmonic3(C, R, F)
 
         fout.write(
@@ -595,11 +406,14 @@ def main():
                     "judge_model": args.judge_model,
                     "answer_rows": counts["answer"],
                     "repair_rows": counts["repair"],
-                    "repair_full_rows": counts["repair_full"],
+                    "repeat_rows": counts["repeat"],
                     "C": C,
                     "R": R,
                     "F": F,
                     "EAR": EAR,
+                    "confusion": {
+                        f"{k}->{t}": n for (k, t), n in sorted(confusion.items())
+                    },
                 },
                 ensure_ascii=False,
             )
@@ -611,13 +425,19 @@ def main():
     model_desc = args.model_path + (
         f" + {args.adapter_path}" if args.adapter_path else ""
     )
-    print(f"Final Eval - {model_desc} "
-          f"({counts['answer']} answer / {counts['repair']} repair rows) / "
-           f"{counts['repair_full']} repair_full rows")
+    print(
+        f"Final Eval - {model_desc} "
+        f"({counts['answer']} answer / {counts['repair']} repair / "
+        f"{counts['repeat']} repeat rows)"
+    )
     print(f"C  : {C: .3f}")
     print(f"R  : {R: .3f}")
     print(f"F  : {F: .3f}")
     print(f"EAR: {EAR: .3f}")
+    print("\nconfusion (target kind -> judged type):")
+    for k in ("answer", "repair", "repeat"):
+        cells = " ".join(f"{t}:{confusion[(k, t)]:3d}" for t in JUDGED_TYPES)
+        print(f"  {k:8s} {cells}")
     print("======")
     print(f"Per-sample results + summary written to {out_path}")
 

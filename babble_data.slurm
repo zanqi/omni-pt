@@ -30,6 +30,6 @@ fi
 echo "judge OK at http://${JUDGE_HOST}:8000/v1"
 
 # -u: unbuffered stdout so errors/progress show up in the log immediately
-python -u slurp_babble_data.py
+python -u babble_data.py
 
 # sbatch /gscratch/sciencehub/zanqil/projects/omni-pt/babble_data.slurm
