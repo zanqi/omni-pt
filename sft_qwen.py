@@ -297,13 +297,6 @@ def main():
     ap.add_argument("--eval-split", default="test")
     ap.add_argument("--no-eval", action="store_true")
     ap.add_argument("--omni-path", default="Qwen/Qwen2.5-Omni-3B")
-    ap.add_argument(
-        "--model-family",
-        choices=["qwen2.5", "qwen3"],
-        default=None,
-        help="Override family auto-detection (needed for fine-tuned "
-        "checkpoint paths that don't contain 'qwen2.5'/'qwen3').",
-    )
     ap.add_argument("--epochs", type=float, default=3.0)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--batch-size", type=int, default=16)
@@ -315,16 +308,14 @@ def main():
         help=f"Replace the target of kind=='answer' rows with {ANSWERABLE_TOKEN!r}.",
     )
     ap.add_argument("--smoke", action="store_true")
-    ap.add_argument("--push", action="store_true")
-    ap.add_argument("--hub-id", default=None, help="Defaults to keylazy/<omni-path basename>-bab-sft-adapter.")
     ap.add_argument("--out", default=None, help="Defaults to ./<omni-path basename>-bab-sft.")
     args = ap.parse_args()
 
-    family = args.model_family or detect_model_family(args.omni_path)
+    family = detect_model_family(args.omni_path)
     print(f"model family: {family}")
 
     model_name = args.omni_path.rstrip("/").split("/")[-1]
-    hub_id = args.hub_id or f"keylazy/{model_name}-bab-sft-adapter"
+    hub_id = f"keylazy/{model_name}-bab-sft-adapter"
     out = args.out or f"./{model_name}-bab-sft"
 
     system_prompt = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
@@ -384,19 +375,19 @@ def main():
     processor.save_pretrained(out)
     print(f"saved adapter to {out}")
 
-    if args.push:
-        model.push_to_hub(hub_id)
-        processor.push_to_hub(hub_id)
 
-        from huggingface_hub import upload_folder
+    model.push_to_hub(hub_id)
+    processor.push_to_hub(hub_id)
 
-        upload_folder(
-            repo_id=hub_id,
-            folder_path=logging_dir,
-            path_in_repo="runs",
-            repo_type="model",
-        )
-        print(f"pushed adapter + training graphs to {hub_id}")
+    from huggingface_hub import upload_folder
+
+    upload_folder(
+        repo_id=hub_id,
+        folder_path=logging_dir,
+        path_in_repo="runs",
+        repo_type="model",
+    )
+    print(f"pushed adapter + training graphs to {hub_id}")
 
 
 if __name__ == "__main__":

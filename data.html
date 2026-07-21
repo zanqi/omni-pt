@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Data plan: one shared, model-agnostic babble eval set</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5b5b5b; --rule: #ddd;
+    --code-bg: #f4f4f5; --accent: #8a3ffc; --bad: #c0392b; --ok: #1a7f37;
+    --card: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#15161a; --fg:#e8e8ea; --muted:#a0a0a8; --rule:#33343a;
+      --code-bg:#1e1f25; --accent:#b794ff; --bad:#ff6b6b; --ok:#4fd07a; --card:#1b1c22; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 880px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem;
+  }
+  h1 { font-size: 1.7rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.8rem; border-bottom: 1px solid var(--rule); padding-bottom: .4rem; }
+  h3 { font-size: 1.02rem; margin-top: 1.6rem; color: var(--accent); }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .87em; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg); padding: .9rem 1rem; border-radius: 8px;
+    overflow-x: auto; line-height: 1.5; border: 1px solid var(--rule);
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--rule); padding: .45rem .6rem; text-align: left; }
+  th { background: var(--code-bg); }
+  .card {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1rem 1.2rem; margin: 1rem 0;
+  }
+  .step-badge {
+    display: inline-block; background: var(--accent); color: #fff;
+    border-radius: 999px; width: 1.6em; height: 1.6em; line-height: 1.6em;
+    text-align: center; font-weight: 600; font-size: .85em; margin-right: .5em;
+  }
+  .risk { border-left: 3px solid var(--bad); padding-left: .9rem; margin: .8rem 0; }
+  .good { color: var(--ok); }
+  .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  ul { padding-left: 1.3rem; }
+  li { margin: .3rem 0; }
+  footer { margin-top: 3rem; color: var(--muted); font-size: .85rem; border-top: 1px solid var(--rule); padding-top: 1rem; }
+</style>
+</head>
+<body>
+
+<h1>Data plan: one shared, model-agnostic babble eval set</h1>
+<p class="subtitle">Keep per-model self-probed training data as-is; replace only the eval set with a single fixed, neutrally-labeled dataset reused across every model.</p>
+
+<div class="card">
+<strong>Why</strong>
+<ul>
+  <li><code>SLOT_SNR</code> in <code>babble_data.py</code> is already one fixed band shared by every model &mdash; self-probing doesn't widen/shift it per model, it just rejection-samples inside that fixed band until the classifier labels a draw the way it needs.</li>
+  <li>Measured on the actual pushed datasets: <strong>968/1000</strong> train <code>slurp_id</code>s overlap between the Qwen2.5 and Qwen3 babble datasets (3.2% content drift from per-model probe failures), and for the utterances that DO overlap, the realized SNR for the same <code>(slurp_id, kind)</code> differs with <strong>std &asymp; 5.5dB</strong> between the two.</li>
+  <li>Every cross-model C/R/F/EAR comparison made so far (the whole point of <code>eval.ipynb</code>'s tables) has been comparing models on <em>different</em> underlying audio, not just different models.</li>
+  <li>Training data stays self-probed on purpose &mdash; SFT/DPO should see the specific noise instances that confuse that exact model. Only eval needs to be shared/neutral.</li>
+</ul>
+</div>
+
+<h2>Design: single fixed listener replaces the omni self-probe, eval-only</h2>
+<p>Today, <code>probe_triplet</code> (in <code>babble_data.py</code>) uses the trained-on omni model itself for <em>two</em> passes per noisy draw: an ASR transcript and a task response (<code>"Heard: ... Reply: ..."</code>), and feeds both to the vLLM classifier as independent survival signals. For the eval set, replace both passes with a single fixed external ASR model &mdash; <strong>Whisper-large-v3</strong> (via <code>transformers</code>, already available in this stack) &mdash; that never changes across runs, and drop the "task response" signal entirely since Whisper doesn't perform tasks, only transcribes.</p>
+
+<table>
+<tr><th></th><th>Current (train, unchanged)</th><th>New (eval only)</th></tr>
+<tr><td>Listener</td><td>the omni model being trained</td><td>Whisper-large-v3, fixed forever</td></tr>
+<tr><td>Signals per draw</td><td>ASR transcript + task response</td><td>ASR transcript only</td></tr>
+<tr><td>SNR bands</td><td><code>SLOT_SNR</code>, fixed</td><td>same <code>SLOT_SNR</code>, fixed</td></tr>
+<tr><td>Rejection-sampling loop</td><td><code>probe_triplet</code>, <code>MAX_PROBES=3</code></td><td>same structure, new listener</td></tr>
+<tr><td>Dataset scope</td><td>per model, train+test</td><td>ONE dataset, reused by every model</td></tr>
+</table>
+
+<h2>Steps</h2>
+
+<h3><span class="step-badge">1</span>New script: <code>babble_eval_data.py</code></h3>
+<p>A sibling to <code>babble_data.py</code>, not a modification of it &mdash; the train-data builder must stay untouched. Reuse directly from <code>babble_data.py</code>: <code>make_probe_batch</code> (noise synthesis is already model-agnostic), <code>generate_targets</code> + <code>TARGET_PROMPT</code> (target text generation doesn't depend on the listener), the vLLM <code>client</code>/<code>gpt_json</code> setup, <code>SLOT_SNR</code>/<code>SLOT_WEIGHTS</code>/<code>KINDS</code> constants.</p>
+
+<h3><span class="step-badge">2</span>Load Whisper once, batch-transcribe</h3>
+<pre><code>from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+whisper_model = WhisperForConditionalGeneration.from_pretrained(
+    "openai/whisper-large-v3", torch_dtype=torch.bfloat16, device_map={"": 0}
+)
+whisper_processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
+
+def whisper_transcribe_batch(audios):
+    inputs = whisper_processor(audios, sampling_rate=16000, return_tensors="pt", padding=True)
+    inputs = inputs.to(whisper_model.device, dtype=whisper_model.dtype)
+    ids = whisper_model.generate(**inputs, language="en", task="transcribe")
+    return [t.lower().strip() for t in whisper_processor.batch_decode(ids, skip_special_tokens=True)]</code></pre>
+<p>This replaces both <code>base_generate_batch</code> calls (ASR pass + task-response pass) inside <code>probe_triplet</code> with a single call.</p>
+
+<h3><span class="step-badge">3</span>Trim the classifier prompt to transcript-only</h3>
+<p><code>CLASSIFY_PROMPT</code> currently frames its input as "two independent passes" (transcript + assistant response) and lets either one prove a piece survived. Whisper only produces a transcript, so write <code>CLASSIFY_PROMPT_FIXED</code>: same rubric (answer / repair / repeat definitions, the "key info" test, the JSON output shape) but with the "two independent passes" framing removed and every survival check based on the transcript alone. <code>_span_survived</code>'s post-processing (the deterministic override that trusts a verbatim match) narrows to checking the transcript only, not <code>(transcript, response)</code>.</p>
+
+<div class="risk">
+<strong>Trade-off to accept:</strong> the current two-signal design exists partly because an ASR transcript can be locally wrong on a word while the full utterance is still contextually recoverable (that's what the "response" signal was catching). Dropping it makes the fixed eval set's ground truth strictly bound by Whisper's transcription quality &mdash; a Whisper mistranscription now directly mislabels the row, with no second chance. Mitigate by using the largest Whisper checkpoint (<code>large-v3</code>, not <code>turbo</code>) and spot-checking ~20 generated labels by ear before trusting the set.
+</div>
+
+<h3><span class="step-badge">4</span>Utterance selection &amp; exclusion set</h3>
+<p>Build the <code>seen_slurp_ids</code> exclusion set from more sources than today's single <code>MASK_DS_ID</code>:</p>
+<pre><code>EXCLUDE_DS_IDS = [
+    "keylazy/slurp-ear-sft",                                   # EAR track (existing)
+    "keylazy/slurp-babble-Qwen2.5-Omni-3B-v3",                 # Qwen2.5 train (avoid eval/train leakage)
+    "keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-v1",     # Qwen3 train (same reason)
+]</code></pre>
+<p>Every model's own self-probed train split already excludes the EAR set; this adds excluding each OTHER model's train utterances too, so the shared eval set never overlaps anything any model was tuned on. Extend this list whenever a new model's train set is built.</p>
+<p>Recommend a larger N than today's 50 per kind (e.g. <strong>150</strong>) &mdash; more eval rows means less noise when comparing four-plus models on the same set going forward, and this only needs to be built once, ever.</p>
+
+<h3><span class="step-badge">5</span>Push one dataset, no model name in the repo id</h3>
+<pre><code>REPO_ID = "keylazy/slurp-babble-fixed-eval-v1"   # deliberately no model name</code></pre>
+<p>Single <code>test</code> split (no <code>train</code> needed &mdash; this dataset is eval-only by design). The naming itself signals "canonical, shared, don't rebuild per model."</p>
+
+<h3><span class="step-badge">6</span>Re-point <code>eval.sh</code> at the shared set</h3>
+<p><code>babble_eval_qwen.py</code> needs zero code changes &mdash; it already takes <code>--dataset</code>/<code>--split</code> as flags. Just change every invocation in <code>eval.sh</code>:</p>
+<pre><code>python babble_eval_qwen.py --model-path Qwen/Qwen2.5-Omni-3B \
+    --dataset keylazy/slurp-babble-fixed-eval-v1 --split test ...
+python babble_eval_qwen.py --model-path Qwen/Qwen2.5-Omni-3B \
+    --adapter-path ./Qwen2.5-Omni-3B-bab-sft-v3 \
+    --dataset keylazy/slurp-babble-fixed-eval-v1 --split test ...
+python babble_eval_qwen.py --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+    --dataset keylazy/slurp-babble-fixed-eval-v1 --split test ...
+python babble_eval_qwen.py --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+    --adapter-path ./Qwen3-Omni-30B-A3B-Instruct-bab-sft \
+    --dataset keylazy/slurp-babble-fixed-eval-v1 --split test ...</code></pre>
+
+<h3><span class="step-badge">7</span>Re-run and expect the numbers to move</h3>
+<p>All four <code>bab_results_*_slurp.jsonl</code> files get regenerated against the new shared set. Every C/R/F/EAR/confusion-matrix comparison made in <code>eval.ipynb</code> so far was computed on four different eval sets &mdash; expect numbers to shift once they're all on the same one, and treat the new numbers (not the old ones) as the trustworthy comparison going forward.</p>
+
+<h2>Scope check: what does NOT change</h2>
+<ul>
+  <li><code>babble_data.py</code> (train-set builder) &mdash; untouched, keeps self-probing per model.</li>
+  <li><code>babble_eval_qwen.py</code> (eval runner) &mdash; untouched, already dataset-agnostic via <code>--dataset</code>.</li>
+  <li>The EAR/word-masking track &mdash; already model-agnostic by construction (deterministic forced-alignment word masking, not self-probed), no issue there to fix.</li>
+  <li>Existing per-model train datasets (<code>keylazy/slurp-babble-Qwen2.5-Omni-3B-v3</code>, <code>...Qwen3...-v1</code>) &mdash; kept as-is for SFT/DPO.</li>
+</ul>
+
+<footer>Generated as a planning doc for the omni-pt repo. No code has been written yet &mdash; say the word and I'll implement <code>babble_eval_data.py</code>, build the shared eval set, and update <code>eval.sh</code>.</footer>
+
+</body>
+</html>

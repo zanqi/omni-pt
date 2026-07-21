@@ -5,3 +5,5 @@ Qwen2.5-Omni-3B-ear-anstok-sft/
 Qwen2.5-Omni-3B-bab-sft-v2/
 Qwen2.5-Omni-3B-bab-sft-v3/
 .vscode/
+.env
+Qwen3-Omni-30B-A3B-Instruct-bab-sft/

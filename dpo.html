@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DPO plan: fixing babble-track over-triggering (Qwen3-Omni-30B)</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5b5b5b; --rule: #ddd;
+    --code-bg: #f4f4f5; --accent: #8a3ffc; --bad: #c0392b; --ok: #1a7f37;
+    --card: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#15161a; --fg:#e8e8ea; --muted:#a0a0a8; --rule:#33343a;
+      --code-bg:#1e1f25; --accent:#b794ff; --bad:#ff6b6b; --ok:#4fd07a; --card:#1b1c22; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 880px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem;
+  }
+  h1 { font-size: 1.7rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.8rem; border-bottom: 1px solid var(--rule); padding-bottom: .4rem; }
+  h3 { font-size: 1.02rem; margin-top: 1.6rem; color: var(--accent); }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .87em; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg); padding: .9rem 1rem; border-radius: 8px;
+    overflow-x: auto; line-height: 1.5; border: 1px solid var(--rule);
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--rule); padding: .45rem .6rem; text-align: left; }
+  th { background: var(--code-bg); }
+  .card {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1rem 1.2rem; margin: 1rem 0;
+  }
+  .step-badge {
+    display: inline-block; background: var(--accent); color: #fff;
+    border-radius: 999px; width: 1.6em; height: 1.6em; line-height: 1.6em;
+    text-align: center; font-weight: 600; font-size: .85em; margin-right: .5em;
+  }
+  .risk { border-left: 3px solid var(--bad); padding-left: .9rem; margin: .8rem 0; }
+  .good { color: var(--ok); }
+  .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  ul { padding-left: 1.3rem; }
+  li { margin: .3rem 0; }
+  .toc { columns: 2; column-gap: 2rem; }
+  .toc a { color: var(--fg); text-decoration: none; }
+  .toc a:hover { color: var(--accent); }
+  footer { margin-top: 3rem; color: var(--muted); font-size: .85rem; border-top: 1px solid var(--rule); padding-top: 1rem; }
+</style>
+</head>
+<body>
+
+<h1>DPO experiment: correcting babble-track over-triggering</h1>
+<p class="subtitle">Qwen3-Omni-30B-A3B-Instruct, babble track only, continuing from the existing SFT adapter.</p>
+
+<div class="card">
+<strong>Decisions locked in for this run</strong>
+<ul>
+  <li>Rejected samples: <strong>on-policy</strong>, mined from the current SFT model's own rollouts &mdash; no synthetic/templated negatives.</li>
+  <li>Model: <strong>Qwen3-Omni-30B-A3B-Instruct</strong> + its existing <code>Qwen3-Omni-30B-A3B-Instruct-bab-sft</code> adapter (proving the approach on the larger model first, not Qwen2.5-Omni-3B).</li>
+  <li>Track: <strong>babble only</strong> (background-noise track) &mdash; where the over-triggering was actually observed.</li>
+  <li>Trainer: <strong>custom minimal DPO loop</strong>, not TRL &mdash; TRL isn't installed in <code>qwen3omni</code>/<code>qwen25omni</code>, and this repo's <code>Qwen3OmniMoeForConditionalGeneration</code> thinker-only wrapper + hand-built audio collator (<code>sft_qwen.py</code>) has no guaranteed DPOTrainer compatibility.</li>
+  <li>Base checkpoint: continue from the SFT adapter, not a fresh LoRA from base &mdash; we're correcting a behavior that adapter already learned.</li>
+</ul>
+</div>
+
+<h2>Why this is needed</h2>
+<p>Pulled straight from <code>bab_results_Qwen3-Omni-30B-A3B-Instruct-bab-sft_slurp.jsonl</code> (150-row test-split eval, already run):</p>
+<div class="card">
+<code>answer_rows: 50</code> &mdash; <span class="bad">18 over-triggered (36%)</span>: the model asked for clarification/repeat on audio that was fully intelligible.
+<pre><code>kind: "answer"   sentence: "event reminder mona tuesday"
+response: "Did you mean Tuesday or another day?"
+judged_type: "repair"   score: 0.0</code></pre>
+Confusion matrix from that run: <code>answer&rarr;answer: 28, answer&rarr;repair: 14, answer&rarr;repeat: 4, answer&rarr;bad: 4</code>.
+</div>
+<p>The scoring rule already in <code>babble_eval_qwen.py</code> (<code>SCORE_MATRIX</code>, keyed by <code>[row kind][judged_type]</code>) is exactly the reward signal this experiment needs &mdash; it already encodes both failure directions, not just over-triggering:</p>
+<table>
+<tr><th>row <code>kind</code></th><th><code>judged_type</code></th><th>score</th><th>meaning</th></tr>
+<tr><td>answer</td><td>answer</td><td class="good">1.0</td><td>correct, no negative signal</td></tr>
+<tr><td>answer</td><td>repair / repeat</td><td class="bad">0.0</td><td><strong>over-triggering</strong> &mdash; the bug you found</td></tr>
+<tr><td>answer</td><td>bad</td><td class="bad">0.0</td><td>hallucinated on clean audio</td></tr>
+<tr><td>repair</td><td>answer</td><td class="good">1.0</td><td>correctly resolved the ambiguity &mdash; not a guess, since <code>classify_response</code>'s rubric only allows "answer" when every detail is actually correct</td></tr>
+<tr><td>repair</td><td>repeat</td><td>0.5</td><td>over-scoped repair (asked to repeat everything when only one detail was lost)</td></tr>
+<tr><td>repair</td><td>bad</td><td class="bad">0.0</td><td><strong>hallucination on ambiguous audio</strong> &mdash; the more dangerous mirror-image failure, worth including</td></tr>
+<tr><td>repeat</td><td>repair</td><td>0.5</td><td>under-scoped (single-detail question when the whole utterance was lost)</td></tr>
+<tr><td>repeat</td><td>answer / bad</td><td class="bad">0.0&ndash;1.0*</td><td>see kind=answer row above for the "answer" case (1.0, genuinely resolved); "bad" is 0.0</td></tr>
+</table>
+<p class="muted">*Note <code>repeat&rarr;answer</code> is also 1.0 by this same "only correct answers get classified answer" logic. The only genuinely bad cells are <code>*&rarr;bad</code> and <code>answer&rarr;{repair,repeat}</code>.</p>
+<p>This means <strong>every rollout scoring &lt;1.0 is a ready-made rejected sample</strong>, and the gold <code>target</code> text already in the dataset is the chosen sample &mdash; no new judging logic needs to be written, and no synthetic negatives are needed.</p>
+
+<h2>Pipeline</h2>
+
+<h3><span class="step-badge">0</span>Prerequisite: don't clobber the existing eval file</h3>
+<p><code>babble_eval_qwen.py</code>'s output path is <code>bab_results_&lt;model_or_adapter_name&gt;_slurp.jsonl</code> &mdash; derived only from the model/adapter name, not the split. Running it with <code>--split train</code> would silently overwrite the real test-split eval result you already have for this adapter. Add a one-line <code>--out</code> override before running anything:</p>
+<pre><code>ap.add_argument("--out", default=None, help="Defaults to bab_results_&lt;name&gt;_slurp.jsonl")
+...
+out_path = args.out or f"bab_results_{model_name}_slurp.jsonl"</code></pre>
+
+<h3><span class="step-badge">1</span>Harvest on-policy rollouts over the train split</h3>
+<p>No new generation code needed &mdash; <code>babble_eval_qwen.py</code>'s main loop already does exactly this per row (generate &rarr; <code>classify_response</code> &rarr; <code>SCORE_MATRIX</code> lookup &rarr; write JSON record with <code>response</code>/<code>judged_type</code>/<code>score</code>). Just point it at the train split with the <code>--out</code> override:</p>
+<pre><code>conda activate qwen3omni
+JUDGE_HOST=$(cat /gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt)
+python babble_eval_qwen.py \
+    --dataset keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-v1 \
+    --split train --num-rows -1 \
+    --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+    --adapter-path ./Qwen3-Omni-30B-A3B-Instruct-bab-sft \
+    --judge-base-url "http://${JUDGE_HOST}:8000/v1" \
+    --out bab_train_rollouts_Qwen3-Omni-30B-A3B-Instruct-bab-sft.jsonl</code></pre>
+<p class="muted">3000 train rows &times; one generation + one judge call each. Extrapolating the test-split rates above (~36% non-1.0 on answer rows, ~30% on repair, ~26% on repeat) suggests roughly <strong>900&ndash;1000</strong> usable pairs out of 3000 rows &mdash; log the actual yield and don't top it up with synthetic data if it comes in lower; that's a real signal about how often the SFT model still misbehaves.</p>
+
+<h3><span class="step-badge">2</span>Build the preference-pair dataset &mdash; new script <code>babble_dpo_data.py</code></h3>
+<ul>
+  <li>Read <code>bab_train_rollouts_..._.jsonl</code>, keep rows with <code>score &lt; 1.0</code>.</li>
+  <li>Join back to <code>keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-v1</code> (train split) by <code>id</code> to reattach the <code>audio</code> column (the eval script only logs text fields, not raw audio arrays).</li>
+  <li>Emit one row per pair: <code>{id, kind, audio, sentence, chosen: target, rejected: response, rejected_type: judged_type, score}</code>.</li>
+  <li>Carve a small held-out slice (~10%) for tracking DPO loss/margin on unseen pairs during training &mdash; the real evaluation is still step 4's full <code>babble_eval_qwen.py</code> run on the untouched test split.</li>
+  <li>Push to <code>keylazy/slurp-babble-dpo-Qwen3-Omni-30B-A3B-Instruct-v1</code>.</li>
+  <li>Log the breakdown by <code>(kind, rejected_type)</code> so the class balance is visible before training &mdash; e.g. if it's 90% <code>answer&rarr;repair</code> pairs and almost no <code>repair&rarr;bad</code>/<code>repeat&rarr;bad</code> pairs, DPO will mostly learn "stop over-asking" and barely touch the hallucination-on-ambiguous-audio failure mode.</li>
+</ul>
+
+<h3><span class="step-badge">3</span>Custom DPO training loop &mdash; new script <code>dpo_qwen.py</code></h3>
+<p>Reuses <code>sft_qwen.py</code>'s <code>load_processor</code>, <code>get_sft_model_cls("qwen3")</code>, <code>find_lm_linear_names</code>, and the full/prompt-diff labeling trick from <code>OmniSFTCollator</code> &mdash; just applied to two assistant completions (chosen, rejected) sharing the same audio+prompt prefix instead of one.</p>
+
+<h4>Reference model without doubling GPU memory</h4>
+<p>Loading a second full copy of a 30B model for the DPO reference is wasteful when the reference is <em>the exact SFT adapter you already have</em>. Instead, attach it twice to one frozen base model as two named PEFT adapters:</p>
+<pre><code>model = PeftModel.from_pretrained(base, sft_adapter_path, adapter_name="policy", is_trainable=True)
+model.load_adapter(sft_adapter_path, adapter_name="reference", is_trainable=False)
+
+# per step:
+model.set_adapter("reference")
+with torch.no_grad():
+    ref_logp_chosen, ref_logp_rejected = seq_logprobs(model, batch)
+
+model.set_adapter("policy")
+policy_logp_chosen, policy_logp_rejected = seq_logprobs(model, batch)   # requires grad
+
+loss = dpo_loss(policy_logp_chosen, policy_logp_rejected,
+                 ref_logp_chosen,   ref_logp_rejected,  beta=0.1)
+loss.backward()</code></pre>
+<p><code>seq_logprobs</code> = sum of per-token log-probs over the completion span only (same <code>labels != -100</code> mask <code>OmniSFTCollator</code> already builds, just computed for both the chosen and rejected assistant turns).</p>
+<p>DPO loss (Rafailov et al. 2024):</p>
+<pre><code>logits = beta * ((policy_logp_chosen - ref_logp_chosen)
+                - (policy_logp_rejected - ref_logp_rejected))
+loss = -F.logsigmoid(logits).mean()</code></pre>
+
+<h4>Memory</h4>
+<p>Single A100 80GB is available on this node. bf16 Qwen3-Omni-30B-A3B weights are ~60GB just for storage (MoE reduces active compute, not weight footprint) &mdash; already tight before DPO's extra forward passes. Recommend:</p>
+<ul>
+  <li><code>--qlora</code> (4-bit NF4 base, already implemented in <code>sft_qwen.py</code>'s <code>load_model</code>) to free headroom for the 4 forward passes (chosen/rejected &times; policy/reference) per step.</li>
+  <li>Gradient checkpointing (already used in <code>sft_qwen.py</code>), micro-batch size 1, gradient accumulation to reach an effective batch size of 8&ndash;16.</li>
+  <li>If it still OOMs, request 2 GPUs and shard the frozen base with <code>device_map="auto"</code> instead of the hardcoded <code>{"": 0}</code> in <code>load_model</code>.</li>
+</ul>
+
+<h4>Smoke test (mirror <code>sft_qwen.py --smoke</code>)</h4>
+<p>At initialization, <code>policy</code> and <code>reference</code> are identical adapters, so <code>policy_logp == ref_logp</code> for both chosen and rejected, which forces <code>logits == 0</code> and <code>loss == -log(0.5) &asymp; 0.693</code> exactly. Assert this before launching a real run &mdash; it's a strong, free correctness check on the dual-adapter plumbing.</p>
+
+<h4>Hyperparameters to start with</h4>
+<table>
+<tr><th>param</th><th>starting value</th><th>note</th></tr>
+<tr><td><code>beta</code></td><td>0.1</td><td>lower = larger policy shift allowed per step; sweep 0.05&ndash;0.3 if EAR barely moves or moves too fast</td></tr>
+<tr><td><code>lr</code></td><td>5e-6 &ndash; 1e-5</td><td>DPO typically wants a smaller LR than the SFT stage (<code>sft_qwen.py</code> used 2e-4)</td></tr>
+<tr><td>epochs</td><td>1&ndash;2</td><td>DPO overfits fast on a ~900-pair set; watch held-out margin, not just train loss</td></tr>
+<tr><td>effective batch size</td><td>8&ndash;16</td><td>via grad accumulation given the micro-batch-1 memory constraint above</td></tr>
+</table>
+
+<h3><span class="step-badge">4</span>Evaluate against the SFT baseline</h3>
+<p>No new eval code &mdash; rerun the existing script, pointed at the saved DPO adapter, same test split used for the baseline number (EAR 0.705, C=0.56 driven down by the 36% over-trigger rate):</p>
+<pre><code>python babble_eval_qwen.py \
+    --dataset keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-v1 --split test \
+    --model-path Qwen/Qwen3-Omni-30B-A3B-Instruct \
+    --adapter-path ./Qwen3-Omni-30B-A3B-Instruct-bab-dpo \
+    --judge-base-url "http://${JUDGE_HOST}:8000/v1"</code></pre>
+<p>Compare confusion matrices cell-by-cell against the baseline, not just aggregate EAR:</p>
+<ul>
+  <li><strong>Must improve:</strong> <code>answer&rarr;repair</code> + <code>answer&rarr;repeat</code> (currently 14+4=18/50) should shrink &mdash; this is the whole point.</li>
+  <li><strong>Must not regress:</strong> <code>repair&rarr;answer</code> (8/50) and <code>repeat&rarr;answer</code> (2/50) should not grow. If DPO overcorrects, the model swings from "over-asks" to "confidently hallucinates on ambiguous audio," which is worse than the bug it fixes &mdash; that failure mode is scored 1.0 by <code>SCORE_MATRIX</code> only when the guess happens to be <em>correct</em>; a wrong guess is <code>bad</code> (0.0), so watch <code>repair&rarr;bad</code> / <code>repeat&rarr;bad</code> too.</li>
+</ul>
+
+<div class="risk">
+<strong>Risk: reward hacking on response shape, not content.</strong> DPO can learn shallow patterns that flip <code>judged_type</code> without real improvement (e.g. always tacking on "...right?" to sound more like "answer" per the rubric's phrasing rules). Manually read 15&ndash;20 sample outputs across all three kinds after training, not just the aggregate score.
+</div>
+<div class="risk">
+<strong>Risk: pair-count imbalance skews what gets fixed.</strong> If step 2's yield is dominated by <code>answer&rarr;{repair,repeat}</code> pairs (very likely, since that's the majority failure mode measured), DPO will preferentially learn "stop over-asking" and may leave the rarer <code>*&rarr;bad</code> hallucination pairs under-corrected. If that matters more than the over-triggering fix, consider oversampling the <code>bad</code>-labeled pairs when building the training set in step 2.
+</div>
+
+<h2>Open questions before running step 2/3 for real</h2>
+<ul>
+  <li>Should the harvest pass (step 1) use a single greedy rollout per row (matches how the model is evaluated/used, simplest), or a few sampled rollouts per row (<code>do_sample=True</code>, temperature &gt; 0) to increase negative yield on rows the greedy decode already gets right? Starting with greedy-only is the simpler default and directly reflects real deployment behavior.</li>
+  <li>Confirm whether the existing <code>Qwen3-Omni-30B-A3B-Instruct-bab-sft</code> adapter was trained with <code>--qlora</code> or full bf16 &mdash; the DPO reference and policy adapters must be loaded onto a base model with matching precision to the checkpoint they were trained against, or the "identical logp at init" smoke-test assertion will fail for a spurious reason.</li>
+</ul>
+
+<footer>Generated as a planning doc for the omni-pt repo. No code has been written yet for steps 0&ndash;3 &mdash; say the word and I'll implement the <code>--out</code> flag, <code>babble_dpo_data.py</code>, and <code>dpo_qwen.py</code>.</footer>
+
+</body>
+</html>

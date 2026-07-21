@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import random
+import re
+import string
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -164,7 +166,7 @@ def base_generate_batch(convs, max_new_tokens):
     )
     gen = out[:, inputs["input_ids"].shape[1] :]
     return [
-        t.strip() for t in base_processor.batch_decode(gen, skip_special_tokens=True)
+        t.lower().strip() for t in base_processor.batch_decode(gen, skip_special_tokens=True)
     ]
 
 
@@ -225,6 +227,9 @@ the noise:
 spelling differences are fine), OR the assistant's restatement or reply \
 correctly contains it — that proves the assistant heard the piece, whether \
 or not the reply agrees to, is able to, or actually does perform the task.
+- All three texts above are shown lowercase with punctuation stripped, so \
+compare on the words alone — case and punctuation are never evidence of \
+loss or of the action/intent changing.
 - A piece was LOST only if BOTH passes missed it: it is absent, garbled, or \
 replaced by a wrong word in the transcript, AND it does not appear correctly \
 in the restatement or reply either.
@@ -234,8 +239,10 @@ proof of survival.
 - Losing only filler words never counts as a loss.
 - Singular/plural, spelling, and other minor wording differences in the \
 transcript count as survived, even if the reply heard something else.
-- The action/intent changing (e.g. a command becoming a question) counts \
-as that action piece being lost.
+- The action/intent changing counts as that action piece being lost — but \
+only when the WORDS actually change (e.g. "set an alarm" heard as "cancel \
+an alarm"), never merely because the transcript is rendered with standard \
+capitalization/punctuation.
 
 Give each key piece ONE verdict and never revisit it — no deliberation, no \
 "wait", no re-evaluating. Keep "reason" under 60 words total.
@@ -270,10 +277,45 @@ being misheard as wrong word(s), not deletion. Quote the misheard word(s). \
 Otherwise, it will be empty."""
 
 
+_PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+
+
+def _normalize_text(s):
+    """Lowercase + strip punctuation, so the judge can't misread ASR-standard \
+    capitalization/punctuation as a wording or intent change."""
+    return " ".join(s.translate(_PUNCT_TABLE).lower().split())
+
+
+def _words(s):
+    return re.findall(r"[a-z0-9']+", s.lower())
+
+
+def _span_survived(span, *texts):
+    """True if `span`'s words appear as a contiguous run in any of `texts`.
+
+    Enforces the rubric's own rule in code: a verbatim match in the
+    transcript or the assistant's response is conclusive proof of survival.
+    The judge is run at CLASSIFY_TEMPERATURE=0, so a wrong call here is
+    deterministic and re-asking the same prompt would just repeat it —
+    this overrides it instead of retrying.
+    """
+    span_words = _words(span)
+    if not span_words:
+        return False
+    n = len(span_words)
+    for text in texts:
+        t_words = _words(text)
+        if any(t_words[i : i + n] == span_words for i in range(len(t_words) - n + 1)):
+            return True
+    return False
+
+
 def classify_many(items, workers=CLASSIFY_WORKERS):
     def classify(sentence, transcript, response, retries=2):
         prompt = CLASSIFY_PROMPT.format(
-            sentence=sentence, transcript=transcript, response=response
+            sentence=_normalize_text(sentence),
+            transcript=_normalize_text(transcript),
+            response=_normalize_text(response),
         )
         for attempt in range(retries + 1):
             obj = gpt_json(
@@ -294,6 +336,18 @@ def classify_many(items, workers=CLASSIFY_WORKERS):
             ):
                 time.sleep(2**attempt)
                 continue
+
+            if kind in ("repair", "repeat"):
+                survived = [m for m in missing if _span_survived(m, transcript, response)]
+                if survived:
+                    missing = [m for m in missing if m not in survived]
+                    if not missing:
+                        kind, misheard = "answer", ""
+                    elif len(missing) == 1:
+                        kind = "repair"
+                    else:
+                        kind = "repeat"
+
             return {
                 "kind": kind,
                 "missing": missing,
