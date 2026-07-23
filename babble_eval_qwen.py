@@ -19,7 +19,6 @@ pass --model-family explicitly.
 import argparse
 import json
 import os
-import re
 import tempfile
 import time
 from collections import Counter

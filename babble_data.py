@@ -8,8 +8,7 @@ transcript, response) and labels the probe:
                 filler only loss
 - "repair":     exactly ONE key piece was lost or misheard;
                 the rest can be trusted
-- "repair_full":    more than one key piece lost, or the transcript
-                    can't be trusted at all.
+- "repeat":    more than one key piece lost in both passes
 """
 
 import argparse
@@ -85,7 +84,7 @@ TARGET_MAX_TOKENS = 1024
 CLASSIFY_WORKERS = 8  # parallel classifier calls to vLLM
 
 ASR_MAX_NEW_TOKENS = 64
-RESP_MAX_NEW_TOKENS = 96  # task response from base omni model
+RESP_MAX_NEW_TOKENS = 256  # task response from base omni model
 
 KINDS = ("answer", "repair", "repeat")
 
@@ -117,11 +116,8 @@ ASR_PROMPT = "Transcribe the English audio into text without any punctuation mar
 # behavior the eval model will exhibit
 TASK_PROMPT = (
     "You are a smart voice device with full access to the user's apps, "
-    "accounts, devices, information, and the internet. Listen to the user's "
-    "spoken request. First write 'Heard:' followed by the request exactly as "
-    "you heard it, word for word. Then write 'Reply:' followed by your "
-    "response, addressing everything the request asks for as concisely as "
-    "natural."
+    "accounts, devices, information, and the internet. Listen to the user's spoken "
+    "request and respond naturally and concisely, addressing everything it asks."
 )
 
 
@@ -166,7 +162,8 @@ def base_generate_batch(convs, max_new_tokens):
     )
     gen = out[:, inputs["input_ids"].shape[1] :]
     return [
-        t.lower().strip() for t in base_processor.batch_decode(gen, skip_special_tokens=True)
+        t.lower().strip()
+        for t in base_processor.batch_decode(gen, skip_special_tokens=True)
     ]
 
 
@@ -175,7 +172,7 @@ def base_generate_batch(convs, max_new_tokens):
 # ---
 
 
-def gpt_json(prompt, temperature, max_tokens):
+def gpt_json(system, user, temperature, max_tokens):
     raw = None
     try:
         resp = client.chat.completions.create(
@@ -184,7 +181,10 @@ def gpt_json(prompt, temperature, max_tokens):
             max_tokens=max_tokens,
             response_format={"type": "json_object"},
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
         )
         msg = resp.choices[0].message
         raw = (msg.content or "").strip()
@@ -201,51 +201,68 @@ def gpt_json(prompt, temperature, max_tokens):
 # LLM probe classification
 # ---
 
-CLASSIFY_PROMPT = """You are labeling noisy-audio for training a smart \
-voice assistant. The user's real spoken command was:
-"{sentence}"
-
-The command was mixed with loud background chatter. Two independent passes \
-listened to the SAME noisy audio:
-1. A speech recognizer transcribed it as:
-"{transcript}"
-2. A voice assistant restated what it heard ("Heard:") and then replied \
-("Reply:"):
-"{response}"
+# Prompt is split into a static SYSTEM prefix (identical on every call) and a
+# tiny USER suffix carrying only the per-probe data. The invariant rubric
+# therefore forms a long shared prefix that vLLM's automatic prefix cache can
+# reuse across all classify calls; only the short trailing case is recomputed.
+CLASSIFY_SYSTEM = """You are labeling noisy-audio for training a smart \
+voice assistant. You will be given three texts:
+- COMMAND: the user's real spoken command.
+- TRANSCRIPT: a speech recognizer's transcription of the SAME command after \
+it was mixed with loud background chatter.
+- REPLY: a voice assistant's reply to that same noisy audio.
+COMMAND is the ground-truth command. TRANSCRIPT, and REPLY are the two \
+independent passes over the same noisy audio.
 
 "Key info" means any piece the assistant must know to correctly perform the \
 task: entities, names, places, times, dates, quantities, titles, the \
 requested action or topic. A piece is key info ONLY if the task cannot be \
 correctly performed without it. Carrier/filler words ("please", "could you", \
-"hey", "tell me", "what") are NOT key info, and neither is a word whose \
+"hey", "tell me", "what") are NOT key info. Wake words and the assistant's \
+name or vocative ("hey olly", "ok google", "assistant") are NOT key info \
+either — they are not needed to perform the task, so a misheard wake word \
+("olly" heard as "ollie") never counts as a loss or triggers a repair. \
+Neither is a word whose \
 meaning is already implied by the rest of the command (e.g. "set" in "are \
 there any alarms set" — the command means the same thing without it).
 
 First decide, for EACH key piece of the real command, whether it SURVIVED \
-the noise:
+the noise. Survival is about whether the piece was HEARD, judged \
+semantically, not about exact wording:
 - A piece SURVIVED if the transcript contains it correctly (minor wording or \
-spelling differences are fine), OR the assistant's restatement or reply \
-correctly contains it — that proves the assistant heard the piece, whether \
-or not the reply agrees to, is able to, or actually does perform the task.
-- All three texts above are shown lowercase with punctuation stripped, so \
-compare on the words alone — case and punctuation are never evidence of \
-loss or of the action/intent changing.
+spelling differences are fine), OR the assistant's reply demonstrates it \
+heard and understood that piece. Judge the reply by whether it shows the \
+piece got through, NOT by whether it repeats the piece word-for-word: a \
+natural paraphrase counts, and so does a capability-decline or a hand-off \
+to the user that correctly refers to the piece (e.g. "i cant check the game \
+score for you", "you can see your alarms in the clock app") — both \
+demonstrate the piece was heard even though the task is refused or offloaded. \
+What matters is that the reply uses the piece correctly, whether or not the \
+reply agrees to, is able to, or actually does perform the task.
+- The COMMAND, TRANSCRIPT, and REPLY are all shown lowercase with punctuation \
+stripped, so compare on the words alone — case and punctuation are never \
+evidence of loss or of the action/intent changing.
 - A piece was LOST only if BOTH passes missed it: it is absent, garbled, or \
-replaced by a wrong word in the transcript, AND it does not appear correctly \
-in the restatement or reply either.
+replaced by a wrong word in the transcript, AND the reply neither contains \
+it nor otherwise demonstrates it was heard.
 - The assistant asserting a wrong detail does NOT mark a piece lost when the \
 transcript has that piece correctly — the transcript alone is sufficient \
 proof of survival.
 - Losing only filler words never counts as a loss.
 - Singular/plural, spelling, and other minor wording differences in the \
 transcript count as survived, even if the reply heard something else.
+- SPECIAL CARE with substituted words. A DIFFERENT word in the transcript is \
+a mishearing. HOWEVER, if the REPLY contains the correct original word or \
+clearly demonstrates it understood the intent anyway, the piece still SURVIVED. \
+A correct reply always overrides a bad transcript. Do NOT rationalize \
+meaning-changing swaps (e.g., "controls" for "choose") as a spelling variant.
 - The action/intent changing counts as that action piece being lost — but \
 only when the WORDS actually change (e.g. "set an alarm" heard as "cancel \
 an alarm"), never merely because the transcript is rendered with standard \
 capitalization/punctuation.
 
-Give each key piece ONE verdict and never revisit it — no deliberation, no \
-"wait", no re-evaluating. Keep "reason" under 60 words total.
+Evaluate the transcript and the reply SEPARATELY before making a final verdict. \
+Keep evaluations short and under 60 words total.
 
 Then classify as exactly one of:
 - "answer": every key piece survived.
@@ -262,12 +279,12 @@ has only ONE key piece and it was lost — OR the audio was so garbled that \
 neither pass caught the key pieces. A targeted question is impossible when \
 there is not enough reliably-heard command left to anchor it on.
 
-Return ONLY valid JSON in exactly this shape (reason first):
-{{"reason": "<one short verdict per key piece, e.g. '7 am: lost in both; \
-alarm: survived via transcript'>", \
+Return ONLY valid JSON in exactly this shape (evaluations first):
+{"transcript_evaluation": "<one short verdict per key piece checking ONLY the transcript, e.g. '7 am: lost; alarm: survived'>", \
+"reply_evaluation": "<one short verdict per key piece checking ONLY the reply, e.g. '7 am: missing; alarm: survived because reply says alarms'>", \
 "missing": ["<lost key piece 1>", ...], \
 "misheard_as": "<wrong word heard instead, or empty string>", \
-"kind": "answer" | "repair" | "repeat"}}
+"kind": "answer" | "repair" | "repeat"}
 
 Rules for "missing": quote the lost pieces using the words of the REAL \
 command. For "answer" it must be an empty list. For "repair" it must contain \
@@ -275,6 +292,13 @@ exactly one key piece. For "repeat" it must contain more than one key piece. \
 Rules for "misheard_as": when "kind" is "repair", and the lost key piece is \
 being misheard as wrong word(s), not deletion. Quote the misheard word(s). \
 Otherwise, it will be empty."""
+
+
+CLASSIFY_USER = (
+    'COMMAND:\n"{sentence}"\n\n'
+    'TRANSCRIPT:\n"{transcript}"\n\n'
+    'REPLY:\n"{response}"'
+)
 
 
 _PUNCT_TABLE = str.maketrans("", "", string.punctuation)
@@ -290,91 +314,23 @@ def _words(s):
     return re.findall(r"[a-z0-9']+", s.lower())
 
 
-def _span_survived(span, *texts):
-    """True if `span`'s words appear as a contiguous run in any of `texts`.
-
-    Enforces the rubric's own rule in code: a verbatim match in the
-    transcript or the assistant's response is conclusive proof of survival.
-    The judge is run at CLASSIFY_TEMPERATURE=0, so a wrong call here is
-    deterministic and re-asking the same prompt would just repeat it —
-    this overrides it instead of retrying.
-    """
-    span_words = _words(span)
-    if not span_words:
-        return False
-    n = len(span_words)
-    for text in texts:
-        t_words = _words(text)
-        if any(t_words[i : i + n] == span_words for i in range(len(t_words) - n + 1)):
-            return True
-    return False
-
-
-def classify_many(items, workers=CLASSIFY_WORKERS):
-    def classify(sentence, transcript, response, retries=2):
-        prompt = CLASSIFY_PROMPT.format(
-            sentence=_normalize_text(sentence),
-            transcript=_normalize_text(transcript),
-            response=_normalize_text(response),
-        )
-        for attempt in range(retries + 1):
-            obj = gpt_json(
-                prompt, temperature=CLASSIFY_TEMPERATURE, max_tokens=CLASSIFY_MAX_TOKENS
-            )
-
-            # parse classifier response
-            if obj is None:
-                return None
-            kind = str(obj.get("kind", "")).strip().lower()
-            if kind not in KINDS:
-                return None
-            missing = [str(s).strip() for s in obj.get("missing", []) if str(s).strip()]
-            misheard = str(obj.get("misheard_as", "")).strip()
-            reason = str(obj.get("reason", "")).strip()
-            if (kind == "answer" and missing) or (
-                kind == "repair" and len(missing) != 1
-            ):
-                time.sleep(2**attempt)
-                continue
-
-            if kind in ("repair", "repeat"):
-                survived = [m for m in missing if _span_survived(m, transcript, response)]
-                if survived:
-                    missing = [m for m in missing if m not in survived]
-                    if not missing:
-                        kind, misheard = "answer", ""
-                    elif len(missing) == 1:
-                        kind = "repair"
-                    else:
-                        kind = "repeat"
-
-            return {
-                "kind": kind,
-                "missing": missing,
-                "misheard_as": misheard,
-                "reason": reason,
-            }
-
-        return None
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        return list(ex.map(lambda it: classify(*it), items))
-
-
 # ---
 # Target generation
 # ---
 
-TARGET_PROMPT = """You are writing training targets for a smart voice \
+TARGET_SYSTEM = """You are writing training targets for a smart voice \
 assistant that has full access to the user's apps, accounts, information, and the internet.
 
-The user's spoken command was:
-"{sentence}"
+You will be given, in the next message, the user's spoken COMMAND and two \
+speech-recognition transcripts of it under increasing background chatter: a \
+REPAIR-TRANSCRIPT that lost exactly one piece (with the LOST-PIECE named, and \
+a MISHEARD-AS value if that piece was swapped for a wrong word), and a \
+REPEAT-TRANSCRIPT that lost too much. Produce three targets for that COMMAND.
 
 Return ONLY valid JSON in exactly this shape:
-{{"answer": "<a short natural response, covering every part of the request>", \
+{"answer": "<a short natural response, covering every part of the request>", \
 "repair": "<one short question>", \
-"repeat": "<one short request>"}}
+"repeat": "<one short request>"}
 
 Rules for "answer": despite background chatter, the full command was heard correctly.
     - If the command asks for more than one distinct thing (e.g. two \
@@ -394,11 +350,11 @@ tense ("I'm setting...", "I'll remind you...")
     - Stay natural and concise — don't pad with extra sentences beyond what \
 covering the full request requires.
 
-Rules for "repair": the device heard the command over loud background chatter, \
-and its speech recognition produced:
-"{repair_transcript}"
-The one piece it lost from the real command is "{lost_span}". Everything else \
-can be treated as heard.{swap_note} \
+Rules for "repair": the device heard the command over loud background \
+chatter, and its speech recognition produced the REPAIR-TRANSCRIPT. The one \
+piece it lost from the real command is the LOST-PIECE; everything else can be \
+treated as heard. If a MISHEARD-AS value is given, the recognizer heard that \
+similar-sounding wrong word in place of the lost piece. \
 Write ONE short natural question (under 20 words) that recovers ONLY that \
 piece. Test: if the user replied with just the missing words, the command \
 would be complete.
@@ -407,18 +363,18 @@ would sound like the assistant wasn't listening.
   - Ground the question in the parts heard correctly (words matching \
 the original), so it is clear the assistant followed everything except this one piece.
   - Do not reveal the missing words. ONE exception: if a word was swapped \
-for a similar-sounding wrong word, you may ask a confirmation question that \
-offers the true word AND the misheard word as alternatives ("did you say \
-saved or shared?") — never the true word alone.
+for a similar-sounding wrong word (the MISHEARD-AS value), you may ask a \
+confirmation question that offers the true word AND the misheard word as \
+alternatives ("did you say saved or shared?") — never the true word alone.
   - Sound like natural speech, not a form. Vary structure freely: \
 "Which...?", "How long before...?", "Who should...?", "What time...?", \
 "Where...?", or a statement+question like "I lost one part — where to?". \
 Do NOT default to starting with "Sorry".
 
-Rules for "repeat": at even louder chatter, speech recognition produced:
-"{full_transcript}"
-Too many pieces were lost for a targeted question. Write ONE short natural \
-request (under 15 words) asking the user to repeat the whole command.
+Rules for "repeat": at even louder chatter, speech recognition produced the \
+REPEAT-TRANSCRIPT. Too many pieces were lost for a targeted question. Write \
+ONE short natural request (under 15 words) asking the user to repeat the \
+whole command.
   - Do NOT reference, guess, or hint at ANY content details from either the \
 real command or the garbled transcription — the assistant cannot trust any of it.
   - Mentioning the noise/chatter is fine and helps explain why.
@@ -428,14 +384,20 @@ again?"). Do NOT default to starting with "Sorry".
 """
 
 
+# variable suffix, kept last so TARGET_SYSTEM stays cacheable
+TARGET_USER = (
+    'COMMAND:\n"{sentence}"\n\n'
+    'REPAIR-TRANSCRIPT:\n"{repair_transcript}"\n'
+    'LOST-PIECE: "{lost_span}"{swap_note}\n\n'
+    'REPEAT-TRANSCRIPT:\n"{full_transcript}"'
+)
+
+
 def generate_targets(sentence, repair_probe, repeat_probe, retries=3):
     swap_note = ""
     if repair_probe["swapped"]:
-        swap_note = (
-            f" Note: in place of the missing piece, the recognizer heard "
-            f'"{repair_probe["swapped"][0]}".'
-        )
-    prompt = TARGET_PROMPT.format(
+        swap_note = f'\nMISHEARD-AS: "{repair_probe["swapped"][0]}"'
+    user = TARGET_USER.format(
         sentence=sentence,
         repair_transcript=repair_probe["transcript"],
         lost_span=repair_probe["lost"][0],
@@ -445,7 +407,9 @@ def generate_targets(sentence, repair_probe, repeat_probe, retries=3):
 
     answer = None
     for attempt in range(retries):
-        obj = gpt_json(prompt, temperature=0.7, max_tokens=TARGET_MAX_TOKENS)
+        obj = gpt_json(
+            TARGET_SYSTEM, user, temperature=0.7, max_tokens=TARGET_MAX_TOKENS
+        )
         if obj is None:
             time.sleep(2**attempt)
             continue
@@ -506,6 +470,49 @@ def make_probe_batch(clean, pool, missing):
 
 
 def probe_triplet(clean, pool, sentence):
+    def classify(sentence, transcript, response, retries=2):
+        user = CLASSIFY_USER.format(
+            sentence=_normalize_text(sentence),
+            transcript=_normalize_text(transcript),
+            response=_normalize_text(response),
+        )
+        for attempt in range(retries + 1):
+            obj = gpt_json(
+                CLASSIFY_SYSTEM,
+                user,
+                temperature=CLASSIFY_TEMPERATURE,
+                max_tokens=CLASSIFY_MAX_TOKENS,
+            )
+
+            # parse classifier response
+            if obj is None:
+                return None
+            kind = str(obj.get("kind", "")).strip().lower()
+            if kind not in KINDS:
+                return None
+            missing = [str(s).strip() for s in obj.get("missing", []) if str(s).strip()]
+            misheard = str(obj.get("misheard_as", "")).strip()
+            
+            # Extract both evaluations and combine them for the final dataset
+            transcript_eval = str(obj.get("transcript_evaluation", "")).strip()
+            reply_eval = str(obj.get("reply_evaluation", "")).strip()
+            reason = f"Transcript: {transcript_eval} | Reply: {reply_eval}"
+
+            if (kind == "answer" and missing) or (
+                kind == "repair" and len(missing) != 1
+            ):
+                time.sleep(2**attempt)
+                continue
+
+            return {
+                "kind": kind,
+                "missing": missing,
+                "misheard_as": misheard,
+                "reason": reason,
+            }
+
+        return None
+
     results: dict[str, dict | None] = {k: None for k in KINDS}
     for _ in range(MAX_PROBES):
         missing_slots = [k for k, v in results.items() if v is None]
@@ -523,9 +530,14 @@ def probe_triplet(clean, pool, sentence):
         convs = [_conv(a, sysp, TASK_PROMPT) for a in audios]
         responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)
 
-        labels = classify_many(
-            [(sentence, t, r) for t, r in zip(transcripts, responses)]
-        )
+        with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
+            labels = list(
+                ex.map(
+                    lambda it: classify(*it),
+                    [(sentence, t, r) for t, r in zip(transcripts, responses)],
+                )
+            )
+
         for snr, noisy, transcript, response, label in zip(
             snrs, audios, transcripts, responses, labels
         ):
@@ -643,6 +655,12 @@ def build_triplets(source_split, n_triplets, tag, seen_slurp_ids):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--omni-path", default="Qwen/Qwen2.5-Omni-3B")
+    ap.add_argument(
+        "--ds-id",
+        required=True,
+        help="HF Hub repo id to push the generated dataset to. Defaults to "
+        "REPO_TMPL formatted with the omni model name.",
+    )
     args = ap.parse_args()
 
     # init base omni model
@@ -670,7 +688,7 @@ if __name__ == "__main__":
         )
 
     # push to hub
-    repo_id = REPO_TMPL.format(args.omni_path.rstrip("/").split("/")[-1])
+    repo_id = args.ds_id
     DatasetDict({"train": list2ds(train_rows), "test": list2ds(test_rows)}).push_to_hub(
         repo_id
     )

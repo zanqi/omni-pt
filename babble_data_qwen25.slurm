@@ -14,10 +14,8 @@
 #SBATCH --time=01-0:00:00 # Max runtime in DD-HH:MM:SS format.
 
 #SBATCH --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt
-#SBATCH --output=babble_data_%j.log
+#SBATCH --output=logs/babble_data_%j.log
 #SBATCH --export=all
-source ~/.bashrc
-conda activate qwen3omni
 # export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # fail fast if the vLLM judge (target-generation) server isn't reachable
@@ -29,7 +27,11 @@ if ! curl -sf --max-time 10 "http://${JUDGE_HOST}:8000/v1/models" > /dev/null; t
 fi
 echo "judge OK at http://${JUDGE_HOST}:8000/v1"
 
-# -u: unbuffered stdout so errors/progress show up in the log immediately
-python -u babble_data.py --omni-path Qwen/Qwen3-Omni-30B-A3B-Instruct
 
-# sbatch /gscratch/sciencehub/zanqil/projects/omni-pt/babble_data.slurm
+source ~/.bashrc
+DS_ID_QWEN25="${1:-keylazy/slurp-babble-Qwen2.5-Omni-3B-v3}"
+
+echo "Generating Qwen2.5 dataset -> ${DS_ID_QWEN25}"
+conda activate qwen25omni
+python -u babble_data.py --omni-path Qwen/Qwen2.5-Omni-3B --ds-id "$DS_ID_QWEN25"
+echo "Qwen2.5 dataset generated successfully."
