@@ -30,6 +30,7 @@ from openai import OpenAI
 from qwen_omni_utils import process_mm_info
 from tqdm import tqdm
 from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
+from prompts import TASK_PROMPT
 
 skip = Counter()
 
@@ -57,7 +58,7 @@ N_TEST_TRIPLETS = 50
 
 # Classification + Target generation are served by the local vLLM judge
 # box. Its slurm job records the node it landed on in VLLM_HOST_FILE.
-TARGET_MODEL = "Qwen/Qwen3.5-122B-A10B-FP8"
+TARGET_MODEL = "Qwen/Qwen3.6-35B-A3B-FP8"
 VLLM_HOST_FILE = "/gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt"
 REPO_TMPL = "keylazy/slurp-babble-{}-v1"
 MASK_DS_ID = "keylazy/slurp-ear-sft"
@@ -111,14 +112,6 @@ IM_END_ID = None
 
 ASR_SYSTEM_PROMPT = "You are a speech recognition model."
 ASR_PROMPT = "Transcribe the English audio into text without any punctuation marks."
-
-# task-response pass mirrors the eval setup so the classifier sees the same
-# behavior the eval model will exhibit
-TASK_PROMPT = (
-    "You are a smart voice device with full access to the user's apps, "
-    "accounts, devices, information, and the internet. Listen to the user's spoken "
-    "request and respond naturally and concisely, addressing everything it asks."
-)
 
 
 def _conv(audio, system_prompt, user_prompt):

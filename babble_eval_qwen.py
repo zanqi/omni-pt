@@ -26,16 +26,10 @@ import soundfile as sf
 import torch
 from datasets import load_dataset, Audio
 from openai import OpenAI
-
 from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
+from prompts import TASK_PROMPT
 
 AUDIO_SAMPLING_RATE = 16000
-
-TASK_PROMPT = (
-    "You are a smart voice device with full access to the user's apps, "
-    "accounts, devices, information, and the internet. Listen to the user's spoken request "
-    "and respond naturally and concisely, addressing everything it asks."
-)
 
 JUDGED_TYPES = ("answer", "repair", "repeat", "bad")
 # Tree-rule score matrix: score = SCORE_MATRIX[target kind][judged type]
@@ -343,6 +337,7 @@ def main():
     ap.add_argument("--split", default="test")
     ap.add_argument("--model-path", default="Qwen/Qwen2.5-Omni-3B")
     ap.add_argument("--adapter-path", default=None)
+    ap.add_argument("--out", default=None)
     ap.add_argument(
         "--model-family",
         default="auto",
@@ -351,7 +346,7 @@ def main():
     )
     ap.add_argument(
         "--judge-model",
-        default="Qwen/Qwen3.5-122B-A10B-FP8",
+        default="Qwen/Qwen3.6-35B-A3B-FP8",
         help="from vllm --served-model-name; from openai, gpt-4o"
         )
     ap.add_argument(
@@ -379,7 +374,7 @@ def main():
 
     name_src = args.adapter_path or args.model_path
     model_name = name_src.rstrip("/").split("/")[-1]
-    out_path = f"bab_results_{model_name}_slurp.jsonl"
+    out_path = args.out or f"bab_results_{model_name}_v2.jsonl"
 
     ds = load_dataset(args.dataset, split=args.split)
 
@@ -427,6 +422,7 @@ def main():
                 "sentence": sentence,
                 "snr_db": row["snr_db"],
                 "asr_transcript": asr_transcript,
+                "base_response": row["omni_response"],
                 "lost": lost,
                 "target": row["target"],
                 "response": resp,

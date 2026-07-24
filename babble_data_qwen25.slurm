@@ -29,7 +29,7 @@ echo "judge OK at http://${JUDGE_HOST}:8000/v1"
 
 
 source ~/.bashrc
-DS_ID_QWEN25="${1:-keylazy/slurp-babble-Qwen2.5-Omni-3B-v3}"
+DS_ID_QWEN25="${1:-keylazy/slurp-babble-Qwen2.5-Omni-3B-v4}"
 
 echo "Generating Qwen2.5 dataset -> ${DS_ID_QWEN25}"
 conda activate qwen25omni
