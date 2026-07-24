@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Response-only labeling: drop the ASR pass, ground the reply</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5b5b5b; --rule: #ddd;
+    --code-bg: #f4f4f5; --accent: #8a3ffc; --bad: #c0392b; --ok: #1a7f37;
+    --card: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#15161a; --fg:#e8e8ea; --muted:#a0a0a8; --rule:#33343a;
+      --code-bg:#1e1f25; --accent:#b794ff; --bad:#ff6b6b; --ok:#4fd07a; --card:#1b1c22; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 880px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem;
+  }
+  h1 { font-size: 1.7rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.8rem; border-bottom: 1px solid var(--rule); padding-bottom: .4rem; }
+  h3 { font-size: 1.02rem; margin-top: 1.6rem; color: var(--accent); }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .87em; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg); padding: .9rem 1rem; border-radius: 8px;
+    overflow-x: auto; line-height: 1.5; border: 1px solid var(--rule);
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--rule); padding: .45rem .6rem; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); }
+  .card {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1rem 1.2rem; margin: 1rem 0;
+  }
+  .step-badge {
+    display: inline-block; background: var(--accent); color: #fff;
+    border-radius: 999px; width: 1.6em; height: 1.6em; line-height: 1.6em;
+    text-align: center; font-weight: 600; font-size: .85em; margin-right: .5em;
+  }
+  .risk { border-left: 3px solid var(--bad); padding-left: .9rem; margin: .8rem 0; }
+  .good { color: var(--ok); }
+  .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  ul { padding-left: 1.3rem; }
+  li { margin: .3rem 0; }
+  del { color: var(--bad); }
+  ins { color: var(--ok); text-decoration: none; }
+  footer { margin-top: 3rem; color: var(--muted); font-size: .85rem; border-top: 1px solid var(--rule); padding-top: 1rem; }
+</style>
+</head>
+<body>
+
+<h1>Response-only labeling</h1>
+<p class="subtitle">Drop the ASR probe pass entirely. Make the task prompt ask the model to ground its reply in what it heard, and let that single reply carry all the survival evidence &mdash; for the classifier, for target writing, and at eval.</p>
+
+<div class="card">
+<strong>Decisions taken (from the pre-plan questions)</strong>
+<ul>
+  <li><strong>Prompt scope: everywhere.</strong> The grounded prompt is used by the data-gen probe, by SFT, and at eval &mdash; train and test framing stay matched. This cascades into target style and into what the eval judge sees.</li>
+  <li><strong>Response shape: naturally grounded reply.</strong> One natural sentence or two that names the request's details back. No <code>Heard: &hellip; / Reply: &hellip;</code> scaffolding in the output format.</li>
+  <li><strong>Target generation: conditioned on base replies</strong> instead of ASR transcripts.</li>
+  <li><strong>Plumbing: <code>--resp-only</code> flag on <code>babble_data.py</code></strong> &mdash; one code path, both variants runnable, prompt variants side by side in <code>prompts.py</code>. Existing baseline datasets stay byte-reproducible.</li>
+</ul>
+</div>
+
+<h2>What changes, at a glance</h2>
+
+<table>
+<tr><th></th><th>Current (two-pass)</th><th>New (<code>--resp-only</code>)</th></tr>
+<tr><td><strong>Passes per probe audio</strong></td><td>2 &mdash; ASR transcript (64 tok) + task reply (256 tok)</td><td>1 &mdash; task reply only</td></tr>
+<tr><td><strong>Task prompt</strong></td><td><code>TASK_PROMPT</code>: respond naturally and concisely</td><td><code>TASK_PROMPT_GROUNDED</code>: &hellip; and name the details you heard back</td></tr>
+<tr><td><strong>Classifier input</strong></td><td>COMMAND + TRANSCRIPT + REPLY</td><td>COMMAND + REPLY</td></tr>
+<tr><td><strong>Survival rule</strong></td><td>lost only if <em>both</em> passes missed it; transcript alone can prove survival and overrides a wrong reply</td><td>lost if the reply neither contains it nor demonstrates it; a confidently wrong restatement <em>is</em> the loss signal</td></tr>
+<tr><td><strong>Target writer input</strong></td><td>COMMAND + REPAIR-TRANSCRIPT + REPEAT-TRANSCRIPT + LOST-PIECE</td><td>COMMAND + REPAIR-REPLY + LOST-PIECE <span class="muted">(repeat reply deliberately withheld &mdash; see step 3)</span></td></tr>
+<tr><td><strong>Eval judge rubric</strong></td><td><code>RESPONSE_TYPE_SYSTEM</code>, sees (sentence, response)</td><td><span class="good">unchanged</span> &mdash; it is already response-only by construction</td></tr>
+<tr><td><strong>Datasets</strong></td><td><code>&hellip;-Omni-3B-v3</code> / <code>&hellip;-Instruct-v1</code></td><td><code>&hellip;-Omni-3B-resp-v1</code> / <code>&hellip;-Instruct-resp-v1</code></td></tr>
+</table>
+
+<div class="card">
+<strong>Why the prompt change is load-bearing, not cosmetic</strong>
+<p style="margin-bottom:.4rem">The two-pass design exists because a task reply is a <em>lossy</em> witness of what was heard: &ldquo;Sure, I'll take care of that&rdquo; proves nothing about any piece. The transcript was the fallback witness. Remove it and a generic reply becomes indistinguishable from total loss &mdash; every such row lands in <code>repeat</code>. The grounded prompt is what makes the single witness informative enough to replace two: it forces the reply to name the action and the entities/times/quantities it caught, so the classifier can check each key piece against the reply alone.</p>
+<p style="margin:0"><strong>Constraint:</strong> the grounded prompt must <em>not</em> mention clarifying questions or repair. Whether the base model asks a targeted question when a piece is missing is exactly what the benchmark measures; instructing it to would contaminate both the labels and the eval baseline. It adds restatement only.</p>
+</div>
+
+<h2>Steps</h2>
+
+<h3><span class="step-badge">1</span>Free dry run first: replay the classifier over data you already have</h3>
+<p>Before touching a GPU. The existing datasets already store the base model's reply per row in the <code>omni_response</code> column, alongside the two-pass <code>kind</code> label. So the new response-only classifier can be scored against the old labels for the cost of some vLLM calls:</p>
+<pre><code>load keylazy/slurp-babble-Qwen2.5-Omni-3B-v3 (train)
+for each row: classify_resp(sentence, omni_response) -> kind'
+report: agreement rate, and the confusion kind -> kind'</code></pre>
+<p>This tells you the single most important unknown &mdash; <em>how much does dropping the transcript move the labels, and in which direction</em> &mdash; before spending a full regeneration run. Expect the drift to be concentrated in <code>answer &rarr; repair</code> and <code>repair &rarr; repeat</code> (evidence removed can only ever make a row look harder, never easier).</p>
+<div class="risk">
+<strong>Read it as a lower bound, not the real number.</strong> Those stored replies were produced under the <em>old</em> prompt, so they are exactly the uninformative-witness case the grounded prompt is meant to fix. Real agreement after the prompt change will be higher than what this dry run shows. Use it to size the problem and to debug the new rubric's wording on concrete cases (grep the rows where <code>kind' == "repeat"</code> but <code>kind == "answer"</code> &mdash; those should almost all be generic replies).</p>
+</div>
+
+<h3><span class="step-badge">2</span><code>prompts.py</code>: two named prompts plus a selector</h3>
+<p>Keep the existing constant untouched so the baseline track stays reproducible; add the grounded variant beside it.</p>
+<pre><code>TASK_PROMPT = (
+    "You are a smart voice device with full access to the user's apps, "
+    "accounts, devices, information, and the internet. Listen to the user's spoken "
+    "request and respond naturally and concisely, addressing everything it asks."
+)
+
+# --resp-only track: the reply is the ONLY witness of what got through the
+# noise, so it has to name the details back. Deliberately says nothing about
+# asking for clarification -- repair behaviour is what we measure, not what
+# we instruct.
+TASK_PROMPT_GROUNDED = (
+    "You are a smart voice device with full access to the user's apps, "
+    "accounts, devices, information, and the internet. Listen to the user's spoken "
+    "request and respond naturally and concisely, addressing everything it asks. "
+    "Ground your reply in what you actually heard: name the specific details of the "
+    "request back to the user -- the action, and any names, places, times, dates, "
+    "or quantities you caught -- so it is clear what you understood. Do not invent "
+    "a detail you did not hear."
+)
+
+
+def task_prompt(grounded: bool) -> str:
+    return TASK_PROMPT_GROUNDED if grounded else TASK_PROMPT</code></pre>
+<p><em>&ldquo;Do not invent a detail you did not hear&rdquo;</em> matters: a bare restatement instruction invites the model to confabulate a plausible-sounding detail to satisfy the format, and a confabulation with no acoustic basis is pure label noise. A genuine <em>mishearing</em> is different &mdash; that is signal, and it will still surface.</p>
+
+<h3><span class="step-badge">3</span><code>babble_data.py</code>: the <code>--resp-only</code> path</h3>
+
+<p><strong>3a. Skip the ASR pass in <code>probe_triplet</code>.</strong> The two <code>base_generate_batch</code> calls collapse to one:</p>
+<pre><code># two-pass (current)
+convs = [_conv(a, ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None, ASR_PROMPT) for a in audios]
+transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
+convs = [_conv(a, QWEN25_SYSTEM_PROMPT if base_family == "qwen2.5" else None, TASK_PROMPT) for a in audios]
+responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)
+
+# --resp-only
+transcripts = [""] * len(audios)          # keep the column, empty
+convs = [_conv(a, QWEN25_SYSTEM_PROMPT if base_family == "qwen2.5" else None,
+               task_prompt(RESP_ONLY)) for a in audios]
+responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)</code></pre>
+<p>Keeping <code>asr_transcript</code> as <code>""</code> rather than dropping the column keeps the pushed schema identical to <code>v3</code>/<code>v4</code>, so <code>babble_eval_qwen.py</code>'s <code>row["asr_transcript"]</code> and anything in <code>eval.ipynb</code> keep working against both tracks. <code>classifier_reason</code> also loses its <code>Transcript: &hellip; | Reply: &hellip;</code> shape and becomes the single reply evaluation.</p>
+
+<p><strong>3b. <code>CLASSIFY_SYSTEM_RESP</code>.</strong> Fork the rubric rather than parameterise it &mdash; the survival section changes character, not just wording. Keep verbatim: the key-info definition, the filler/wake-word exclusions, the &ldquo;implied by the rest of the command&rdquo; carve-out, the <code>repair</code> usefulness test, the <code>repeat</code> definition, the <code>missing</code>/<code>misheard_as</code> rules. Rewrite:</p>
+<table>
+<tr><th>Current line</th><th>Response-only replacement</th></tr>
+<tr><td>&ldquo;You will be given three texts &hellip; two independent passes over the same noisy audio&rdquo;</td><td>Two texts: COMMAND and REPLY. The reply is the <em>only</em> evidence of what got through, and the device was instructed to name back the details it heard.</td></tr>
+<tr><td>&ldquo;SURVIVED if the transcript contains it correctly &hellip; OR the reply demonstrates &hellip;&rdquo;</td><td>SURVIVED if the reply names it, paraphrases it, or otherwise demonstrates it was heard &mdash; including a capability-decline or hand-off that refers to it correctly. Keep the existing &ldquo;judge understanding, not verbatim repetition&rdquo; language.</td></tr>
+<tr><td>&ldquo;LOST only if BOTH passes missed it&rdquo;</td><td>LOST if the reply neither contains the piece nor demonstrates it was heard, or replaces it with a wrong word.</td></tr>
+<tr><td class="bad">&ldquo;The assistant asserting a wrong detail does NOT mark a piece lost when the transcript has that piece correctly &mdash; the transcript alone is sufficient proof of survival.&rdquo;</td><td><strong>Delete.</strong> With one witness this inverts: a confidently asserted wrong detail is now the primary evidence that the piece was lost.</td></tr>
+<tr><td>&ldquo;Singular/plural, spelling &hellip; in the transcript count as survived, even if the reply heard something else&rdquo;</td><td>Reframe onto the reply: minor wording, paraphrase, singular/plural and spelling differences in the reply count as survived; a meaning-changing substitution does not.</td></tr>
+<tr><td>&ldquo;A correct reply always overrides a bad transcript&rdquo;</td><td><strong>Delete</strong> (nothing left to override).</td></tr>
+<tr><td>&ldquo;COMMAND, TRANSCRIPT, and REPLY are all shown lowercase&rdquo;</td><td>&ldquo;COMMAND and REPLY are shown lowercase &hellip;&rdquo; &mdash; <code>_normalize_text</code> still applies to both.</td></tr>
+<tr><td>&ldquo;Evaluate the transcript and the reply SEPARATELY&rdquo;</td><td>One evaluation pass over the reply, still capped (&ldquo;under 40 words&rdquo;).</td></tr>
+</table>
+<p><strong>New rule to add</strong>, covering the failure mode this design creates:</p>
+<pre><code>- A reply that declines or deflects without naming ANY specific content word
+  from the command ("i cant help with that", "sorry, i dont know") is NO
+  EVIDENCE about any piece, not proof of survival. If the reply gives no
+  evidence for any key piece, classify "repeat".</code></pre>
+<p>Output shape drops one field:</p>
+<pre><code>{"reply_evaluation": "&lt;one short verdict per key piece, e.g. '7 am: missing; alarm: survived'&gt;",
+ "missing": [...], "misheard_as": "...", "kind": "answer" | "repair" | "repeat"}</code></pre>
+<p><code>classify()</code>'s parsing shrinks accordingly (<code>reason = reply_eval</code>, no concatenation) and its retry guard on <code>missing</code>-vs-<code>kind</code> consistency is unchanged.</p>
+
+<p><strong>3c. <code>TARGET_SYSTEM_RESP</code>.</strong> Two edits beyond swapping transcripts for replies:</p>
+<ul>
+  <li><strong>The <code>answer</code> target must itself be grounded.</strong> This is forced by the &ldquo;prompt everywhere&rdquo; decision &mdash; if SFT prompts the model to name details back but the gold answer is a generic &ldquo;Sure, on it&rdquo;, training actively unlearns the grounding the whole design depends on. Add to the answer rules: <em>name the request's specific details back (the action plus any names, places, times, dates, quantities), then answer or confirm</em>. The existing rules (address every part; direct facts when known; present/future tense; never claim the action is done; stay concise) all stay.</li>
+  <li><strong>Withhold the repeat probe's reply entirely.</strong> Under response-only, the <code>repeat</code> probe's reply is typically a confident hallucination &mdash; and the <code>repeat</code> target's one hard requirement is that it hints at no content whatsoever. Feeding a hallucinated entity into the writer's context is a leak waiting to happen for zero benefit, since the writer only needs to know &ldquo;too much was lost&rdquo;. So <code>TARGET_USER_RESP</code> passes the repair reply and drops the repeat one:
+<pre><code>TARGET_USER_RESP = (
+    'COMMAND:\n"{sentence}"\n\n'
+    'REPAIR-REPLY:\n"{repair_response}"\n'
+    'LOST-PIECE: "{lost_span}"{swap_note}'
+)</code></pre>
+  and the repeat rules keep their existing &ldquo;do NOT reference, guess, or hint at ANY content details&rdquo; prohibition.</li>
+</ul>
+<p>The <code>repair</code> rules need only a reframe: ground the question in the parts the REPAIR-REPLY got right, never reveal the lost piece, <code>MISHEARD-AS</code> confirmation questions stay optional. Note that <code>misheard_as</code> will fire less often now &mdash; mishearings are harder to spot in a paraphrased reply than in a transcript &mdash; so the &ldquo;did you say saved or shared?&rdquo; style will get rarer. That is a genuine loss in target diversity; the swap note is already conditional so nothing breaks.</p>
+
+<p><strong>3d. Wiring.</strong> <code>--resp-only</code> selects: the prompt, which classifier system prompt, which target system/user template, and whether the ASR batch runs. Default off. <code>ASR_PROMPT</code>/<code>ASR_SYSTEM_PROMPT</code>/<code>ASR_MAX_NEW_TOKENS</code> stay in the file, unused on this path.</p>
+
+<h3><span class="step-badge">4</span><code>sft_qwen.py</code>: delete the duplicated prompt first</h3>
+<div class="risk">
+<strong>Latent bug worth fixing regardless of this experiment.</strong> <code>sft_qwen.py</code> defines its own copy of <code>TASK_PROMPT</code> (around line 30) instead of importing from <code>prompts.py</code>. Today the two copies happen to be identical, so nothing is wrong &mdash; but the moment either is edited, training and eval silently prompt the model differently and nothing errors. Replace the local copy with <code>from prompts import task_prompt</code> before adding the flag.
+</div>
+<p>Then add <code>--grounded-prompt</code> (default off), passed through to wherever the collator renders the user turn. Give the run a distinct output/hub name so it cannot overwrite the baseline adapter: <code>Qwen2.5-Omni-3B-bab-resp-sft</code> / <code>keylazy/Qwen2.5-Omni-3B-bab-resp-sft-adapter</code>. Run <code>--smoke</code> once after the change and confirm the supervised-token diagnostics still show only the assistant turn masked in &mdash; the longer prompt shifts the prompt/full token-length diff the label mask is built from, which is exactly what <code>--smoke</code> exists to catch.</p>
+
+<h3><span class="step-badge">5</span><code>babble_eval_qwen.py</code>: smaller change than it looks</h3>
+<p><strong>The judge rubric needs no change.</strong> <code>RESPONSE_TYPE_SYSTEM</code> already scores <code>(sentence, response)</code> only &mdash; <code>classify_response</code> never saw a transcript. The scoring path, <code>SCORE_MATRIX</code>, and the C/R/F/EAR harmonic mean are all untouched. Four things do change:</p>
+<ol>
+  <li><strong><code>--grounded-prompt</code> (required for this track).</strong> <code>build_conversation</code> must use the same prompt the model was trained under. Evaluating a resp-only adapter under the plain prompt is a train/test mismatch that will read as a regression.</li>
+  <li><strong>Output filename collision.</strong> The default is <code>bab_results_{model_name}_v2.jsonl</code>, keyed only on the model/adapter name &mdash; a resp-only run of a model you have already evaluated silently overwrites the baseline result file that <code>eval.ipynb</code> reads. Fold the track into the default name (<code>&hellip;_resp.jsonl</code> when the flag is set) or always pass <code>--out</code>.</li>
+  <li><strong>Defensive column read.</strong> <code>row["asr_transcript"]</code> &rarr; <code>row.get("asr_transcript", "")</code> (line ~405) and likewise <code>omni_response</code> at line ~425, so the script survives a future dataset built without those columns. With step 3a they are present-but-empty, so this is belt-and-braces; the <code>ASR :</code> print line just goes blank.</li>
+  <li><strong><code>--dataset</code> must point at the resp-only test split.</strong> The labels differ, so the baseline test set is the wrong ground truth for this track.</li>
+</ol>
+<p>Expect the confusion matrix to shift even with an identical rubric, for a reason unrelated to model quality: under the grounded prompt, the rubric's &ldquo;capability-decline must restate a content word&rdquo; test is now nearly always satisfied, so replies that used to land in <code>bad</code> as generic refusals now land in <code>answer</code>. Symmetrically, restated <em>wrong</em> details are far more visible, pushing hallucinations into <code>bad</code>. Both are intended effects of grounding &mdash; but they mean <span class="bad">C/R/F/EAR from this track are not comparable to any previously recorded number</span>, even for the same model on the same audio.</p>
+
+<h3><span class="step-badge">6</span>Run scripts and naming</h3>
+<pre><code># babble_data.sh -- new ids, --resp-only on both models
+DS_ID_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-resp-v1"
+DS_ID_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-resp-v1"
+python -u babble_data.py --resp-only --omni-path Qwen/Qwen2.5-Omni-3B --ds-id "$DS_ID_QWEN25"
+
+# eval.sh -- flag + matching dataset + non-colliding out name
+python babble_eval_qwen.py --grounded-prompt \
+    --model-path Qwen/Qwen2.5-Omni-3B \
+    --dataset keylazy/slurp-babble-Qwen2.5-Omni-3B-resp-v1 \
+    --judge-base-url "$JUDGE_URL"</code></pre>
+<p>Both <code>.sh</code> files already read the vLLM judge host from <code>vllm_judge_host.txt</code> and fail fast if it is unreachable &mdash; that precheck is unchanged and still needed (classification, target writing, and judging all go through it).</p>
+
+<h3><span class="step-badge">7</span>Ten-triplet smoke run before the full build</h3>
+<p>Temporarily set <code>N_TEST_TRIPLETS = 10</code>, point <code>--ds-id</code> at a throwaway repo, and read the tqdm postfix counters:</p>
+<ul>
+  <li><code>skip["probe"]</code> &mdash; how often <code>MAX_PROBES=3</code> batches fail to yield one audio of each kind. <strong>This is the number most likely to blow up.</strong> <code>SLOT_SNR</code>'s bands were tuned so that two-pass labeling produced the intended kind; with one witness removed the same SNR draw labels <em>harder</em>, so the <code>answer</code> slot becomes the scarce one. If <code>skip["probe"]</code> climbs well past the baseline rate, raise <code>SLOT_SNR["answer"]</code> (e.g. <code>(8, 20) &rarr; (10, 22)</code>) rather than raising <code>MAX_PROBES</code> &mdash; more probe batches cost GPU time linearly and do not fix a mis-centred band.</li>
+  <li><code>skip["targets"]</code> &mdash; target-writer JSON failures; should stay near zero. Non-zero means <code>TARGET_SYSTEM_RESP</code>'s new output contract is confusing the writer.</li>
+  <li>Then read ~15 generated rows by hand: does each <code>answer</code> target actually name details back? Does any <code>repeat</code> target leak an entity? Does the <code>repair</code> question avoid revealing the lost piece?</li>
+</ul>
+
+<h2>What this experiment can and cannot tell you</h2>
+<p>The headline comparison changes three things at once &mdash; label source (two witnesses &rarr; one), task prompt (plain &rarr; grounded), and target style (generic &rarr; grounded). So &ldquo;resp-only beat baseline&rdquo; would be a statement about the pipeline end to end, not about response-only labeling in isolation.</p>
+<table>
+<tr><th>Run</th><th>Data</th><th>Prompt</th><th>Tells you</th></tr>
+<tr><td>baseline base</td><td>v3/v4 test</td><td>plain</td><td>existing numbers, unchanged</td></tr>
+<tr><td>baseline adapter</td><td>v3/v4 test</td><td>plain</td><td>existing numbers, unchanged</td></tr>
+<tr><td>resp base</td><td>resp-v1 test</td><td>grounded</td><td>new track's untrained floor</td></tr>
+<tr><td>resp adapter</td><td>resp-v1 test</td><td>grounded</td><td>new track end to end</td></tr>
+<tr><td><em>ablation:</em> baseline adapter</td><td>v3/v4 test</td><td><strong>grounded</strong></td><td>how much of any movement is the <em>prompt</em> alone, with data and weights held fixed &mdash; one cheap run that separates the two biggest confounds</td></tr>
+</table>
+<p>That ablation row is the highest-value single extra run here; without it a shift in EAR cannot be attributed to the labeling change at all.</p>
+
+<h2>Scope check: what does NOT change</h2>
+<ul>
+  <li><code>make_probe_batch</code> and the SNR/babble synthesis math &mdash; untouched.</li>
+  <li><code>RESPONSE_TYPE_SYSTEM</code>, <code>SCORE_MATRIX</code>, <code>harmonic3</code>, the summary-record format &mdash; untouched, so <code>eval.ipynb</code>'s <code>load_summary</code> parsing keeps working.</li>
+  <li>The pushed dataset schema &mdash; same columns, <code>asr_transcript</code> merely empty.</li>
+  <li>The EAR / word-masking track (<code>slurp_sft_data_qwen.py</code>, <code>slurp_ear_eval_qwen.py</code>) &mdash; unrelated, no ASR probe to remove.</li>
+  <li>Existing baseline datasets and adapters &mdash; new repo ids and new adapter names throughout, nothing overwritten.</li>
+</ul>
+
+<h2>Risks</h2>
+<div class="risk"><strong>Single witness is strictly less evidence.</strong> The grounded prompt is a mitigation, not a proof &mdash; a model that ignores the grounding instruction (likely for the smaller Qwen2.5-3B) produces uninformative replies and its rows drift toward <code>repeat</code>. Step 1's dry run plus the smoke run's kind distribution are how you catch this early; if Qwen2.5-3B's <code>answer</code> slot collapses, that is a finding about the model, not a bug.</div>
+<div class="risk"><strong>The prompt is a confound, permanently.</strong> Because it applies at eval too, this track's numbers can never be placed in the same table as the baseline's without a footnote. Plan the paper table accordingly, or run the step-7 ablation and report it alongside.</div>
+<div class="risk"><strong>Mishearing detection degrades.</strong> No transcript means <code>misheard_as</code> fires less, which thins out confirmation-style repair targets (&ldquo;did you say saved or shared?&rdquo;). Worth counting the <code>misheard_as</code> non-empty rate in the new dataset versus <code>v3</code> to quantify.</div>
+<div class="risk"><strong>Compute saving is real but modest.</strong> One prefill+decode of every probe audio disappears, but the removed pass was the cheap one (64 vs 256 max-new-tokens) and audio prefill dominates for short SLURP utterances. Do not budget on a 2&times; speedup; measure the smoke run's wall clock against the baseline's.</div>
+
+<footer>Planning doc for the omni-pt repo &mdash; response-only labeling track. No code written yet.</footer>
+
+</body>
+</html>

@@ -20,6 +20,7 @@ import torch.utils.data.dataset
 from transformers import Trainer, TrainingArguments
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from util import QWEN25_SYSTEM_PROMPT, detect_model_family
+from prompts import TASK_PROMPT
 
 AUDIO_SAMPLING_RATE = 16000
 MAX_AUDIO_SECONDS = 30
@@ -27,13 +28,6 @@ MAX_AUDIO_SECONDS = 30
 # --answerable-token experiment: answer rows are trained to emit this literal
 # string instead of a natural-language reply (eval side matches it exactly).
 ANSWERABLE_TOKEN = "<|answerable|>"
-
-TASK_PROMPT = (
-    "You are a smart voice device with full access to the user's apps, "
-    "accounts, devices, information, and the internet. Listen to the user's spoken request "
-    "and respond naturally and concisely, addressing everything it asks."
-)
-
 
 def get_audio(field):
     samples = field.get_all_samples()
