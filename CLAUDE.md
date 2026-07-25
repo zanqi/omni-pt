@@ -13,6 +13,26 @@ then used for LoRA SFT and for judged evaluation.
 There is no package manager / build system here — this is a flat collection of standalone scripts run on a
 Slurm GPU cluster (Hyak, UW `sciencehub` allocation), each invoked directly with `python`.
 
+## Code style: no single-use module-level functions
+
+Every module-level `def` should either have two or more call sites, or be a top-level pipeline step called
+from `__main__`. A helper that exactly one function uses does not belong at module level — pick one of:
+
+- **Nest it** as a `def` inside its single caller. This is the user's preferred fix: it makes the
+  "only used here" relationship visible, lets the helper close over the caller's locals, and keeps the
+  caller's body short. Examples in `babble_data.py`: `classify` inside `probe_kinds`, `list2ds` inside
+  `__main__`.
+- **Inline it** when it is short, needs no name, and reads as one step of the caller. Mark the pasted block
+  with a short comment (or a `# --- ... ---` banner for a longer block), and carry over any non-obvious
+  rationale from the old docstring.
+- A one-line callback should just become a lambda at the registration site.
+
+Rationale (user preference): a single-use function at module level advertises reuse that doesn't exist, and
+reading it far from its only caller hides the context it actually runs in.
+
+Needing to be a callable value (e.g. `classify`, mapped over a `ThreadPoolExecutor`) is *not* a reason to
+hoist a helper to module level — nest it instead.
+
 ## Two parallel data/eval tracks
 
 The repo has two independently-developed variants of the same idea; don't conflate them:
@@ -27,23 +47,26 @@ The repo has two independently-developed variants of the same idea; don't confla
      an LLM judge).
    - Dataset pushed to `keylazy/slurp-ear-sft`.
 
-2. **Babble track** (background-noise) — `slurp_babble_data.py` → `slurp_bab_eval_qwen.py`
+2. **Babble track** (background-noise) — `babble_data.py` → `babble_eval_qwen.py`
    - Mixes 3-speaker babble noise (sampled from the same SLURP split) into the clean utterance at a sampled
-     SNR, using the *base* Qwen2.5-Omni-3B itself as an ASR probe to decide, per-SNR draw, whether the
-     resulting audio is fully intelligible (`answer`), missing one detail (`repair`), or missing so much
-     that no part can be trusted (`repair_full`). Diffing is done between the ASR transcript and ground
-     truth (`difflib` on stemmed/Whisper-normalized tokens).
-   - Probing loop (`probe_triplet`) keeps redrawing SNR/babble (up to `MAX_PROBES` batches) until one audio
-     of each kind (`answer`/`repair`/`repair_full`) is found for an utterance; skips the utterance otherwise.
+     SNR, then probes the noisy audio twice with the *base* omni model — once for an ASR transcript, once
+     for a task response — and has an LLM classifier read (ground-truth sentence, transcript, response) to
+     decide whether the audio is fully intelligible (`answer`), missing exactly one key piece (`repair`), or
+     missing so much that no part can be trusted (`repeat`).
+   - Probing loop (`probe_kinds`) keeps redrawing SNR/babble (up to `MAX_PROBES` batches) until one audio
+     of each requested kind is found for an utterance; skips the utterance otherwise.
    - Excludes any `slurp_id` already used by the EAR dataset (`MASK_DS_ID = keylazy/slurp-ear-sft`) to avoid
      double-weighting the same sentence.
    - Metric: `EAR = 3*C*R*F/(C*R + C*F + R*F)` (harmonic mean of three judged scores, one added dimension
      `F` = full-repair quality).
-   - Dataset pushed to `keylazy/slurp-babble-Qwen2.5-Omni-3B`.
+   - Dataset pushed to `--ds-id` (e.g. `keylazy/slurp-babble-Qwen2.5-Omni-3B-v1`).
 
-Both data-builder scripts call GPT-4o (`OPENAI_MODEL = "gpt-4o"`, via `OpenAI()` client) with a shared-style
-prompt template to synthesize the `answer` / `repair` (/ `repair_full`) natural-language training targets
-conditioned on what was actually heard — never revealing the masked/lost content directly.
+Both data-builder scripts call an LLM with a shared-style prompt template to synthesize the `answer` /
+`repair` (/ `repeat`) natural-language training targets conditioned on what was actually heard — never
+revealing the masked/lost content directly. `babble_data.py` serves both its classifier and its target
+generation from the local vLLM box (`TARGET_MODEL`, node read from `VLLM_HOST_FILE`); each prompt is split
+into a long static SYSTEM rubric plus a tiny per-case USER suffix so vLLM's prefix cache can reuse the rubric
+across calls.
 
 ## SFT
 
@@ -51,7 +74,7 @@ conditioned on what was actually heard — never revealing the masked/lost conte
 (`--ds-id`, defaults to the babble dataset). Key details:
 - `Qwen2_5OmniForSFT` subclasses the full omni model but forwards straight to `self.thinker(...)`, and LoRA
   is applied to that same wrapper — this makes saved adapter keys carry the `thinker.` prefix that
-  `PeftModel.from_pretrained` expects at eval time (see `slurp_ear_eval_qwen.py` / `slurp_bab_eval_qwen.py`
+  `PeftModel.from_pretrained` expects at eval time (see `slurp_ear_eval_qwen.py` / `babble_eval_qwen.py`
   `--adapter-path` loading, which attaches + `merge_and_unload()`s onto the plain
   `Qwen2_5OmniForConditionalGeneration`).
 - `OmniSFTCollator` builds two chat-template renderings per example — full conversation (with assistant
@@ -65,7 +88,7 @@ conditioned on what was actually heard — never revealing the masked/lost conte
 
 ## Evaluation
 
-`slurp_ear_eval_qwen.py` and `slurp_bab_eval_qwen.py` are near-duplicates (evolved independently for their
+`slurp_ear_eval_qwen.py` and `babble_eval_qwen.py` are near-duplicates (evolved independently for their
 respective dataset). Both:
 - Auto-detect model family (`qwen2.5` vs `qwen3`) from `--model-path` substring; pass `--model-family`
   explicitly for fine-tuned checkpoint paths that don't contain either string.
@@ -75,7 +98,7 @@ respective dataset). Both:
 - Score every row with an LLM judge against a fixed rubric (`COMPETENCE_SYSTEM` / `REPAIR_SYSTEM` /
   `FULL_REPAIR_SYSTEM` for the babble track) that returns `{"reason": ..., "score": ...}` — reason is
   requested *before* score to force the judge to reason before committing to a number.
-- `slurp_bab_eval_qwen.py` additionally supports a local vLLM judge server (`--judge-base-url`, default
+- `babble_eval_qwen.py` additionally supports a local vLLM judge server (`--judge-base-url`, default
   points at a specific cluster node `http://g3085:8000/v1`) instead of the OpenAI API — see the module
   docstring for the exact `vllm serve` invocation used to host the judge model.
 - Write one JSON record per row plus a trailing `{"type": "summary", ...}` record to a `.jsonl` file
@@ -98,7 +121,7 @@ export OPENAI_API_KEY=...                 # required by data-builder scripts and
 
 # 1. build a dataset (pushes to the Hub repo hardcoded as REPO_ID in the script)
 python slurp_sft_data_qwen.py             # EAR (word-masking) track
-python slurp_babble_data.py               # babble (background-noise) track
+python babble_data.py               # babble (background-noise) track
 
 # 2. LoRA SFT
 python slurp_sft_qwen25.py --smoke        # sanity check collator/labels before a real run
@@ -106,8 +129,8 @@ python slurp_sft_qwen25.py --push         # full run, pushes adapter to --hub-id
 
 # 3. evaluate
 python slurp_ear_eval_qwen.py --num-rows 100
-python slurp_bab_eval_qwen.py --judge-base-url openai --judge-model gpt-4o
-python slurp_bab_eval_qwen.py --model-path Qwen/Qwen2.5-Omni-3B --adapter-path ./Qwen2.5-Omni-3B-bab-sft \
+python babble_eval_qwen.py --judge-base-url openai --judge-model gpt-4o
+python babble_eval_qwen.py --model-path Qwen/Qwen2.5-Omni-3B --adapter-path ./Qwen2.5-Omni-3B-bab-sft \
     --judge-base-url openai --judge-model gpt-4o
 ```
 
