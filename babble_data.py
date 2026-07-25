@@ -45,9 +45,9 @@ AUDIO_SAMPLING_RATE = 16000
 # defend against single long audio causing oom
 MAX_AUDIO_SECONDS = 30
 
-N_TRAIN_TRIPLETS = 10
-N_TEST_TRIPLETS = 5
-N_TRAIN_EXTRA_ANS = 10
+N_TRAIN_TRIPLETS = 1000
+N_TEST_TRIPLETS = 50
+N_TRAIN_EXTRA_ANS = 3000
 
 # Classification + Target generation are served by the local vLLM judge
 # box. Its slurm job records the node it landed on in VLLM_HOST_FILE.
