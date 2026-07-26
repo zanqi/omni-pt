@@ -19,8 +19,9 @@ import os
 import random
 import shutil
 import string
+import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import soundfile as sf
@@ -66,6 +67,9 @@ BABBLE_CLIP_MAX_SEC = 10  # trim pool clips to save memory
 PROBE_BATCH_SIZE = 16
 MAX_PROBES = 3
 ANSWER_PROBE_BATCH_SIZE = 4
+UTTERANCE_WORKERS = 4
+GPU_LOCK = threading.Lock()
+
 SLOT_SNR = {
     "answer": (8.0, 20.0),
     "repair": (0.0, 12.0),
@@ -421,48 +425,47 @@ ANSWER_TARGET_USER = 'COMMAND:\n"{sentence}"'
 # ---
 
 
-def make_probe_batch(clean, pool, kinds_need, batch_size):
-    length = len(clean)
-    clean_power = float(np.mean(clean**2))
-    audios, snrs = [], []
-    while len(audios) < batch_size:
-        # mix a babble
-        babble = np.zeros(length, dtype=np.float32)
-        for b in random.sample(pool, BABBLE_SPEAKERS):
-            if len(b) < length:
-                b = np.pad(b, (0, length - len(b)), "wrap")
-            else:
-                start = random.randint(0, len(b) - length)
-                b = b[start : start + length]
-            babble += b
-        babble /= BABBLE_SPEAKERS
+def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
+    def make_probe_batch(kinds_need):
+        length = len(clean)
+        clean_power = float(np.mean(clean**2))
+        audios, snrs = [], []
+        while len(audios) < batch_size:
+            # mix a babble
+            babble = np.zeros(length, dtype=np.float32)
+            for b in rng.sample(pool, BABBLE_SPEAKERS):
+                if len(b) < length:
+                    b = np.pad(b, (0, length - len(b)), "wrap")
+                else:
+                    start = rng.randint(0, len(b) - length)
+                    b = b[start : start + length]
+                babble += b
+            babble /= BABBLE_SPEAKERS
 
-        # sample snr
-        weights = [SLOT_WEIGHTS[k] for k in kinds_need]
-        slot = random.choices(kinds_need, weights=weights, k=1)[0]
-        # round to 1 decimal digit
-        snr = round(random.uniform(*SLOT_SNR[slot]), 1)
+            # sample snr
+            weights = [SLOT_WEIGHTS[k] for k in kinds_need]
+            slot = rng.choices(kinds_need, weights=weights, k=1)[0]
+            # round to 1 decimal digit
+            snr = round(rng.uniform(*SLOT_SNR[slot]), 1)
 
-        # synthesize noisy audio
-        # SNR = 10*log10(clean_power / babble_power)
-        #   -> target_babble_power = clean_power / 10^(SNR/10)
-        #   -> scale babble = sqrt(target_power / current_power)
-        current_babble_power = float(np.mean(babble**2))
-        target_babble_power = clean_power / (10 ** (snr / 10))
-        scale = np.sqrt(target_babble_power / current_babble_power)
-        noisy = clean + scale * babble
-        peak = float(np.max(np.abs(noisy)))
-        if peak > 1.0:
-            # avoid clipping on save; rescaling do not change SNR
-            noisy = noisy / peak
-        noisy = noisy.astype(np.float32)
+            # synthesize noisy audio
+            # SNR = 10*log10(clean_power / babble_power)
+            #   -> target_babble_power = clean_power / 10^(SNR/10)
+            #   -> scale babble = sqrt(target_power / current_power)
+            current_babble_power = float(np.mean(babble**2))
+            target_babble_power = clean_power / (10 ** (snr / 10))
+            scale = np.sqrt(target_babble_power / current_babble_power)
+            noisy = clean + scale * babble
+            peak = float(np.max(np.abs(noisy)))
+            if peak > 1.0:
+                # avoid clipping on save; rescaling do not change SNR
+                noisy = noisy / peak
+            noisy = noisy.astype(np.float32)
 
-        audios.append(noisy)
-        snrs.append(snr)
-    return audios, snrs
+            audios.append(noisy)
+            snrs.append(snr)
+        return audios, snrs
 
-
-def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size):
     def classify(transcript, response, retries=2):
         user = CLASSIFY_USER.format(
             sentence=_normalize_text(sentence),
@@ -511,17 +514,18 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size):
         missing_slots = [k for k, v in results.items() if v is None]
         if not missing_slots:
             break
-        audios, snrs = make_probe_batch(clean, pool, missing_slots, batch_size)
+        audios, snrs = make_probe_batch(missing_slots)
 
-        # get batch omni asr respond
-        sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-        convs = [_conv(a, sysp, ASR_PROMPT) for a in audios]
-        transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
+        with GPU_LOCK:
+            # get batch omni asr respond
+            sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
+            convs = [_conv(a, sysp, ASR_PROMPT) for a in audios]
+            transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
 
-        # get batch omni assistant respond
-        sysp = QWEN25_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-        convs = [_conv(a, sysp, TASK_PROMPT) for a in audios]
-        responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)
+            # get batch omni assistant respond
+            sysp = QWEN25_SYSTEM_PROMPT if base_family == "qwen2.5" else None
+            convs = [_conv(a, sysp, TASK_PROMPT) for a in audios]
+            responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)
 
         with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
             labels = list(
@@ -554,6 +558,30 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size):
 # ---
 # triplet-building loop
 # ---
+
+
+def imap_ordered(items, work, workers):
+    it = iter(items)
+    pending = deque()
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        try:
+            while True:
+                while len(pending) < workers:
+                    item = next(it, None)
+                    if item is None:
+                        break
+                    pending.append((item, ex.submit(work, item)))
+                if not pending:
+                    return
+                item, fut = pending.popleft()
+                yield item, fut.result()
+        finally:
+            # if a caller doing `for row, result in imap_ordered()`
+            # but decided to break the loop after its target reached.
+            # yield above will throw `GeneratorExit` error and reach here
+            # with non empty pending
+            for _, fut in pending:
+                fut.cancel()
 
 
 def slurp_ds_stream(split):
@@ -595,23 +623,24 @@ def make_row(kind, target, path, probe, slurp_id, sentence):
 
 
 def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
-    stream = slurp_ds_stream(split)
-
     rows, scanned, done = [], 0, 0
     skip.clear()
     pbar = tqdm(total=n_triplets, desc=f"[{split}]", unit="triplet", dynamic_ncols=True)
-    for row in stream:
-        if done >= n_triplets:
-            break
-        scanned += 1
-        pbar.set_postfix({**skip, "scanned": scanned}, refresh=False)
 
+    def candidates():
+        nonlocal scanned
+        for row in slurp_ds_stream(split):
+            scanned += 1
+            pbar.set_postfix({**skip, "scanned": scanned}, refresh=False)
+            if row["slurp_id"] in seen_slurp_ids or len(row["sentence"].split()) < 4:
+                skip["seen/short"] += 1
+                continue
+            yield row
+
+    def build(row):
+        # this is the threadpool worker
         slurp_id = row["slurp_id"]
         sentence = row["sentence"]
-        if slurp_id in seen_slurp_ids or len(sentence.split()) < 4:
-            skip["seen/short"] += 1
-            continue
-
         clean = row["audio"]["array"].astype(np.float32)
         clean = clean[: MAX_AUDIO_SECONDS * AUDIO_SAMPLING_RATE]
 
@@ -622,11 +651,11 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
             sentence,
             KINDS,
             PROBE_BATCH_SIZE,
+            random.Random(f"{SEED}:{slurp_id}"),
         )
         if any(v is None for v in triplet.values()):
-            skip["probe"] += 1
-            continue
-        
+            return {"skip": "probe"}
+
         # ---
         # one LLM call writes all 3 targets for the utterance
         # ---
@@ -661,24 +690,110 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
             if answer and repair and repeat:
                 targets = {"answer": answer, "repair": repair, "repeat": repeat}
                 break
+
         if targets is None:
-            skip["targets"] += 1
+            return {"skip": "targets"}
+
+        return {"triplet": triplet, "targets": targets}
+
+    for row, built in imap_ordered(candidates(), build, UTTERANCE_WORKERS):
+        if "skip" in built:
+            skip[built["skip"]] += 1
             continue
 
+        slurp_id = row["slurp_id"]
+        sentence = row["sentence"]
         seen_slurp_ids.add(slurp_id)
         for kind in KINDS:
-            probe = triplet[kind]
+            probe = built["triplet"][kind]
             path = os.path.join(AUDIO_DIR, f"{split}_{slurp_id}_{kind}.wav")
             sf.write(path, probe["audio"], AUDIO_SAMPLING_RATE)
             rows.append(
-                make_row(kind, targets[kind], path, probe, slurp_id, sentence)
+                make_row(kind, built["targets"][kind], path, probe, slurp_id, sentence)
             )
 
         done += 1
         pbar.update(1)
+        if done >= n_triplets:
+            break
 
     pbar.close()
     log(f"[{split}] built {len(rows)} rows from {done} utterances ({scanned} scanned)")
+    return rows
+
+
+def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
+    rows, scanned = [], 0
+    skip.clear()
+    pbar = tqdm(total=n_rows, desc=f"[{split}ans]", unit="row", dynamic_ncols=True)
+
+    def candidates():
+        nonlocal scanned
+        for row in slurp_ds_stream(split):
+            scanned += 1
+            pbar.set_postfix({**skip, "scanned": scanned}, refresh=False)
+            if row["slurp_id"] in seen_slurp_ids or len(row["sentence"].split()) < 4:
+                skip["seen/short"] += 1
+                continue
+            yield row
+
+    def build(row):
+        slurp_id = row["slurp_id"]
+        sentence = row["sentence"]
+        clean = row["audio"]["array"].astype(np.float32)
+        clean = clean[: MAX_AUDIO_SECONDS * AUDIO_SAMPLING_RATE]
+
+        probe = probe_by_kinds(
+            clean,
+            [arr for sid, arr in babble_pool if sid != slurp_id],
+            sentence,
+            ["answer"],
+            ANSWER_PROBE_BATCH_SIZE,
+            random.Random(f"{SEED}:{slurp_id}"),
+        )["answer"]
+        if probe is None:
+            return {"skip": "probe"}
+
+        target = ""
+        for attempt in range(TARGET_RETRIES):
+            obj = gpt_json(
+                ANSWER_TARGET_SYSTEM,
+                ANSWER_TARGET_USER.format(sentence=sentence),
+                temperature=0.7,
+                max_tokens=TARGET_MAX_TOKENS,
+            )
+            if obj is None:
+                time.sleep(2**attempt)
+                continue
+            target = str(obj.get("answer", "")).strip()
+            if target:
+                break
+        if not target:
+            return {"skip": "targets"}
+
+        return {"probe": probe, "target": target}
+
+    for row, built in imap_ordered(candidates(), build, UTTERANCE_WORKERS):
+        if "skip" in built:
+            skip[built["skip"]] += 1
+            continue
+
+        slurp_id = row["slurp_id"]
+        sentence = row["sentence"]
+        seen_slurp_ids.add(slurp_id)
+
+        path = os.path.join(AUDIO_DIR, f"{split}_{slurp_id}_answer.wav")
+        sf.write(path, built["probe"]["audio"], AUDIO_SAMPLING_RATE)
+        rows.append(
+            make_row("answer", built["target"], path, built["probe"], slurp_id, sentence)
+        )
+
+        pbar.update(1)
+        if len(rows) >= n_rows:
+            break
+
+    pbar.close()
+    log(f"[{split}ans] built {len(rows)} answer rows ({scanned} scanned)")
     return rows
 
 
@@ -727,72 +842,12 @@ if __name__ == "__main__":
     train_rows = build_triplets("train", N_TRAIN_TRIPLETS, seen_ids, train_babble_pool)
 
     if args.n_extra_ans:
-        pool = train_babble_pool
-        stream = slurp_ds_stream("train")
-        seen_sentences = {_normalize_text(r["sentence"]) for r in test_rows + train_rows}
-
-        rows, scanned = [], 0
-        skip.clear()
-        pbar = tqdm(total=args.n_extra_ans, desc="[trainans]", unit="row", dynamic_ncols=True)
-        for row in stream:
-            if len(rows) >= args.n_extra_ans:
-                break
-            scanned += 1
-            pbar.set_postfix({**skip, "scanned": scanned}, refresh=False)
-
-            slurp_id = row["slurp_id"]
-            sentence = row["sentence"]
-            if (
-                slurp_id in seen_ids
-                or _normalize_text(sentence) in seen_sentences
-                or len(sentence.split()) < 4
-            ):
-                skip["seen/short"] += 1
-                continue
-
-            clean = row["audio"]["array"].astype(np.float32)
-            clean = clean[: MAX_AUDIO_SECONDS * AUDIO_SAMPLING_RATE]
-
-            babble_pool = [arr for sid, arr in pool if sid != slurp_id]
-            probe = probe_by_kinds(
-                clean,
-                babble_pool,
-                sentence,
-                ["answer"],
-                ANSWER_PROBE_BATCH_SIZE,
-            )["answer"]
-            if probe is None:
-                skip["probe"] += 1
-                continue
-
-            target = ""
-            for attempt in range(TARGET_RETRIES):
-                obj = gpt_json(
-                    ANSWER_TARGET_SYSTEM,
-                    ANSWER_TARGET_USER.format(sentence=sentence),
-                    temperature=0.7,
-                    max_tokens=TARGET_MAX_TOKENS,
-                )
-                if obj is None:
-                    time.sleep(2**attempt)
-                    continue
-                target = str(obj.get("answer", "")).strip()
-                if target:
-                    break
-            if not target:
-                skip["targets"] += 1
-                continue
-
-            seen_ids.add(slurp_id)
-            seen_sentences.add(_normalize_text(sentence))
-            path = os.path.join(AUDIO_DIR, f"train_{slurp_id}_answer.wav")
-            sf.write(path, probe["audio"], AUDIO_SAMPLING_RATE)
-            rows.append(make_row("answer", target, path, probe, slurp_id, sentence))
-            pbar.update(1)
-
-        pbar.close()
-        log(f"[trainans] built {len(rows)} answer rows ({scanned} scanned)")
-        train_rows += rows
+        train_rows += build_answer_rows(
+            "train",
+            args.n_extra_ans,
+            seen_ids,
+            train_babble_pool,
+        )
 
     dump = f"rows_{args.ds_id.split('/')[-1]}.json"
     with open(dump, "w") as f:
