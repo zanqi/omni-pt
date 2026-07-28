@@ -11,6 +11,7 @@ mirrors babble_data.py's use of util.py.
 
 import argparse
 import os
+from collections import Counter
 from typing import Any
 import torch
 import torch.nn as nn
@@ -161,16 +162,6 @@ PROJ_SUFFIXES = (
 
 
 def find_lm_linear_names(model):
-    """Collect thinker Linear layers to LoRA-target.
-
-    Covers attention (q/k/v/o_proj) and dense-MLP (gate/up/down_proj) on
-    both families. Qwen3-Omni's MoE thinker stores its expert FFN weights
-    (gate_up_proj/down_proj) as raw nn.Parameter tensors rather than
-    nn.Linear modules on most layers, so those are NOT picked up here —
-    Qwen3 LoRA ends up attention-only (+ whatever dense layers exist under
-    config.mlp_only_layers). This is a deliberate scope choice, not a bug:
-    covering the MoE experts would need peft's target_parameters instead.
-    """
     names = []
     for name, module in model.named_modules():
         if (
@@ -302,20 +293,59 @@ def main():
         help=f"Replace the target of kind=='answer' rows with {ANSWERABLE_TOKEN!r}.",
     )
     ap.add_argument("--smoke", action="store_true")
-    ap.add_argument("--out", default=None, help="Defaults to ./<omni-path basename>-bab-sft.")
+    ap.add_argument(
+        "--train-caps",
+        default=None,
+        help="Per-kind row budget for the train split, e.g. "
+        "'answer=2000,repair=1000,repeat=1000'. Keeps the first N rows of each "
+        "listed kind (in dataset order); unlisted kinds are kept in full.",
+    )
+    ap.add_argument(
+        "--run-name",
+        default=None,
+        help="Names both the output dir and the hub repo. "
+        "Defaults to <omni-path basename>-bab-sft.",
+    )
+    ap.add_argument("--out", default=None, help="Overrides the ./<run-name> output dir.")
     args = ap.parse_args()
 
     family = detect_model_family(args.omni_path)
     print(f"model family: {family}")
 
     model_name = args.omni_path.rstrip("/").split("/")[-1]
-    hub_id = f"keylazy/{model_name}-bab-sft-adapter"
-    out = args.out or f"./{model_name}-bab-sft"
+    run_name = args.run_name or f"{model_name}-bab-sft"
+    hub_id = f"keylazy/{run_name}"
+    out = args.out or f"./{run_name}"
 
     system_prompt = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
 
     print(f"Loading SFT dataset {args.ds_id} ...")
     train_hf = load_ds_split(args.ds_id, args.train_split)
+
+    if args.train_caps:
+        # --- subsample the train split to a target answer:repair:repeat mix ---
+        # The babble datasets are laid out as N interleaved (answer, repair,
+        # repeat) triplets followed by extra answer-only rows, so capping each
+        # kind at its first N rows keeps every triplet intact and just varies
+        # how many of the surplus answer rows come along. Counting by kind
+        # rather than slicing a prefix keeps this correct if that layout changes.
+        caps = {}
+        for part in args.train_caps.split(","):
+            kind, _, n = part.partition("=")
+            caps[kind.strip()] = int(n)
+
+        kept, taken = [], Counter()
+        for i, kind in enumerate(train_hf["kind"]):
+            if taken[kind] < caps.get(kind, float("inf")):
+                kept.append(i)
+                taken[kind] += 1
+        train_hf = train_hf.select(kept)
+
+        missing = {k: n - taken[k] for k, n in caps.items() if taken[k] < n}
+        if missing:
+            print(f"warning: train split short of requested caps by {missing}")
+        print(f"train caps {caps} -> {len(train_hf)} rows {dict(taken)}")
+
     train_ds = SlurpDataset(train_hf, answerable_token=args.answerable_token)
     if args.answerable_token:
         print(f"answerable-token mode: answer targets -> {ANSWERABLE_TOKEN!r}")

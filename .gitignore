@@ -9,3 +9,4 @@ Qwen2.5-Omni-3B-bab-sft-v3/
 .env
 Qwen3-Omni-30B-A3B-Instruct-bab-sft/
 Qwen2.5-Omni-3B-bab-sft/
+Qwen2.5-Omni-3B-bab-adapter-*/
