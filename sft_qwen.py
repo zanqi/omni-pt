@@ -21,7 +21,7 @@ import torch.utils.data.dataset
 from transformers import Trainer, TrainingArguments
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from util import QWEN25_SYSTEM_PROMPT, detect_model_family
-from prompts import TASK_PROMPT
+from prompts import task_prompt
 
 AUDIO_SAMPLING_RATE = 16000
 MAX_AUDIO_SECONDS = 30
@@ -68,11 +68,14 @@ def load_ds_split(ds_id, split, limit=None):
 
 
 class OmniSFTCollator:
-    def __init__(self, processor, system_prompt=None) -> None:
+    def __init__(self, processor, system_prompt=None, heard_reply=False) -> None:
         self.processor = processor
         # Qwen3-Omni's HF page says NO system prompt should be set; only
         # qwen2.5 gets QWEN25_SYSTEM_PROMPT (see main()).
         self.system_prompt = system_prompt
+        # must match the prompt the dataset's targets were built under, and
+        # the one babble_eval_qwen.py evaluates with
+        self.task_prompt = task_prompt(heard_reply)
 
     def _conv(self, audio, answer=None):
         conv = []
@@ -86,7 +89,7 @@ class OmniSFTCollator:
                 "content": [
                     # audio is an in-memory float32 array
                     {"type": "audio", "audio": audio},
-                    {"type": "text", "text": TASK_PROMPT},
+                    {"type": "text", "text": self.task_prompt},
                 ],
             }
         )
@@ -251,9 +254,11 @@ def load_model(omni_path, family, use_qlora):
     return model
 
 
-def run_smoke(model, processor, dataset, batch_size, system_prompt):
+def run_smoke(model, processor, dataset, batch_size, system_prompt, heard_reply):
     print("\n=== SMOKE TEST ===")
-    coll = OmniSFTCollator(processor, system_prompt=system_prompt)
+    coll = OmniSFTCollator(
+        processor, system_prompt=system_prompt, heard_reply=heard_reply
+    )
     n = min(batch_size, len(dataset))
     exs = [dataset[i] for i in range(n)]
     for ex in exs:
@@ -268,6 +273,13 @@ def run_smoke(model, processor, dataset, batch_size, system_prompt):
         n_sup = int((batch["labels"][i] != -100).sum())
         n_real = int(batch["attention_mask"][i].sum())
         print(f"  ex{i}: seq_len={total} real_tokens={n_real} supervised(label!=-100)={n_sup}")
+        if heard_reply and not processor.tokenizer.decode(sup_ids).lstrip().startswith(
+            "Heard:"
+        ):
+            print(
+                f"  ex{i}: WARNING supervised span does not start at 'Heard:' — "
+                "the label mask is off and the two-line format will train as garbage"
+            )
     batch = {k: v.to(model.device) for k, v in batch.items()}
     with torch.no_grad():
         out = model(**batch)
@@ -292,6 +304,13 @@ def main():
         action="store_true",
         help=f"Replace the target of kind=='answer' rows with {ANSWERABLE_TOKEN!r}.",
     )
+    ap.add_argument(
+        "--heard-reply",
+        action="store_true",
+        help="Train under TASK_PROMPT_HR. Required for datasets built with "
+        "babble_data.py --heard-reply, whose targets are two-line "
+        "'Heard: ... / Reply: ...' strings.",
+    )
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument(
         "--train-caps",
@@ -313,7 +332,10 @@ def main():
     print(f"model family: {family}")
 
     model_name = args.omni_path.rstrip("/").split("/")[-1]
-    run_name = args.run_name or f"{model_name}-bab-sft"
+    # distinct default name so an hr run can't overwrite the baseline adapter
+    run_name = args.run_name or (
+        f"{model_name}-bab-hr-sft" if args.heard_reply else f"{model_name}-bab-sft"
+    )
     hub_id = f"keylazy/{run_name}"
     out = args.out or f"./{run_name}"
 
@@ -359,7 +381,9 @@ def main():
     model = load_model(args.omni_path, family, args.qlora)
 
     if args.smoke:
-        run_smoke(model, processor, train_ds, args.batch_size, system_prompt)
+        run_smoke(
+            model, processor, train_ds, args.batch_size, system_prompt, args.heard_reply
+        )
         return
 
     logging_dir = os.path.join(out, "runs")
@@ -390,7 +414,9 @@ def main():
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        data_collator=OmniSFTCollator(processor, system_prompt=system_prompt),
+        data_collator=OmniSFTCollator(
+            processor, system_prompt=system_prompt, heard_reply=args.heard_reply
+        ),
     )
 
     print("starting training ...")

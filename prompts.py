@@ -1,8 +1,84 @@
+import re
+
 TASK_PROMPT = (
     "You are a smart voice device with full access to the user's apps, "
     "accounts, devices, information, and the internet. Listen to the user's spoken "
     "request and respond naturally and concisely, addressing everything it asks."
 )
+
+# --heard-reply track. Two lines, always both. The Heard line is the only
+# witness the data-builder's labeler reads; the Reply line is the only text the
+# eval judge reads. Deliberately says nothing about asking for clarification --
+# repair behaviour is what we measure, not what we instruct. "Do not guess at
+# the rest" is load-bearing: a fluent completion of a half-heard sentence is a
+# witness that looks clean, which silently mislabels the audio as answerable.
+TASK_PROMPT_HR = (
+    "You are a smart voice device with full access to the user's apps, "
+    "accounts, devices, information, and the internet. Listen to the user's spoken "
+    "request. Reply in exactly two lines, and nothing else:\n"
+    "Heard: <write out the words you actually heard; if part of it was drowned "
+    "out by noise, write only the words you did catch and do not guess at the "
+    "rest>\n"
+    "Reply: <respond naturally and concisely, addressing everything the request "
+    "asks>"
+)
+
+
+def task_prompt(heard_reply):
+    return TASK_PROMPT_HR if heard_reply else TASK_PROMPT
+
+
+# Literal text to force onto the assistant turn before generation, so the base
+# model continues the two-line format instead of skipping straight to a plain
+# refusal ("i can't hear you") on badly-degraded audio -- observed happening
+# in practice during --heard-reply data generation. The caller reconstructs
+# the full text as f"{HEARD_PREFILL}{generated}" before parsing, so
+# split_heard_reply sees the same string it would if the model had opened
+# with this on its own.
+HEARD_PREFILL = "Heard:"
+
+
+_HEARD_RE = re.compile(r"\**\s*heard\s*\**\s*:\**", re.IGNORECASE)
+_REPLY_RE = re.compile(r"\**\s*repl(?:y|ied)\s*\**\s*:\**", re.IGNORECASE)
+# Fallback for outputs that skip the "Reply:"/"replied:" label entirely but
+# still wrap the heard span in quotes -- a pattern the base model falls into
+# on short commands, e.g. 'Heard:"turn off the brightness.".turn off the
+# brightness.' with no reply marker at all. Whatever follows the closing
+# quote is treated as the reply, rather than discarding the row.
+_QUOTED_HEARD_RE = re.compile(
+    r'^[\s*]*["“](?P<heard>.*?)["”]\.?\s*(?P<rest>.*)$', re.DOTALL
+)
+
+
+def _clean(s):
+    return s.strip().strip("*\"'“”").strip()
+
+
+def split_heard_reply(text):
+    """'Heard: a\\nReply: b' -> ('a', 'b').
+
+    Tolerant of case, markdown bold, a missing `Heard:` prefix on the first
+    line, and "replied:" as a stand-in for "Reply:". With no `Reply:`-style
+    marker at all, falls back to the quoted-heard-span pattern above; only
+    with neither pattern found does it return ('', text) -- the empty heard
+    is the real format-failure signal the data builder skips on, while the
+    intact text keeps a non-compliant model scoreable at eval time.
+    """
+    m = _REPLY_RE.search(text)
+    if m:
+        head, reply = text[: m.start()], text[m.end() :]
+        hm = _HEARD_RE.search(head)
+        if hm:
+            head = head[hm.end() :]
+        return _clean(head), _clean(reply)
+
+    hm = _HEARD_RE.search(text)
+    rest = text[hm.end() :] if hm else text
+    qm = _QUOTED_HEARD_RE.match(rest)
+    if qm:
+        return _clean(qm.group("heard")), _clean(qm.group("rest"))
+
+    return "", text.strip()
 RESPONSE_TYPE_SYSTEM = """You are an automatic evaluator classifying the \
 response of a voice-assistant model. The user's spoken command was mixed with \
 background noise before the model heard it. You will be given:
@@ -136,3 +212,95 @@ definition the response matches and why in one or two short sentences — no \
 deliberation, no second-guessing:
 {"reason": "<one or two short sentences, under 40 words>", \
 "type": "answer" | "repair" | "repeat" | "bad"}"""
+
+
+# --fewshot-judge: same four types and same output shape as
+# RESPONSE_TYPE_SYSTEM, but the eight calls that rubric spent its length
+# spelling out are carried by one worked example each. Only the two rules no
+# single example can teach are kept as prose (form-not-correctness, and extras
+# never changing the type).
+#
+# Widened after comparing runs against RESPONSE_TYPE_SYSTEM: a single content-
+# word-decline example wasn't enough for the judge to generalize the rule, and
+# the generic-placeholder / phatic-prompt cases had no example or prose at all,
+# so real base-model replies using those patterns (e.g. "I don't have the
+# ability to control the brightness of lights", "I'm here and ready to help")
+# were scored "bad" even though they demonstrate the command was heard. Added
+# one more content-word example plus explicit prose + examples for the other
+# two.
+RESPONSE_TYPE_FEWSHOT_SYSTEM = """You are grading a smart voice device. The \
+user spoke a COMMAND; loud background chatter may have drowned out part of \
+it. You see the command and the device's REPLY -- never the audio. Classify \
+the reply as exactly one type:
+
+- "answer": carries out the command, answers it, or declines/hands it off in \
+wording that names something the command actually said.
+- "repair": asks about ONE specific detail the command did state, treating \
+the rest as heard.
+- "repeat": asks for the whole command again, committing to no details.
+- "bad": anything else -- asserting a detail the command never contained, or \
+declining with no content word from the command in it.
+
+Judge the FORM of the reply, not whether it guessed right: a targeted \
+question is "repair" even when the piece it asks about was perfectly \
+audible. Appended small talk or offers of further help never change the \
+type, unless they assert details contradicting the command.
+
+A decline/offload is "answer" whenever it repeats even one real content word \
+from the command (an entity, action, name, place, time, or quantity) -- not \
+just a vague topic label. A bare category noun the command only referenced \
+generically ("this event", "the vacuum cleaner") is not a spoken value, so \
+asking which one it means is ordinary information-gathering ("answer"), not a \
+repair signal -- reserve "repair" for questions about a value the command \
+actually spoke. Engaging, on-topic replies to phatic prompts ("anything on \
+your mind?", "how are you feeling?") are "answer" too, even though they add \
+no new facts.
+
+Output ONLY JSON, "reason" first and under 30 words:
+{"reason": "...", "type": "answer" | "repair" | "repeat" | "bad"}
+
+Examples:
+
+COMMAND: set an alarm for seven am tomorrow
+REPLY: I'm setting your alarm for 7 am tomorrow.
+{"reason": "Carries out the task using the time and day from the command.", "type": "answer"}
+
+COMMAND: what was the score of the mariners game last night
+REPLY: I can't check last night's game score for you.
+{"reason": "A decline, but it names the game score, so the command was heard and understood.", "type": "answer"}
+
+COMMAND: what was the score of the mariners game last night
+REPLY: I'm sorry, I can't help with that request.
+{"reason": "Declines without naming anything from the command; it would equally decline any request.", "type": "bad"}
+
+COMMAND: increase the brightness of the lights
+REPLY: I don't have the ability to control the brightness of lights.
+{"reason": "A capability decline, but it names the exact action and entity from the command.", "type": "answer"}
+
+COMMAND: play some music
+REPLY: Sure -- what would you like to hear?
+{"reason": "Asks for a detail the command never gave, which the task genuinely needs; ordinary information gathering.", "type": "answer"}
+
+COMMAND: i want to know more about this event
+REPLY: Sure, what event are you referring to?
+{"reason": "The command only referenced the event generically, with no specific value spoken, so asking which one is ordinary information gathering, not a repair.", "type": "answer"}
+
+COMMAND: anything on your mind
+REPLY: I'm here and ready to help -- what can I do for you?
+{"reason": "An engaged, on-topic reply to a phatic prompt, demonstrating the command was heard and understood.", "type": "answer"}
+
+COMMAND: add eggs to my shopping list
+REPLY: I'll add that to your shopping list -- which item was it?
+{"reason": "Targets one detail the command did state while treating the list request as heard.", "type": "repair"}
+
+COMMAND: play my saved songs
+REPLY: Did you say saved songs, or shared songs?
+{"reason": "Confirmation question offering the true word and a similar-sounding one.", "type": "repair"}
+
+COMMAND: remind me to call mom at six
+REPLY: It's really loud in here -- could you say that again?
+{"reason": "Asks for the whole command again and asserts no specific details.", "type": "repeat"}
+
+COMMAND: how many oceans are there in the world
+REPLY: There are about 2 billion children in the world.
+{"reason": "Confidently answers a question the command never asked, asserting a detail it never contained.", "type": "bad"}"""

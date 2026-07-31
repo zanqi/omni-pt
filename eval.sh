@@ -14,18 +14,56 @@
 #   ./eval.sh qwen25              # one family
 #   MULTS="4" ./eval.sh qwen3     # base + the 4x adapter only
 #   ADAPTER_PREFIX=keylazy ./eval.sh   # eval the pushed hub adapters, not ./<dir>
+#
+# Tracks (each writes its own TAG so nothing overwrites a prior run's file):
+#   HR=1   ./eval.sh   hr-v1 data, TASK_PROMPT_HR, few-shot judge, hr adapters
+#   ABL=a  ./eval.sh   baseline data/prompt/adapters, few-shot judge only —
+#                      isolates how much of any EAR movement is the judge swap
+#   ABL=b  ./eval.sh   baseline data/adapters, hr prompt + few-shot judge —
+#                      does the scaffolding help a model never trained on it?
+#                      (expect a high heard-parse-failure count; that's the point)
 source ~/.bashrc
 set -eo pipefail
 
 WHICH="${1:-both}"
 MULTS="${MULTS:-1 2 3 4}"
-DS_QWEN25="${DS_QWEN25:-keylazy/slurp-babble-Qwen2.5-Omni-3B-v4}"
-DS_QWEN3="${DS_QWEN3:-keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-v2}"
+
+# Track selection: prompt flags, which datasets, which adapters, result tag.
+HR_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-hr-v1"
+HR_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-hr-v1"
+BASE_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-v4"
+BASE_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-v2"
+ADAPTER_KIND="bab-adapter"
+case "${ABL:-${HR:+hr}}" in
+    hr)
+        TRACK_DESC="heard-reply"
+        EVAL_FLAGS="--heard-reply --fewshot-judge"
+        DEFAULT_QWEN25="$HR_DS_QWEN25"; DEFAULT_QWEN3="$HR_DS_QWEN3"
+        ADAPTER_KIND="bab-hr-adapter"; DEFAULT_TAG="hr" ;;
+    a)
+        TRACK_DESC="ablation A (judge swap only)"
+        EVAL_FLAGS="--fewshot-judge"
+        DEFAULT_QWEN25="$BASE_DS_QWEN25"; DEFAULT_QWEN3="$BASE_DS_QWEN3"
+        DEFAULT_TAG="abl-a" ;;
+    b)
+        TRACK_DESC="ablation B (hr prompt on baseline weights)"
+        EVAL_FLAGS="--heard-reply --fewshot-judge"
+        DEFAULT_QWEN25="$BASE_DS_QWEN25"; DEFAULT_QWEN3="$BASE_DS_QWEN3"
+        DEFAULT_TAG="abl-b" ;;
+    *)
+        TRACK_DESC="baseline"
+        EVAL_FLAGS=""
+        DEFAULT_QWEN25="$BASE_DS_QWEN25"; DEFAULT_QWEN3="$BASE_DS_QWEN3"
+        DEFAULT_TAG="v4" ;;
+esac
+
+DS_QWEN25="${DS_QWEN25:-$DEFAULT_QWEN25}"
+DS_QWEN3="${DS_QWEN3:-$DEFAULT_QWEN3}"
 # Where the adapters live: "." for sft.sh's local output dirs, "keylazy" for the
 # pushed hub copies. Either way the result filename uses the adapter basename.
 ADAPTER_PREFIX="${ADAPTER_PREFIX:-.}"
 OUT_DIR="${OUT_DIR:-results}"
-TAG="${TAG:-v4}"
+TAG="${TAG:-$DEFAULT_TAG}"
 
 JUDGE_HOST=$(cat /gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt)
 JUDGE_URL="http://${JUDGE_HOST}:8000/v1"
@@ -34,6 +72,7 @@ if ! curl -sf --max-time 10 "${JUDGE_URL}/models" > /dev/null; then
     exit 1
 fi
 echo "judge OK at ${JUDGE_URL}"
+echo "track: ${TRACK_DESC} — flags '${EVAL_FLAGS}', tag '${TAG}'"
 mkdir -p "$OUT_DIR"
 
 run_eval() {
@@ -43,7 +82,7 @@ run_eval() {
     local out="${OUT_DIR}/bab_results_${name}_${TAG}.jsonl"
 
     echo "=== eval ${name} on ${ds_id} -> ${out} ==="
-    python -u babble_eval_qwen.py \
+    python -u babble_eval_qwen.py $EVAL_FLAGS \
         --model-path "$model_path" \
         ${adapter_path:+--adapter-path "$adapter_path"} \
         --dataset "$ds_id" \
@@ -57,7 +96,7 @@ run_family() {
 
     run_eval "$model_path" "$ds_id"
     for n in $MULTS; do
-        run_eval "$model_path" "$ds_id" "${ADAPTER_PREFIX}/${model_name}-bab-adapter-${n}x"
+        run_eval "$model_path" "$ds_id" "${ADAPTER_PREFIX}/${model_name}-${ADAPTER_KIND}-${n}x"
     done
 }
 

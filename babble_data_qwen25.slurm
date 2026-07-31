@@ -4,12 +4,12 @@
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=zanqil@uw.edu
 
-#SBATCH --account=cse
-#SBATCH --partition=gpu-a100
+#SBATCH --account=intelligentsystems # cse
+#SBATCH --partition=gpu-l40s
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=6
-#SBATCH --mem=90G
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=188G
 #SBATCH --gpus=1
 #SBATCH --time=01-0:00:00 # Max runtime in DD-HH:MM:SS format.
 
@@ -29,9 +29,9 @@ echo "judge OK at http://${JUDGE_HOST}:8000/v1"
 
 
 source ~/.bashrc
-DS_ID_QWEN25="${1:-keylazy/slurp-babble-Qwen2.5-Omni-3B-v4}"
+DS_ID_QWEN25="${1:-keylazy/slurp-babble-Qwen2.5-Omni-3B-hr}"
 
 echo "Generating Qwen2.5 dataset -> ${DS_ID_QWEN25}"
 conda activate qwen25omni
-python -u babble_data.py --omni-path Qwen/Qwen2.5-Omni-3B --ds-id "$DS_ID_QWEN25"
+python -u babble_data.py --heard-reply --omni-path Qwen/Qwen2.5-Omni-3B --ds-id "$DS_ID_QWEN25" --n-test 50 --n-train 1000 --n-extra-ans 1000
 echo "Qwen2.5 dataset generated successfully."

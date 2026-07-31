@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Two-pass decision-tree labeling: independent ASR / reply witnesses, table-resolved kinds</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5b5b5b; --rule: #ddd;
+    --code-bg: #f4f4f5; --accent: #8a3ffc; --bad: #c0392b; --ok: #1a7f37;
+    --card: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#15161a; --fg:#e8e8ea; --muted:#a0a0a8; --rule:#33343a;
+      --code-bg:#1e1f25; --accent:#b794ff; --bad:#ff6b6b; --ok:#4fd07a; --card:#1b1c22; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 880px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem;
+  }
+  h1 { font-size: 1.7rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.8rem; border-bottom: 1px solid var(--rule); padding-bottom: .4rem; }
+  h3 { font-size: 1.02rem; margin-top: 1.6rem; color: var(--accent); }
+  h4 { font-size: .95rem; margin-top: 1.3rem; margin-bottom: .3rem; }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .87em; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg); padding: .9rem 1rem; border-radius: 8px;
+    overflow-x: auto; line-height: 1.5; border: 1px solid var(--rule);
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--rule); padding: .45rem .6rem; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); }
+  .card {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1rem 1.2rem; margin: 1rem 0;
+  }
+  .step-badge {
+    display: inline-block; background: var(--accent); color: #fff;
+    border-radius: 999px; width: 1.6em; height: 1.6em; line-height: 1.6em;
+    text-align: center; font-weight: 600; font-size: .85em; margin-right: .5em;
+  }
+  .risk { border-left: 3px solid var(--bad); padding-left: .9rem; margin: .8rem 0; }
+  .good { color: var(--ok); }
+  .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  .kind-answer { color: var(--ok); font-weight: 600; }
+  .kind-repair { color: var(--accent); font-weight: 600; }
+  .kind-repeat { color: var(--bad); font-weight: 600; }
+  ul { padding-left: 1.3rem; }
+  li { margin: .3rem 0; }
+  del { color: var(--bad); }
+  ins { color: var(--ok); text-decoration: none; }
+  .q { border-left: 3px solid var(--accent); padding-left: .9rem; margin: .9rem 0; }
+  footer { margin-top: 3rem; color: var(--muted); font-size: .85rem; border-top: 1px solid var(--rule); padding-top: 1rem; }
+</style>
+</head>
+<body>
+
+<h1>Two-pass decision-tree labeling</h1>
+<p class="subtitle">The ASR pass and the task-reply pass are labeled <em>independently</em>, then a deterministic table in Python resolves the pair into a kind and — for <code>repair</code> — names the exact piece to ask about. Replaces the single reconciling classifier call in the default babble track.</p>
+
+<div class="card">
+<strong>What changes, in one line each</strong>
+<ul>
+  <li><strong>Classifier:</strong> one 90-line reconciling rubric &rarr; two short independent labelers + an 11-cell table in code.</li>
+  <li><strong>Repair anchor:</strong> the table names <em>which pass</em> supplies the lost piece, so the repair question is anchored per probe rather than per utterance.</li>
+  <li><strong>Answer targets:</strong> when the ASR pass is clean, the base model's own reply becomes the training target verbatim (free, no LLM call) — unless that reply fumbled it, in which case one style-few-shot call writes a replacement.</li>
+  <li><strong>Eval:</strong> exactly one cell of <code>SCORE_MATRIX</code> moves. Nothing else about the judge changes.</li>
+  <li><strong>Packaging:</strong> new <code>--tree-label</code> flag, new <code>-tree-v1</code> dataset ids. The existing default and <code>--heard-reply</code> tracks stay runnable and comparable.</li>
+</ul>
+</div>
+
+<div class="card">
+<strong>Decisions taken</strong> <span class="muted">(answers to the four open questions)</span>
+<ul>
+  <li><strong>ASR 1 lost / reply &ge;2 lost with empty intersection &rarr; <span class="kind-answer">answer</span>.</strong> The starred reading, taken literally: two passes disagreeing about <em>what</em> was lost is treated as neither loss being real.</li>
+  <li><strong>Judge rubric unchanged.</strong> The existing <code>"answer"</code> type already demands every needed detail be demonstrated, so judged&nbsp;<code>answer</code>&nbsp;=&nbsp;"answer with full details" and partial answers fall through to <code>"bad"</code>. No new type, no <code>full_details</code> flag.</li>
+  <li><strong>repeat&nbsp;&times;&nbsp;repair scores a flat&nbsp;0</strong> (was&nbsp;0.5). The judge never sees the row's <code>lost</code> list.</li>
+  <li><strong>New track, new ids.</strong> <code>--tree-label</code> on <code>babble_data.py</code>, <code>TP=1</code> on the shell drivers.</li>
+</ul>
+</div>
+
+<h2>The decision table</h2>
+
+<p>Each pass gets a bucket. The ASR pass has three; the reply pass has five, because a reply can also <em>be</em> a repair question or a repeat request rather than an attempt at the task.</p>
+
+<table>
+<tr><th>Pass</th><th>Buckets</th><th>From</th></tr>
+<tr>
+  <td><code>asr</code></td>
+  <td><code>a0</code> nothing lost &middot; <code>a1</code> exactly one key piece lost &middot; <code>aN</code> two or more lost</td>
+  <td><code>len(lost)</code> from the ASR labeler</td>
+</tr>
+<tr>
+  <td><code>resp</code></td>
+  <td><code>r0</code> / <code>r1</code> / <code>rN</code> by <code>len(lost)</code> when the reply attempts the task &middot; <code>rREPAIR</code> the reply is itself a targeted question &middot; <code>rREPEAT</code> the reply asks for the whole thing again</td>
+  <td><code>form</code> + <code>lost</code> from the reply labeler</td>
+</tr>
+</table>
+
+<p>All 15 combinations, with the professor's 11 rows plus the 4 he left implicit (marked <span class="muted">†</span>, all covered by his "asr is perfect &rarr; answerable" line):</p>
+
+<table>
+<tr><th>asr</th><th>resp</th><th>kind</th><th>repair anchor</th><th>target</th></tr>
+<tr><td><code>a0</code></td><td><code>r0</code></td><td class="kind-answer">answer</td><td>—</td><td>base reply, verbatim</td></tr>
+<tr><td><code>a1</code></td><td><code>r0</code></td><td class="kind-answer">answer</td><td>—</td><td>base reply, verbatim</td></tr>
+<tr><td><code>aN</code></td><td><code>r0</code></td><td class="kind-answer">answer</td><td>—</td><td>base reply, verbatim</td></tr>
+<tr><td><code>a0</code></td><td><code>r1</code></td><td class="kind-answer">answer</td><td>—</td><td>style few-shot call</td></tr>
+<tr><td><code>a0</code></td><td><code>rN</code></td><td class="kind-answer">answer</td><td>—</td><td>style few-shot call</td></tr>
+<tr><td><code>a0</code></td><td><code>rREPAIR</code> <span class="muted">†</span></td><td class="kind-answer">answer</td><td>—</td><td>style few-shot call</td></tr>
+<tr><td><code>a0</code></td><td><code>rREPEAT</code> <span class="muted">†</span></td><td class="kind-answer">answer</td><td>—</td><td>style few-shot call</td></tr>
+<tr><td><code>a1</code></td><td><code>r1</code></td><td class="kind-repair">repair</td><td>the reply's piece</td><td>repair call</td></tr>
+<tr><td><code>a1</code></td><td><code>rN</code></td><td>∩&nbsp;=&nbsp;1&nbsp;&rarr;&nbsp;<span class="kind-repair">repair</span><br>∩&nbsp;=&nbsp;∅&nbsp;&rarr;&nbsp;<span class="kind-answer">answer</span></td><td>the intersecting piece</td><td>repair call<br>style few-shot call</td></tr>
+<tr><td><code>a1</code></td><td><code>rREPAIR</code></td><td class="kind-repair">repair</td><td>the piece the reply asked about</td><td>repair call</td></tr>
+<tr><td><code>a1</code></td><td><code>rREPEAT</code></td><td class="kind-repair">repair</td><td>the ASR's piece</td><td>repair call</td></tr>
+<tr><td><code>aN</code></td><td><code>r1</code></td><td class="kind-repair">repair</td><td>the reply's piece</td><td>repair call</td></tr>
+<tr><td><code>aN</code></td><td><code>rREPAIR</code></td><td class="kind-repair">repair</td><td>the piece the reply asked about</td><td>repair call</td></tr>
+<tr><td><code>aN</code></td><td><code>rN</code></td><td class="kind-repeat">repeat</td><td>—</td><td>repeat call</td></tr>
+<tr><td><code>aN</code></td><td><code>rREPEAT</code></td><td class="kind-repeat">repeat</td><td>—</td><td>repeat call</td></tr>
+</table>
+
+<p>Two properties worth naming, because they are the substance of the change:</p>
+<ul>
+  <li><strong>Either witness alone can clear the audio.</strong> <code>r0</code> is a full row and <code>a0</code> is a full row: a clean pass on <em>either</em> side means <span class="kind-answer">answer</span>, whatever the other pass did. The old rubric spent a dozen lines of prose trying to express this ("a correct reply always overrides a bad transcript") and still leaked.</li>
+  <li><strong><span class="kind-repeat">repeat</span> requires both passes to fail badly.</strong> Only two of fifteen cells produce it, and both need <code>aN</code>. Expect the kind distribution to shift hard toward <code>answer</code> — see the risk note in step&nbsp;2.</li>
+</ul>
+
+<p>Because <code>a1</code> contributes exactly one entry, the <code>a1&times;rN</code> intersection has size 0 or 1 — never more. The table is exhaustive.</p>
+
+<h2>Steps</h2>
+
+<h3><span class="step-badge">1</span> Split the classifier into two independent labelers</h3>
+
+<p>New prompts in <code>prompts.py</code>, replacing <code>CLASSIFY_SYSTEM</code>/<code>CLASSIFY_USER</code> for this track only:</p>
+
+<ul>
+  <li><code>ASR_LOSS_SYSTEM</code> &mdash; sees <code>(COMMAND, TRANSCRIPT)</code>, returns <code>{"lost": [...], "misheard_as": "..."}</code>. This is <code>LABEL_TARGET_SYSTEM</code>'s labeling half with the target-writing half deleted; its worked examples (wake words, implied words, spacing differences, bundling a near-miss phrase into one entry) carry over unedited, since they were already written against a single text witness.</li>
+  <li><code>RESP_LOSS_SYSTEM</code> &mdash; sees <code>(COMMAND, REPLY)</code>, returns <code>{"form": "answer"|"repair"|"repeat"|"bad", "lost": [...], "misheard_as": "...", "asked_about": "..."}</code>. <code>form</code> reuses the four type definitions the eval judge already applies to model replies, so the definitions stay in one place. <code>asked_about</code> is populated only when <code>form=="repair"</code> and is what the table means by "the piece the reply asked about"; it must be quoted in the <em>command's</em> words so it can be matched against the ASR's list.</li>
+</ul>
+
+<p><strong>Two calls, not one.</strong> Independence is the entire point of the redesign — one call that sees both passes will let the good one launder the bad one, which is exactly the contamination the current rubric keeps patching. Both systems are static, so vLLM prefix-caches each; cost goes from 1 to 2 calls per probe audio, absorbed by raising <code>CLASSIFY_WORKERS</code>.</p>
+
+<p><code>form=="bad"</code> has no column in the professor's table. Treat it as <code>rN</code>: a hallucinated or boilerplate reply demonstrates that <em>nothing</em> got through, which is what <code>rN</code> already means for the table's purposes.</p>
+
+<h3><span class="step-badge">2</span> Put the table in <code>util.py</code></h3>
+
+<pre><code>def decide_kind(asr_lost, resp_form, resp_lost, resp_asked_about):
+    """(per-pass labels) -> (kind, anchor_piece | None). The 15-cell table."""</code></pre>
+
+<p>It goes in <code>util.py</code> rather than <code>babble_data.py</code> because it has two real call sites — the builder and the dry-run harness of step&nbsp;3 — which is what the repo's no-single-use-function rule asks for.</p>
+
+<p>Intersection matching is the one fuzzy part: <code>lost</code> entries are free-text quotes, so <code>"the 7 am alarm"</code> and <code>"7 am"</code> must intersect. Use normalized content-token overlap — <code>BasicTextNormalizer</code>, drop a small stopword set, intersect if they share at least one token. Deterministic, no third LLM call, and it only has to adjudicate a single containment test per probe.</p>
+
+<div class="risk">
+<strong>Risk: the kind distribution skews.</strong> Only 2 of 15 cells yield <code>repeat</code> and both need <code>aN</code>. <code>probe_by_kinds</code> redraws SNR up to <code>MAX_PROBES</code> batches looking for one audio of each kind, so a rare <code>repeat</code> means more skipped utterances and more GPU time per triplet. Mitigation, in order: adopt the disjoint <code>SLOT_SNR_HR</code> bands (already tuned so kind tracks SNR), then widen the <code>repeat</code> band downward, then raise <code>MAX_PROBES</code>. Step&nbsp;3 measures this before any GPU time is spent.
+</div>
+
+<h3><span class="step-badge">3</span> Dry-run the table offline first</h3>
+
+<p><code>babble_audio/slurp-babble-Qwen2.5-Omni-3B-v4/rows.json</code> already holds 6000 rows carrying <code>sentence</code>, <code>asr_transcript</code>, <strong><code>omni_response</code></strong>, and the v4 <code>kind</code>/<code>lost</code> labels. Both witnesses the new table needs are already on disk, so the whole classifier can be validated for the cost of vLLM calls and zero GPU:</p>
+
+<pre><code>python twopass_label_dryrun.py \
+    babble_audio/slurp-babble-Qwen2.5-Omni-3B-v4/rows.json -n 300</code></pre>
+
+<p>Modeled on <code>hr_label_dryrun.py</code>. It should print:</p>
+<ul>
+  <li>occupancy of all 15 cells &mdash; the direct answer to the skew risk above;</li>
+  <li>the new-kind × v4-kind confusion matrix;</li>
+  <li>every row where the two labelers disagree about which piece was lost, since that is where the table earns or loses its keep;</li>
+  <li>the <code>a1&times;rN</code> rows split by intersection, so the "answerable" decision can be eyeballed on real cases before it is baked in.</li>
+</ul>
+<p>Read the confusion as diagnostic, not as accuracy: v4's labels came from the reconciling rubric this design is deliberately replacing, and the <code>a0</code>/<code>r0</code> rows are <em>meant</em> to reclassify.</p>
+
+<h3><span class="step-badge">4</span> Move target generation per-probe</h3>
+
+<p>Today <code>build()</code> makes one <code>TARGET_SYSTEM</code> call per utterance that writes all three targets, anchored on the repair probe's lost piece. The table anchors per probe, so this has to move next to the labeling — the same restructuring <code>--heard-reply</code> already did. Four target paths:</p>
+
+<table>
+<tr><th>Path</th><th>Cost</th><th>How</th></tr>
+<tr><td>answer, base reply usable</td><td><span class="good">free</span></td><td><code>target = probe["response"]</code>. The <code>r0</code> column: the reply demonstrably heard everything, so it <em>is</em> a correct target — and a target in the base model's own voice, which is a bonus for SFT.</td></tr>
+<tr><td>answer, base reply fumbled</td><td>1 call</td><td>New <code>ANSWER_STYLE_SYSTEM</code>: the <code>a0</code> row. The ASR proves everything got through but the reply mishandled it, so it can't be the target. Prompt carries ~6 <code>(COMMAND, good reply)</code> pairs mined from v4 rows where <code>kind=="answer"</code> and <code>lost==[]</code>, hand-picked to cover the archetypes (direct fact, task confirmation, capability decline, multi-part request). Static, so it prefix-caches; the exemplars are the style spec.</td></tr>
+<tr><td>repair</td><td>1 call</td><td><code>TARGET_SYSTEM</code>'s repair rules, narrowed to one target and given the anchor piece + <code>misheard_as</code> the table selected, plus the transcript for grounding.</td></tr>
+<tr><td>repeat</td><td>1 call</td><td><code>TARGET_SYSTEM</code>'s repeat rules, narrowed to one target. Content-free by construction; keep it an LLM call for phrasing variety rather than sampling a fixed pool.</td></tr>
+</table>
+
+<p>Net LLM calls per probe: 2 labelers + 0&ndash;1 target. Roughly comparable to today's 1 classifier + amortized triplet target call, and the <code>r0</code> rows are strictly cheaper.</p>
+
+<h3><span class="step-badge">5</span> Wire the <code>--tree-label</code> flag</h3>
+
+<p>A third branch in <code>probe_by_kinds</code> alongside the existing <code>HEARD_REPLY</code> / default split. It reuses the default path's two GPU decodes (ASR prompt, then task prompt) unchanged — only the labeling and target steps differ. <code>make_row</code> gains the per-pass diagnostics, which are what makes a bad run debuggable after the fact:</p>
+
+<pre><code>"asr_lost": [...], "asr_bucket": "a1",
+"resp_form": "repeat", "resp_lost": [...], "resp_bucket": "rREPEAT",
+"anchor": "7 am", "cell": "a1xrREPEAT"</code></pre>
+
+<p>Dataset ids: <code>keylazy/slurp-babble-&lt;model&gt;-tree-v1</code>. Driver: <code>TP=1 ./babble_data.sh</code>, mirroring the existing <code>HR=1</code> branch.</p>
+
+<h3><span class="step-badge">6</span> SFT — no code change</h3>
+
+<p><code>sft_qwen.py</code> needs nothing: no <code>--heard-reply</code>, plain <code>TASK_PROMPT</code>, and the existing <code>--train-caps</code> composition sweep applies as-is. <code>TP=1 ./sft.sh</code> adds the track's dataset defaults and names adapters <code>&lt;model&gt;-bab-tree-adapter-&lt;n&gt;x</code>.</p>
+<p>One caveat inherited from the skew risk: the sweep caps <code>repair</code> and <code>repeat</code> at 1000 each, so the data build has to actually reach 1000 <code>repeat</code> triplets. Step&nbsp;3's cell occupancy tells you whether that is affordable before you commit the GPU hours.</p>
+
+<h3><span class="step-badge">7</span> Eval — one cell moves</h3>
+
+<p>Lining the professor's judge rules up against the current matrix, three of the four rows are already exactly right:</p>
+
+<pre><code>SCORE_MATRIX_TREE = {
+    "answer": {"answer": 1.0, "repair": 0.0, "repeat": 0.0, "bad": 0.0},   # unchanged
+    "repair": {"answer": 1.0, "repair": 1.0, "repeat": 0.5, "bad": 0.0},   # unchanged
+    "repeat": {"answer": 1.0, "repair": <del>0.5</del> <ins>0.0</ins>, "repeat": 1.0, "bad": 0.0},
+}</code></pre>
+
+<p>Gate it behind <code>--score-matrix {legacy,tree}</code> on <code>babble_eval_qwen.py</code> so prior result files stay reproducible, and have the new <code>TP=1</code> track in <code>eval.sh</code> pass <code>tree</code>. The flag is deliberately about scoring, not about labeling — a legacy-track dataset can be rescored under the new matrix, which is the cheapest way to see how much of any EAR movement is the matrix change alone.</p>
+
+<p>Judge prompt: <strong>no change</strong>, per the decision above. Default to the rules judge (<code>RESPONSE_TYPE_SYSTEM</code>) for comparability with the v4 baseline; <code>--fewshot-judge</code> stays available and orthogonal.</p>
+
+<p>Expect <code>F</code> (the repeat-row mean) to drop versus prior runs purely from the matrix change — a base model that answers one question when the whole command was lost used to bank 0.5 and now banks 0. Since <code>EAR</code> is the harmonic mean of three, a lower <code>F</code> pulls it down more than proportionally. This is intended, but it means <strong>tree-track EAR is not comparable to published v4 EAR</strong> unless the v4 results are rescored under <code>--score-matrix tree</code> too. Do that rescore; it is a few minutes of judge calls against existing <code>.jsonl</code> files.</p>
+
+<h3><span class="step-badge">8</span> Run order</h3>
+
+<pre><code># 0. judge box up
+sbatch /gscratch/sciencehub/zanqil/vllm_judge/vllm_judge.slurm
+
+# 1. validate the table with zero GPU  (steps 1-3)
+python twopass_label_dryrun.py \
+    babble_audio/slurp-babble-Qwen2.5-Omni-3B-v4/rows.json -n 300
+#    -> read cell occupancy; tune SLOT_SNR / MAX_PROBES before spending GPU
+
+# 2. smoke the builder on a handful of utterances  (steps 4-5)
+python -u babble_data.py --tree-label --omni-path Qwen/Qwen2.5-Omni-3B \
+    --ds-id keylazy/slurp-babble-Qwen2.5-Omni-3B-tree-smoke \
+    --n-train 5 --n-test 2 --n-extra-ans 0
+
+# 3. full build, both families
+TP=1 ./babble_data.sh
+
+# 4. LoRA sweep  (step 6)
+TP=1 ./sft.sh qwen25
+
+# 5. eval  (step 7)
+TP=1 ./eval.sh qwen25
+#    plus: rescore the v4 baseline under the new matrix, for comparability
+python -u babble_eval_qwen.py --score-matrix tree \
+    --model-path Qwen/Qwen2.5-Omni-3B \
+    --dataset keylazy/slurp-babble-Qwen2.5-Omni-3B-v4 \
+    --out results/bab_results_Qwen2.5-Omni-3B_v4-treescore.jsonl \
+    --judge-base-url "http://$(cat /gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt):8000/v1"</code></pre>
+
+<h2>Open, decided by recommendation</h2>
+<p>These were not in the professor's notes; each is resolved above in the direction I'd default to, and each is cheap to reverse.</p>
+<div class="q"><strong>Two labeler calls rather than one.</strong> Doubles classifier calls to buy genuine independence. Reversible: one call returning both per-pass objects would work, at the cost of the contamination the redesign exists to remove.</div>
+<div class="q"><strong><code>form=="bad"</code> maps to <code>rN</code>.</strong> A hallucinated or boilerplate reply is treated as "nothing survived this pass". The alternative is dropping the probe, which is cleaner but costs GPU work.</div>
+<div class="q"><strong>Intersection by normalized content-token overlap.</strong> Deterministic and cheap; the alternative is an LLM alignment call. Only ever adjudicates one containment test per probe.</div>
+<div class="q"><strong>Style exemplars mined from v4 and frozen into <code>prompts.py</code>.</strong> Static beats per-run sampling here: it prefix-caches, and it makes the answer-target style a reviewable artifact rather than a property of whichever rows a run happened to draw.</div>
+<div class="q"><strong>Repeat targets stay an LLM call.</strong> They carry no content, so a fixed phrase pool would work, but variety in the training targets is worth one cached call.</div>
+
+<footer>
+Housekeeping done alongside this plan: <code>rows_&lt;ds&gt;.json</code> dumps now land at <code>babble_audio/&lt;ds&gt;/rows.json</code>, next to the wavs they reference, and the four existing dumps were moved there.
+</footer>
+
+</body>
+</html>

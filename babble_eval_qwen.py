@@ -29,7 +29,12 @@ import torch
 from datasets import load_dataset, Audio
 from openai import OpenAI
 from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
-from prompts import RESPONSE_TYPE_SYSTEM, TASK_PROMPT
+from prompts import (
+    RESPONSE_TYPE_FEWSHOT_SYSTEM,
+    RESPONSE_TYPE_SYSTEM,
+    split_heard_reply,
+    task_prompt,
+)
 
 AUDIO_SAMPLING_RATE = 16000
 
@@ -61,29 +66,8 @@ def get_audio(field):
     return arr.numpy().astype("float32"), samples.sample_rate
 
 
-def build_conversation(wav_path: str, family: str):
-    conversation = []
-    if family == "qwen2.5":
-        conversation.append(
-            {
-                "role": "system",
-                "content": [{"type": "text", "text": QWEN25_SYSTEM_PROMPT}],
-            }
-        )
-    conversation.append(
-        {
-            "role": "user",
-            "content": [
-                {"type": "audio", "audio": wav_path},
-                {"type": "text", "text": TASK_PROMPT},
-            ],
-        }
-    )
-    return conversation
-
-
 @torch.inference_mode()
-def run_model(model, processor, family, audio_array, sr, max_new_tokens):
+def run_model(model, processor, family, audio_array, sr, max_new_tokens, heard_reply):
     """input: audio + task prompt => return: model's text reply"""
     from qwen_omni_utils import process_mm_info
 
@@ -92,7 +76,26 @@ def run_model(model, processor, family, audio_array, sr, max_new_tokens):
     try:
         sf.write(wav_path, audio_array, sr)
 
-        conversation = build_conversation(wav_path, family)
+        conversation = []
+        if family == "qwen2.5":
+            conversation.append(
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": QWEN25_SYSTEM_PROMPT}],
+                }
+            )
+        conversation.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "audio": wav_path},
+                    # must match the prompt the adapter was trained under --
+                    # evaluating an hr adapter under the plain prompt is a
+                    # train/test mismatch that reads as a regression
+                    {"type": "text", "text": task_prompt(heard_reply)},
+                ],
+            }
+        )
 
         text = processor.apply_chat_template(
             conversation, add_generation_prompt=True, tokenize=False
@@ -189,14 +192,6 @@ def _fmt_lost(lost):
     return "; ".join(f'"{s}"' for s in lost)
 
 
-def classify_response(judge_fn, sentence, response):
-    user = (
-        f'Original Spoken Command: "{sentence}"\n'
-        f'Model Response: "{response}"\n'
-    )
-    return judge_fn(RESPONSE_TYPE_SYSTEM, user)
-
-
 def harmonic3(c, r, f):
     denom = c * r + c * f + r * f
     if denom == 0:
@@ -234,6 +229,19 @@ def main():
     )
     ap.add_argument("--num-rows", type=int, default=150)
     ap.add_argument("--max-new-tokens", type=int, default=256)
+    ap.add_argument(
+        "--heard-reply",
+        action="store_true",
+        help="Prompt with TASK_PROMPT_HR and judge only the parsed 'Reply:' "
+        "half. Required for adapters trained with sft_qwen.py --heard-reply.",
+    )
+    ap.add_argument(
+        "--fewshot-judge",
+        action="store_true",
+        help="Judge with RESPONSE_TYPE_FEWSHOT_SYSTEM instead of the rule "
+        "rubric. Independent of --heard-reply so the judge swap can be "
+        "ablated on its own.",
+    )
     args = ap.parse_args()
 
     # if not os.environ.get("OPENAI_API_KEY"):
@@ -247,7 +255,18 @@ def main():
 
     name_src = args.adapter_path or args.model_path
     model_name = name_src.rstrip("/").split("/")[-1]
-    out_path = args.out or f"bab_results_{model_name}_v2.jsonl"
+    # the default name is keyed only on the model/adapter, so fold the track in
+    # -- otherwise an hr run silently overwrites the baseline result file
+    # eval.ipynb reads
+    tag = "hr" if args.heard_reply else "v2"
+    out_path = args.out or f"results/bab_results_{model_name}_{tag}.jsonl"
+    judge_system = (
+        RESPONSE_TYPE_FEWSHOT_SYSTEM if args.fewshot_judge else RESPONSE_TYPE_SYSTEM
+    )
+    print(
+        f"prompt: {'heard-reply' if args.heard_reply else 'plain'} | "
+        f"judge: {'few-shot' if args.fewshot_judge else 'rules'}"
+    )
 
     ds = load_dataset(args.dataset, split=args.split)
 
@@ -298,20 +317,39 @@ def main():
             raise ValueError(f"unknown kind in dataset: {kind!r}")
         arr, sr = get_audio(row["audio"])
         with GPU_LOCK:
-            resp = run_model(model, processor, family, arr, sr, args.max_new_tokens)
-        judged_type, reason = classify_response(judge_fn, row["sentence"], resp)
+            resp = run_model(
+                model, processor, family, arr, sr, args.max_new_tokens, args.heard_reply
+            )
+
+        # The judge sees the reply alone -- never the Heard line, which would
+        # leak evidence into the type decision. A model that ignores the
+        # two-line contract is scored on its raw output rather than penalized
+        # twice; the summary counts how often that happened.
+        heard, reply = ("", resp)
+        if args.heard_reply:
+            heard, reply = split_heard_reply(resp)
+
+        user = (
+            f'Original Spoken Command: "{row["sentence"]}"\n'
+            f'Model Response: "{reply}"\n'
+        )
+        judged_type, reason = judge_fn(judge_system, user)
         return {
             "resp": resp,
+            "heard": heard,
+            "reply": reply,
             "judged_type": judged_type,
             "reason": reason,
             "score": SCORE_MATRIX[kind][judged_type],
         }
 
+    parse_failures = 0
     with open(out_path, "w", encoding="utf-8") as fout:
         for i, (row, result) in enumerate(imap_ordered(ds, process_row, ROW_WORKERS)):
             kind = row["kind"]
             sentence = row["sentence"]
-            asr_transcript = row["asr_transcript"]
+            # a dataset built without the probe columns still evaluates
+            asr_transcript = row.get("asr_transcript", "")
             lost = row["lost"]
 
             resp = result["resp"]
@@ -322,6 +360,8 @@ def main():
             scores[kind] += score
             counts[kind] += 1
             confusion[(kind, judged_type)] += 1
+            if args.heard_reply and not result["heard"]:
+                parse_failures += 1
 
             rec = {
                 "id": row["id"],
@@ -330,10 +370,12 @@ def main():
                 "sentence": sentence,
                 "snr_db": row["snr_db"],
                 "asr_transcript": asr_transcript,
-                "base_response": row["omni_response"],
+                "base_response": row.get("omni_response", ""),
                 "lost": lost,
                 "target": row["target"],
                 "response": resp,
+                "heard": result["heard"],
+                "reply": result["reply"],
                 "judged_type": judged_type,
                 "score": score,
                 "reason": reason,
@@ -349,7 +391,11 @@ def main():
             print(f"    CMD : {sentence}")
             print(f"    ASR : {asr_transcript}")
             print(f"    LOST: {_fmt_lost(lost)}")
-            print(f"    LLM : {resp}")
+            if args.heard_reply:
+                print(f"    HRD : {result['heard'] or '(unparseable — judged raw)'}")
+                print(f"    RPLY: {result['reply']}")
+            else:
+                print(f"    LLM : {resp}")
             print(f"    JUD : {reason}")
 
         if sum(counts.values()) == 0:
@@ -369,6 +415,9 @@ def main():
                     "adapter": args.adapter_path,
                     "model_family": family,
                     "judge_model": args.judge_model,
+                    "heard_reply": args.heard_reply,
+                    "fewshot_judge": args.fewshot_judge,
+                    "heard_parse_failures": parse_failures,
                     "answer_rows": counts["answer"],
                     "repair_rows": counts["repair"],
                     "repeat_rows": counts["repeat"],
@@ -399,6 +448,11 @@ def main():
     print(f"R  : {R: .3f}")
     print(f"F  : {F: .3f}")
     print(f"EAR: {EAR: .3f}")
+    if args.heard_reply:
+        print(
+            f"heard-parse failures: {parse_failures}/{sum(counts.values())} "
+            "(judged on raw output)"
+        )
     print("\nconfusion (target kind -> judged type):")
     for k in ("answer", "repair", "repeat"):
         cells = " ".join(f"{t}:{confusion[(k, t)]:3d}" for t in JUDGED_TYPES)

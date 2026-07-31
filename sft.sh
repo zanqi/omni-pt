@@ -17,6 +17,8 @@
 #   ./sft.sh qwen25       # only the Qwen2.5-Omni-3B sweep
 #   ./sft.sh qwen3        # only the Qwen3-Omni-30B-A3B-Instruct sweep
 #   MULTS="3 4" ./sft.sh  # only the 3x and 4x runs
+#   HR=1 ./sft.sh         # Heard:/Reply: track — hr-v1 datasets, TASK_PROMPT_HR,
+#                         # adapters named <model>-bab-hr-adapter-<n>x
 #
 # One GPU, sequential — run it under salloc/srun or wrap it in an sbatch job.
 source ~/.bashrc
@@ -24,8 +26,20 @@ set -eo pipefail
 
 WHICH="${1:-both}"
 MULTS="${MULTS:-1 2 3 4}"
-DS_QWEN25="${DS_QWEN25:-keylazy/slurp-babble-Qwen2.5-Omni-3B-v4}"
-DS_QWEN3="${DS_QWEN3:-keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-v2}"
+
+if [[ -n "${HR:-}" ]]; then
+    HR_FLAG="--heard-reply"
+    ADAPTER_KIND="bab-hr-adapter"
+    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-hr-v1"
+    DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-hr-v1"
+else
+    HR_FLAG=""
+    ADAPTER_KIND="bab-adapter"
+    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-v4"
+    DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-v2"
+fi
+DS_QWEN25="${DS_QWEN25:-$DEFAULT_QWEN25}"
+DS_QWEN3="${DS_QWEN3:-$DEFAULT_QWEN3}"
 
 run_sweep() {
     local omni_path="$1" ds_id="$2"
@@ -33,9 +47,9 @@ run_sweep() {
     local n run_name
 
     for n in $MULTS; do
-        run_name="${model_name}-bab-adapter-${n}x"
+        run_name="${model_name}-${ADAPTER_KIND}-${n}x"
         echo "=== ${run_name}: answer=$((n * 1000)) repair=1000 repeat=1000 <- ${ds_id} ==="
-        python -u sft_qwen.py \
+        python -u sft_qwen.py $HR_FLAG \
             --omni-path "$omni_path" \
             --ds-id "$ds_id" \
             --train-caps "answer=$((n * 1000)),repair=1000,repeat=1000" \

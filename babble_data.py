@@ -1,14 +1,25 @@
 """
 Build babble-noise slurp dataset for conversational-repair training.
 
-Scheme: For each noisy probe, the omni base model produce an ASR
-transcript and a task response. The LLM  sees (original sentence,
+Two tracks, selected by --heard-reply:
+
+Default (two-pass): for each noisy probe the omni base model produces an ASR
+transcript and, separately, a task response. The LLM sees (original sentence,
 transcript, response) and labels the probe:
 - "answer":     every detail needed to perform the task survived the noise;
                 filler only loss
 - "repair":     exactly ONE key piece was lost or misheard;
                 the rest can be trusted
-- "repeat":    more than one key piece lost in both passes
+- "repeat":     more than one key piece lost in both passes
+
+--heard-reply (one pass): the base model answers TASK_PROMPT_HR, which asks
+for `Heard: <what got through>` then `Reply: <the response>`, so a single
+decode yields both. The LLM sees (original sentence, Heard) only -- it lists
+the key pieces that did not survive, judges the kind (answer/repair/repeat)
+itself, and writes that kind's target reply in the same call. The SFT target
+is the two-line string `Heard: <the probe's own Heard>\\nReply: <the written
+target>`, so the model is trained to write down what it heard before
+conditioning its response on it.
 """
 
 import argparse
@@ -18,7 +29,6 @@ import logging
 import os
 import random
 import shutil
-import string
 import threading
 import time
 from collections import Counter, deque
@@ -30,8 +40,9 @@ from datasets import Audio, Dataset, DatasetDict, load_dataset
 from openai import OpenAI
 from qwen_omni_utils import process_mm_info
 from tqdm import tqdm
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
-from prompts import TASK_PROMPT
+from prompts import HEARD_PREFILL, TASK_PROMPT, split_heard_reply, task_prompt
 
 skip = Counter()
 
@@ -75,6 +86,15 @@ SLOT_SNR = {
     "repair": (0.0, 12.0),
     "repeat": (0.0, 4.0),
 }
+# --heard-reply uses disjoint bands, so SNR range and kind stay close to a
+# function of each other.
+SLOT_SNR_HR = {
+    "answer": (12.0, 20.0),
+    "repair": (5.0, 12.0),
+    "repeat": (0.0, 5.0),
+}
+# keep training on clean audio, which is the common case in deployment
+CLEAN_ANSWER_PROB = 0.25
 SLOT_WEIGHTS = {"answer": 1, "repair": 2, "repeat": 2}
 
 CLASSIFY_TEMPERATURE = 0.0
@@ -101,6 +121,9 @@ print(f"target model: {TARGET_MODEL} @ http://{_vllm_host}:8000/v1")
 base_model = None
 base_processor = None
 base_family = None
+# set in __main__ from --heard-reply; switches the probe pass, the labeler,
+# the SNR bands, and how the SFT target is composed
+HEARD_REPLY = False
 IM_END_ID = None
 
 
@@ -109,7 +132,7 @@ IM_END_ID = None
 # ---
 
 ASR_SYSTEM_PROMPT = "You are a speech recognition model."
-ASR_PROMPT = "Transcribe the English audio into text without any punctuation marks."
+ASR_PROMPT = "Transcribe the English audio into text without any punctuation marks." # from Qwen2.5-Omni github cookbooks
 
 
 def _conv(audio, system_prompt, user_prompt):
@@ -131,7 +154,13 @@ def _conv(audio, system_prompt, user_prompt):
 
 
 @torch.inference_mode()
-def base_generate_batch(convs, max_new_tokens):
+def base_generate_batch(convs, max_new_tokens, prefill=None):
+    """prefill, if given, is literal text appended to the rendered prompt so
+    the model continues from there instead of opening with something else
+    (e.g. --heard-reply forces HEARD_PREFILL so a refusal on bad audio can't
+    skip the required format). The prefill is prepended back onto the decoded
+    text, so callers see the same string they'd get if the model had opened
+    with it spontaneously."""
     # the omni processor logs a root-logger warning per conversation whenever
     # the system prompt isn't the talker default (our ASR prompt never is). We
     # only decode text, so mute it for just this call -- an int compare in
@@ -143,6 +172,8 @@ def base_generate_batch(convs, max_new_tokens):
         )
     finally:
         logging.disable(logging.NOTSET)
+    if prefill is not None:
+        texts = [t + prefill for t in texts]
     mm_audios, images, videos = process_mm_info(convs, use_audio_in_video=False)
     inputs = base_processor(
         text=texts,
@@ -160,10 +191,13 @@ def base_generate_batch(convs, max_new_tokens):
         pad_token_id=IM_END_ID,
     )
     gen = out[:, inputs["input_ids"].shape[1] :]
-    return [
+    decoded = [
         t.lower().strip()
         for t in base_processor.batch_decode(gen, skip_special_tokens=True)
     ]
+    if prefill is not None:
+        decoded = [f"{prefill}{d}" for d in decoded]
+    return decoded
 
 
 # ---
@@ -300,13 +334,210 @@ CLASSIFY_USER = (
 )
 
 
-_PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+_TEXT_NORMALIZER = BasicTextNormalizer()
 
 
 def _normalize_text(s):
-    """Lowercase + strip punctuation, so the judge can't misread ASR-standard \
-    capitalization/punctuation as a wording or intent change."""
-    return " ".join(s.translate(_PUNCT_TABLE).lower().split())
+    return _TEXT_NORMALIZER(s).strip()
+
+
+# ---
+# --heard-reply: label + target in one few-shot call
+# ---
+
+# With one witness instead of two, labeling is a single text comparison
+# (diff HEARD against the command, count what's gone) rather than a
+# reconciliation of two passes that can disagree -- which is what makes
+# examples viable where CLASSIFY_SYSTEM needed ~90 lines of survival rules.
+# Every rule those lines enforced is now carried by an example: the wake-word
+# and implied-word exclusions (ex. 2), no-reveal on deletions (ex. 4), the
+# misheard-as confirmation form (ex. 3, 5), content-free repeat requests
+# (ex. 6, 7). Only the key-piece definition and the per-kind reply style are
+# still stated, because no single example teaches them.
+LABEL_TARGET_SYSTEM = """You are labeling noisy-audio data for a smart voice \
+assistant.
+
+You get the user's real spoken COMMAND, and HEARD -- what the device caught \
+after loud background chatter. Compare them and list the key pieces of the \
+command that did not survive: entities, names, places, times, dates, \
+quantities, titles, and the requested action. Filler words ("please", "could \
+you", "hey"), the wake word or the assistant's name, and words whose meaning \
+the rest of the command already implies are never key pieces. Neither are \
+spelling, spacing, or other minor wording differences (e.g. "mockingbird" \
+heard as "mocking bird"), or a question rephrased in different grammar that \
+still asks for the same thing (e.g. "what does X mean" heard as "what is \
+X", or "do you think" heard as "you think") -- these are never lost pieces, \
+even when a real key piece is lost alongside them.
+
+Then set kind by how many key pieces were lost:
+  0 lost -> "answer"    1 lost -> "repair"    2 or more lost -> "repeat"
+
+Then write the device's target reply for that kind. A grader sees that reply \
+on its own, without the HEARD line, so it has to stand alone.
+- answer: address EVERY part of the request. Give the fact directly if you \
+know it, otherwise say you are getting it -- present or future tense, never \
+"done". Name the action and topic, since the grader sees this line alone.
+- repair: ONE short question (under 20 words) recovering ONLY the lost piece, \
+grounded in the parts that survived. Never say the lost words back -- unless \
+the piece was misheard as another word, in which case you may offer the true \
+word and the misheard one as alternatives.
+- repeat: ONE short request (under 15 words) to say the whole thing again. \
+Mentioning the noise is fine; hinting at ANY content from the command is not.
+Sound like natural speech, vary the phrasing, and do not default to starting \
+with "Sorry".
+
+Return ONLY JSON: {"lost": [...], "misheard_as": "...", "kind": "...", \
+"reply": "..."}
+Quote "lost" using the words of the real COMMAND. "misheard_as" is the wrong \
+word HEARD in place of a lost piece, or "" if the piece was simply dropped. \
+"lost" does not need one entry per missing word -- bundle several words into \
+ONE entry whenever they are a single point of confusion:
+  - a whole phrase was misheard as one SPECIFIC, similar-sounding phrase -- \
+one entry for the true phrase, with the misheard phrase in "misheard_as" \
+(this can still be "repair"). Only bundle this way when HEARD is a genuine \
+close call: most of the words or their sounds carry over, so the misheard \
+phrase is a plausible thing to guess and offer back. If HEARD reads as a \
+different, unrelated sentence -- a different topic, or barely any shared \
+words or sounds -- there is nothing specific enough to guess at, so it \
+stays "repeat" even though it's one phrase versus one phrase.
+  - the command is destroyed past telling pieces apart, with no plausible \
+guess to offer -- one entry naming everything unclear (this is "repeat").
+Keep entries separate when the losses are actually unrelated to each other \
+(e.g. a mishearing in one spot, a different piece dropped elsewhere) -- \
+that's what makes something "repeat" instead of "repair". Never add an \
+entry for the wake word or the assistant's name just to lengthen the list \
+-- they are still never key pieces, no matter how garbled or absent they are.
+
+Examples:
+
+COMMAND: find some classical music by beethoven and play it
+HEARD:   find some classical music by beethoven and play it
+{"lost": [], "misheard_as": "", "kind": "answer", \
+"reply": "I'm finding some classical music by Beethoven and playing it now."}
+
+COMMAND: hey olly are there any alarms set
+HEARD:   hey ollie are there any alarms
+{"lost": [], "misheard_as": "", "kind": "answer", \
+"reply": "I'm checking your alarms now."}
+   -- the wake word and "set" are not key pieces
+
+COMMAND: do you think it's going to rain tomorrow
+HEARD:   you think it is going to rain tomorrow
+{"lost": [], "misheard_as": "", "kind": "answer", \
+"reply": "I'm checking the forecast to see if it'll rain tomorrow."}
+   -- "do" is just the auxiliary opening the question; dropping it doesn't \
+change what's being asked
+
+COMMAND: how many oceans are there in the world
+HEARD:   how many children are there in the world
+{"lost": ["oceans"], "misheard_as": "children", "kind": "repair", \
+"reply": "How many of what in the world -- oceans, or children?"}
+
+COMMAND: i have a meeting by two pm today please remind me
+HEARD:   i have a meeting at two p m today
+{"lost": ["remind me"], "misheard_as": "", "kind": "repair", \
+"reply": "Got your two pm meeting today but missed part of your command -- do you want me to remind you about it?"}
+   -- or "Got your two pm meeting today but missed part of your command -- what did you want me to do about the meeting?"
+
+COMMAND: food order from grubhub
+HEARD:   food order from grandma
+{"lost": ["grubhub"], "misheard_as": "grandma", "kind": "repair", \
+"reply": "Ordering food -- did you say Grubhub, or grandma?"}
+
+COMMAND: play mocking bird by eminem
+HEARD:   play mockingbird by edna meyer
+{"lost": ["eminem"], "misheard_as": "edna meyer", "kind": "repair", \
+"reply": "Did you mean Mockingbird by Eminem, or by Edna Meyer?"}
+   -- "mocking bird" vs "mockingbird" is a spacing difference, not a lost \
+piece; only the artist name was actually misheard
+
+COMMAND: how do you make steel
+HEARD:   or do you make a sale
+{"lost": ["how do you make steel"], "misheard_as": "or do you make a sale", \
+"kind": "repair", "reply": "Did you ask how to make steel, or how to make a sale?"}
+   -- multiple words changed together as one coherent near-miss of the \
+whole phrase, so it's one bundled entry, not two separate ones -- still \
+"repair", not "repeat"
+
+COMMAND: skip to next episode
+HEARD:   get to make copies
+{"lost": ["skip to next episode"], "misheard_as": "", "kind": "repeat", \
+"reply": "It's too loud to catch that -- could you say it again?"}
+   -- HEARD is one phrase versus one phrase too, but it reads as a \
+different, unrelated sentence, not a close call -- there's nothing specific \
+enough to guess at, so this is still "repeat", not "repair"
+
+COMMAND: turn on the radio on this channel
+HEARD:   anywhere on the radio
+{"lost": ["turn on", "this channel"], "misheard_as": "", "kind": "repeat", \
+"reply": "It's really loud in here -- what was that?"}
+
+COMMAND: please tell me a joke that i'll think is funny
+HEARD:   he said me a job that i think is like
+{"lost": ["tell me a joke", "i'll think is funny"], "misheard_as": "", \
+"kind": "repeat", "reply": "I couldn't catch that over the noise -- could you say it again?"}
+
+COMMAND: please turn on the radio
+HEARD:   yes
+{"lost": ["turn on the radio"], "misheard_as": "", "kind": "repeat", \
+"reply": "I missed that over the noise -- could you say it again?"}
+   -- nothing distinguishable survived, so one bundled entry is enough; \
+"lost" having only one item doesn't make this a "repair" """
+
+
+LABEL_TARGET_USER = "COMMAND: {sentence}\nHEARD:   {heard}"
+
+
+def label_target(sentence, heard, trace=None):
+    """(command, Heard line) -> {kind, missing, misheard_as, reply, reason}.
+
+    Also called by hr_label_dryrun.py, which replays this labeler over an
+    already-built dataset's ASR transcripts to measure label drift before any
+    GPU time is spent. Pass a list via `trace` to collect the raw JSON and the
+    outcome, for diagnosing failures -- production call sites don't pass it,
+    so their behavior is unchanged. The kind/lost-count consistency check that
+    used to retry here was removed: the model's own kind judgment tracked the
+    prompt's intent better than a mechanical count match did.
+    """
+    if not heard:
+        if trace is not None:
+            trace.append({"reason": "empty heard (format failure upstream)"})
+        return None
+
+    user = LABEL_TARGET_USER.format(
+        sentence=_normalize_text(sentence), heard=_normalize_text(heard)
+    )
+    obj = gpt_json(
+        LABEL_TARGET_SYSTEM,
+        user,
+        temperature=CLASSIFY_TEMPERATURE,
+        max_tokens=CLASSIFY_MAX_TOKENS,
+    )
+    if obj is None:
+        if trace is not None:
+            trace.append({"reason": "gpt_json returned None (API/JSON error)"})
+        return None
+
+    kind = str(obj.get("kind", "")).strip().lower()
+    if kind not in KINDS:
+        if trace is not None:
+            trace.append({"obj": obj, "reason": f"kind {kind!r} not in {KINDS}"})
+        return None
+
+    missing = [str(s).strip() for s in obj.get("lost", []) if str(s).strip()]
+    if trace is not None:
+        trace.append({"obj": obj, "reason": "accepted"})
+    return {
+        "kind": kind,
+        "missing": missing,
+        "misheard_as": str(obj.get("misheard_as", "")).strip(),
+        "reply": str(obj.get("reply", "")).strip(),
+        "reason": (
+            f"lost from Heard: {'; '.join(missing)}"
+            if missing
+            else "all key pieces survived in Heard"
+        ),
+    }
 
 
 # ---
@@ -429,8 +660,19 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
     def make_probe_batch(kinds_need):
         length = len(clean)
         clean_power = float(np.mean(clean**2))
+        bands = SLOT_SNR_HR if HEARD_REPLY else SLOT_SNR
         audios, snrs = [], []
         while len(audios) < batch_size:
+            weights = [SLOT_WEIGHTS[k] for k in kinds_need]
+            slot = rng.choices(kinds_need, weights=weights, k=1)[0]
+
+            if HEARD_REPLY and slot == "answer" and rng.random() < CLEAN_ANSWER_PROB:
+                # keep noise-free audio in the answer band; snr_db=None reads
+                # as "clean" everywhere downstream
+                audios.append(clean)
+                snrs.append(None)
+                continue
+
             # mix a babble
             babble = np.zeros(length, dtype=np.float32)
             for b in rng.sample(pool, BABBLE_SPEAKERS):
@@ -442,11 +684,8 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                 babble += b
             babble /= BABBLE_SPEAKERS
 
-            # sample snr
-            weights = [SLOT_WEIGHTS[k] for k in kinds_need]
-            slot = rng.choices(kinds_need, weights=weights, k=1)[0]
-            # round to 1 decimal digit
-            snr = round(rng.uniform(*SLOT_SNR[slot]), 1)
+            # sample snr, round to 1 decimal digit
+            snr = round(rng.uniform(*bands[slot]), 1)
 
             # synthesize noisy audio
             # SNR = 10*log10(clean_power / babble_power)
@@ -516,24 +755,45 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             break
         audios, snrs = make_probe_batch(missing_slots)
 
-        with GPU_LOCK:
-            # get batch omni asr respond
-            sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-            convs = [_conv(a, sysp, ASR_PROMPT) for a in audios]
-            transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
-
-            # get batch omni assistant respond
-            sysp = QWEN25_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-            convs = [_conv(a, sysp, TASK_PROMPT) for a in audios]
-            responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)
-
-        with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
-            labels = list(
-                ex.map(
-                    lambda it: classify(*it),
-                    list(zip(transcripts, responses)),
+        sysp = QWEN25_SYSTEM_PROMPT if base_family == "qwen2.5" else None
+        if HEARD_REPLY:
+            with GPU_LOCK:
+                convs = [_conv(a, sysp, task_prompt(True)) for a in audios]
+                outs = base_generate_batch(
+                    convs, RESP_MAX_NEW_TOKENS, prefill=HEARD_PREFILL
                 )
-            )
+            pairs = [split_heard_reply(o) for o in outs]
+            transcripts = [h for h, _ in pairs]
+            responses = [r for _, r in pairs]
+            n_format_fail = sum(1 for h in transcripts if not h)
+            if n_format_fail and skip["format"] < 5:
+                # print one raw sample per round while format failures are
+                # still rare in this run, to see what the model actually said
+                for o in outs:
+                    if not split_heard_reply(o)[0]:
+                        log(f"[format-fail raw output]: {o!r}")
+                        break
+            skip["format"] += n_format_fail
+            with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
+                labels = list(ex.map(lambda h: label_target(sentence, h), transcripts))
+        else:
+            with GPU_LOCK:
+                # get batch omni asr respond
+                asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
+                convs = [_conv(a, asr_sysp, ASR_PROMPT) for a in audios]
+                transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
+
+                # get batch omni assistant respond
+                convs = [_conv(a, sysp, TASK_PROMPT) for a in audios]
+                responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)
+
+            with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
+                labels = list(
+                    ex.map(
+                        lambda it: classify(*it),
+                        list(zip(transcripts, responses)),
+                    )
+                )
 
         for snr, noisy, transcript, response, label in zip(
             snrs, audios, transcripts, responses, labels
@@ -550,6 +810,9 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                     "lost": label["missing"],
                     "swapped": [label["misheard_as"]] if label["misheard_as"] else [],
                     "reason": label["reason"],
+                    # --heard-reply writes the target in the same call; the
+                    # two-pass path fills this in later, per utterance
+                    "target": label.get("reply", ""),
                 }
 
     return results
@@ -605,10 +868,14 @@ def collect_babble_pool(split):
 
 
 def make_row(kind, target, path, probe, slurp_id, sentence):
+    reply = target
+    if HEARD_REPLY:
+        target = f"Heard: {probe['transcript']}\nReply: {reply}"
     return {
         "id": next(ROW_ID),
         "kind": kind,
         "target": target,
+        "target_reply": reply,
         "audio": path,
         "snr_db": probe["snr_db"],
         "asr_transcript": probe["transcript"],
@@ -655,6 +922,10 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
         )
         if any(v is None for v in triplet.values()):
             return {"skip": "probe"}
+
+        if HEARD_REPLY:
+            # already written, one call per probe audio alongside its label
+            return {"triplet": triplet, "targets": {k: triplet[k]["target"] for k in KINDS}}
 
         # ---
         # one LLM call writes all 3 targets for the utterance
@@ -754,6 +1025,9 @@ def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
         if probe is None:
             return {"skip": "probe"}
 
+        if HEARD_REPLY:
+            return {"probe": probe, "target": probe["target"]}
+
         target = ""
         for attempt in range(TARGET_RETRIES):
             obj = gpt_json(
@@ -809,7 +1083,30 @@ if __name__ == "__main__":
         type=int,
         default=N_TRAIN_EXTRA_ANS,
     )
+    ap.add_argument(
+        "--n-test",
+        type=int,
+        default=N_TEST_TRIPLETS,
+        help="test triplets to build (default: N_TEST_TRIPLETS). Lower this "
+        "for a quick smoke run instead of hand-editing the module constant.",
+    )
+    ap.add_argument(
+        "--n-train",
+        type=int,
+        default=N_TRAIN_TRIPLETS,
+        help="train triplets to build (default: N_TRAIN_TRIPLETS).",
+    )
+    ap.add_argument(
+        "--heard-reply",
+        action="store_true",
+        help="One probe pass emitting 'Heard: ... / Reply: ...'; label off the "
+        "Heard line alone with the few-shot labeler, disjoint SNR bands, and "
+        "two-line SFT targets.",
+    )
     args = ap.parse_args()
+
+    HEARD_REPLY = args.heard_reply
+    log(f"track: {'heard-reply' if HEARD_REPLY else 'two-pass (baseline)'}")
 
     # ---
     # point AUDIO_DIR at a fresh per-dataset subdir of AUDIO_ROOT.
@@ -837,9 +1134,9 @@ if __name__ == "__main__":
 
 
     test_babble_pool = collect_babble_pool("test")
-    test_rows = build_triplets("test", N_TEST_TRIPLETS, seen_ids, test_babble_pool)
+    test_rows = build_triplets("test", args.n_test, seen_ids, test_babble_pool)
     train_babble_pool = collect_babble_pool("train")
-    train_rows = build_triplets("train", N_TRAIN_TRIPLETS, seen_ids, train_babble_pool)
+    train_rows = build_triplets("train", args.n_train, seen_ids, train_babble_pool)
 
     if args.n_extra_ans:
         train_rows += build_answer_rows(
@@ -849,7 +1146,9 @@ if __name__ == "__main__":
             train_babble_pool,
         )
 
-    dump = f"rows_{args.ds_id.split('/')[-1]}.json"
+    # sits with the wavs it references, so a dataset's audio and its row
+    # metadata stay together under one gitignored folder
+    dump = os.path.join(AUDIO_DIR, "rows.json")
     with open(dump, "w") as f:
         json.dump({"train": train_rows, "test": test_rows}, f, indent=1)
     log(f"wrote {dump} before pushing")
