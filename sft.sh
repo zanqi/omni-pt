@@ -17,23 +17,32 @@
 #   ./sft.sh qwen25       # only the Qwen2.5-Omni-3B sweep
 #   ./sft.sh qwen3        # only the Qwen3-Omni-30B-A3B-Instruct sweep
 #   MULTS="3 4" ./sft.sh  # only the 3x and 4x runs
+#   MULTS= ./sft.sh       # no sweep: ONE run on the whole train split, whatever
+#                         # its composition -> adapter <model>-bab[-<track>]-sft
 #   HR=1 ./sft.sh         # Heard:/Reply: track — hr-v1 datasets, TASK_PROMPT_HR,
 #                         # adapters named <model>-bab-hr-adapter-<n>x
+#   TREE=1 ./sft.sh       # decision-table track — tree-v1 datasets, plain
+#                         # TASK_PROMPT, adapters <model>-bab-tree-adapter-<n>x
 #
 # One GPU, sequential — run it under salloc/srun or wrap it in an sbatch job.
 source ~/.bashrc
 set -eo pipefail
 
 WHICH="${1:-both}"
-MULTS="${MULTS:-1 2 3 4}"
+MULTS="${MULTS-1 2 3 4}"  # no colon: MULTS= means "single run", not "default"
 
+# the tree track trains under the plain prompt, so only HR passes a flag
+HR_FLAG=""
 if [[ -n "${HR:-}" ]]; then
     HR_FLAG="--heard-reply"
     ADAPTER_KIND="bab-hr-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-hr-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-hr-v1"
+elif [[ -n "${TREE:-}" ]]; then
+    ADAPTER_KIND="bab-tree-adapter"
+    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-tree-v1"
+    DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-tree-v1"
 else
-    HR_FLAG=""
     ADAPTER_KIND="bab-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-v4"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-v2"
@@ -45,6 +54,20 @@ run_sweep() {
     local omni_path="$1" ds_id="$2"
     local model_name="${omni_path##*/}"
     local n run_name
+
+    if [[ -z "$MULTS" ]]; then
+        # train on the split exactly as built -- no --train-caps, so the
+        # dataset's own answer:repair:repeat mix is what the model sees
+        run_name="${model_name}-${ADAPTER_KIND%-adapter}-sft"
+        echo "=== ${run_name}: full train split <- ${ds_id} ==="
+        python -u sft_qwen.py $HR_FLAG \
+            --omni-path "$omni_path" \
+            --ds-id "$ds_id" \
+            --run-name "$run_name" \
+            --epochs 3
+        echo "=== ${run_name} done ==="
+        return
+    fi
 
     for n in $MULTS; do
         run_name="${model_name}-${ADAPTER_KIND}-${n}x"

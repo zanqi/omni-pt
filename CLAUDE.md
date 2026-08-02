@@ -13,6 +13,14 @@ then used for LoRA SFT and for judged evaluation.
 There is no package manager / build system here — this is a flat collection of standalone scripts run on a
 Slurm GPU cluster (Hyak, UW `sciencehub` allocation), each invoked directly with `python`.
 
+## Don't build dry-run / smoke-test scaffolding
+
+GPU time is not a constraint on this project — developer time is. Do **not** propose or write dry-run,
+smoke-test, or "cheap preview before spending GPU" scripts and flags (`sft_qwen.py --smoke`, or the
+deleted `label_dryrun.py`); they cost more time to build and maintain than the real run they
+guard costs to launch. Just run the real thing on a small `--num-rows` / short job and read its output.
+When touching code that already has such a path, prefer deleting it over extending it.
+
 ## Code style: no single-use module-level functions
 
 Every module-level `def` should either have two or more call sites, or be a top-level pipeline step called
@@ -70,7 +78,7 @@ across calls.
 
 ## SFT
 
-`slurp_sft_qwen25.py` LoRA-tunes Qwen2.5-Omni-3B's `thinker` submodule on one of the two datasets above
+`sft_qwen.py` LoRA-tunes Qwen2.5-Omni-3B's `thinker` submodule on one of the two datasets above
 (`--ds-id`, defaults to the babble dataset). Key details:
 - `Qwen2_5OmniForSFT` subclasses the full omni model but forwards straight to `self.thinker(...)`, and LoRA
   is applied to that same wrapper — this makes saved adapter keys carry the `thinker.` prefix that
@@ -102,10 +110,11 @@ respective dataset). Both:
   points at a specific cluster node `http://g3085:8000/v1`) instead of the OpenAI API — see the module
   docstring for the exact `vllm serve` invocation used to host the judge model.
 - Write one JSON record per row plus a trailing `{"type": "summary", ...}` record to a `.jsonl` file
-  (defaults to `{ear,bab}_results_<model-or-adapter-name>_slurp.jsonl` in the repo root — the existing
-  `*_results_*.jsonl` files here are prior run outputs, read by `eval.ipynb`).
+  (`babble_eval_qwen.py` defaults to `results/bab_results_<model-or-adapter-name>_<tag>.jsonl`;
+  `slurp_ear_eval_qwen.py` still defaults to `ear_results_<model-name>_slurp.jsonl` in the repo root).
+  The `*_results_*.jsonl` files under `results/` are prior run outputs, read by `results/viz.ipynb`.
 
-`eval.ipynb` only consumes those result `.jsonl` files (reads the last `"EAR"`-containing line as the run
+`results/viz.ipynb` only consumes those result `.jsonl` files (reads the last `"EAR"`-containing line as the run
 summary) to plot C/R/EAR bars across models and to emit a LaTeX booktabs table for the paper — it does not
 run any model itself. When adding a new eval run, the summary-line format must stay parseable by its
 `load_summary`-style helpers.
@@ -121,11 +130,10 @@ export OPENAI_API_KEY=...                 # required by data-builder scripts and
 
 # 1. build a dataset (pushes to the Hub repo hardcoded as REPO_ID in the script)
 python slurp_sft_data_qwen.py             # EAR (word-masking) track
-python babble_data.py               # babble (background-noise) track
+python babble_data.py                     # babble (background-noise) track
 
 # 2. LoRA SFT
-python slurp_sft_qwen25.py --smoke        # sanity check collator/labels before a real run
-python slurp_sft_qwen25.py --push         # full run, pushes adapter to --hub-id
+python sft_qwen.py --push                 # full run, pushes adapter to --hub-id
 
 # 3. evaluate
 python slurp_ear_eval_qwen.py --num-rows 100
@@ -134,9 +142,12 @@ python babble_eval_qwen.py --model-path Qwen/Qwen2.5-Omni-3B --adapter-path ./Qw
     --judge-base-url openai --judge-model gpt-4o
 ```
 
-Slurm jobs (`sft_qwen25.slurm`, `slurp_babble_data.slurm`) are submitted with `sbatch <file>.slurm`; note
-their `#SBATCH --chdir` points at an older path (`/gscratch/sciencehub/zanqil/asr-calibration/qwen_omni/sft`)
-that predates this repo's current location — check/update that path before resubmitting.
+Slurm jobs (`sft_qwen25.slurm`, `sft_eval_qwen25.slurm`, `babble_data_qwen25.slurm`,
+`babble_data_qwen3.slurm`) are submitted with `sbatch <file>.slurm`; their `#SBATCH --chdir` now points at
+this repo (`/gscratch/sciencehub/zanqil/projects/omni-pt`). The `.sh` drivers run multi-job sweeps rather
+than single jobs: `sft.sh` trains the four data-composition adapters (1x–4x `answer` rows) per model family,
+`eval.sh` evaluates the base model plus those four adapters, and `babble_data.sh` builds the babble dataset
+for one or both families.
 
 Available conda envs on this cluster (`conda env list`): `qwen25omni`, `qwen3omni`, `llama-omni2`,
 `vllm-judge`, `calibration`. Match the env to the model family being loaded/evaluated.

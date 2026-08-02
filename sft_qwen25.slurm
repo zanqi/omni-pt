@@ -12,12 +12,20 @@
 #SBATCH --gpus=1
 #SBATCH --time=01-0:00:00 # Max runtime in DD-HH:MM:SS format.
 
-#SBATCH --chdir=/gscratch/sciencehub/zanqil/asr-calibration/qwen_omni/sft
+#SBATCH --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt
+#SBATCH --output=logs/qwen25_sft_%j.log
 #SBATCH --export=all
-source ~/.bashrc
-conda activate qwen25omni
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
-python slurp_sft_qwen25.py --push
+# Thin wrapper: track and sweep shape are sft.sh env vars, carried in from the
+# submitting shell by --export=all. conda activate and LD_LIBRARY_PATH live in
+# sft.sh, so they stay in one place.
+#
+#   MULTS= TREE=1 sbatch sft_qwen25.slurm    # ONE adapter on the full split
+#   TREE=1 sbatch sft_qwen25.slurm           # the 1x-4x answer-row sweep
+#   HR=1 sbatch sft_qwen25.slurm
+#
+# Both the --chdir and the script name were stale before this: they pointed at
+# asr-calibration/qwen_omni/sft and ran slurp_sft_qwen25.py, which does not
+# exist in this repo.
 
-# sbatch /gscratch/sciencehub/zanqil/asr-calibration/qwen_omni/sft/sft_qwen25.slurm
+exec ./sft.sh qwen25 "$@"

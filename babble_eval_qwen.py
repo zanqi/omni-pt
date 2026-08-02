@@ -45,11 +45,21 @@ GPU_LOCK = threading.Lock()
 ROW_WORKERS = 4
 
 JUDGED_TYPES = ("answer", "repair", "repeat", "bad")
-# Tree-rule score matrix: score = SCORE_MATRIX[target kind][judged type]
-SCORE_MATRIX = {
-    "answer": {"answer": 1.0, "repair": 0.0, "repeat": 0.0, "bad": 0.0},
-    "repair": {"answer": 1.0, "repair": 1.0, "repeat": 0.5, "bad": 0.0},
-    "repeat": {"answer": 1.0, "repair": 0.5, "repeat": 1.0, "bad": 0.0},
+# score = SCORE_MATRICES[--score-matrix][target kind][judged type]
+SCORE_MATRICES = {
+    "legacy": {
+        "answer": {"answer": 1.0, "repair": 0.0, "repeat": 0.0, "bad": 0.0},
+        "repair": {"answer": 1.0, "repair": 1.0, "repeat": 0.5, "bad": 0.0},
+        "repeat": {"answer": 1.0, "repair": 0.5, "repeat": 1.0, "bad": 0.0},
+    },
+    # asking one targeted question when the whole command was lost earns
+    # nothing: there was no reliably-heard piece to anchor it on. Only cell
+    # that differs, so a legacy dataset rescored under "tree" isolates it.
+    "tree": {
+        "answer": {"answer": 1.0, "repair": 0.0, "repeat": 0.0, "bad": 0.0},
+        "repair": {"answer": 1.0, "repair": 1.0, "repeat": 0.5, "bad": 0.0},
+        "repeat": {"answer": 1.0, "repair": 0.0, "repeat": 1.0, "bad": 0.0},
+    },
 }
 
 
@@ -236,6 +246,15 @@ def main():
         "half. Required for adapters trained with sft_qwen.py --heard-reply.",
     )
     ap.add_argument(
+        "--score-matrix",
+        default="legacy",
+        choices=list(SCORE_MATRICES),
+        help="How a judged type scores against the row's target kind. Only "
+        "the repeat-row/repair-judgment cell differs (0.5 -> 0.0), so this is "
+        "independent of how the dataset was labeled: rescoring an old run "
+        "under 'tree' measures the cell change on its own.",
+    )
+    ap.add_argument(
         "--fewshot-judge",
         action="store_true",
         help="Judge with RESPONSE_TYPE_FEWSHOT_SYSTEM instead of the rule "
@@ -263,9 +282,11 @@ def main():
     judge_system = (
         RESPONSE_TYPE_FEWSHOT_SYSTEM if args.fewshot_judge else RESPONSE_TYPE_SYSTEM
     )
+    score_matrix = SCORE_MATRICES[args.score_matrix]
     print(
         f"prompt: {'heard-reply' if args.heard_reply else 'plain'} | "
-        f"judge: {'few-shot' if args.fewshot_judge else 'rules'}"
+        f"judge: {'few-shot' if args.fewshot_judge else 'rules'} | "
+        f"scores: {args.score_matrix}"
     )
 
     ds = load_dataset(args.dataset, split=args.split)
@@ -313,7 +334,7 @@ def main():
 
     def process_row(row):
         kind = row["kind"]
-        if kind not in SCORE_MATRIX:
+        if kind not in score_matrix:
             raise ValueError(f"unknown kind in dataset: {kind!r}")
         arr, sr = get_audio(row["audio"])
         with GPU_LOCK:
@@ -340,7 +361,7 @@ def main():
             "reply": reply,
             "judged_type": judged_type,
             "reason": reason,
-            "score": SCORE_MATRIX[kind][judged_type],
+            "score": score_matrix[kind][judged_type],
         }
 
     parse_failures = 0
@@ -417,6 +438,7 @@ def main():
                     "judge_model": args.judge_model,
                     "heard_reply": args.heard_reply,
                     "fewshot_judge": args.fewshot_judge,
+                    "score_matrix": args.score_matrix,
                     "heard_parse_failures": parse_failures,
                     "answer_rows": counts["answer"],
                     "repair_rows": counts["repair"],

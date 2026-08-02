@@ -16,22 +16,15 @@
 #SBATCH --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt
 #SBATCH --output=logs/babble_data_%j.log
 #SBATCH --export=all
-# export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
-# fail fast if the vLLM judge (target-generation) server isn't reachable
-JUDGE_HOST=$(cat /gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt)
-if ! curl -sf --max-time 10 "http://${JUDGE_HOST}:8000/v1/models" > /dev/null; then
-    echo "ERROR: vLLM judge at http://${JUDGE_HOST}:8000 is not responding." >&2
-    echo "Start it first: sbatch /gscratch/sciencehub/zanqil/vllm_judge/vllm_judge.slurm" >&2
-    exit 1
-fi
-echo "judge OK at http://${JUDGE_HOST}:8000/v1"
+# Thin wrapper: everything that varies -- track, dataset id, row counts -- is a
+# babble_data.sh env var, and --export=all carries it in from the submitting
+# shell. This file only pins the Qwen2.5 resource request; the judge precheck
+# and the conda activate live in babble_data.sh, so they stay in one place.
+#
+#   TREE=1 N_EXTRA_ANS=1000 sbatch babble_data_qwen25.slurm
+#   HR=1 sbatch babble_data_qwen25.slurm
+#   DS_QWEN25=me/my-ds sbatch babble_data_qwen25.slurm
+#   sbatch babble_data_qwen25.slurm            # default two-pass track
 
-
-source ~/.bashrc
-DS_ID_QWEN25="${1:-keylazy/slurp-babble-Qwen2.5-Omni-3B-hr}"
-
-echo "Generating Qwen2.5 dataset -> ${DS_ID_QWEN25}"
-conda activate qwen25omni
-python -u babble_data.py --heard-reply --omni-path Qwen/Qwen2.5-Omni-3B --ds-id "$DS_ID_QWEN25" --n-test 50 --n-train 1000 --n-extra-ans 1000
-echo "Qwen2.5 dataset generated successfully."
+exec ./babble_data.sh qwen25 "$@"

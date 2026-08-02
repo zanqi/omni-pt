@@ -13,10 +13,14 @@
 #   ./eval.sh                     # all 10 runs
 #   ./eval.sh qwen25              # one family
 #   MULTS="4" ./eval.sh qwen3     # base + the 4x adapter only
+#   MULTS= ./eval.sh qwen25       # base + the single <model>-bab[-<track>]-sft
+#                                 # adapter trained by `MULTS= ./sft.sh`
 #   ADAPTER_PREFIX=keylazy ./eval.sh   # eval the pushed hub adapters, not ./<dir>
 #
 # Tracks (each writes its own TAG so nothing overwrites a prior run's file):
 #   HR=1   ./eval.sh   hr-v1 data, TASK_PROMPT_HR, few-shot judge, hr adapters
+#   TREE=1 ./eval.sh   tree-v1 data, plain prompt, rules judge, tree adapters,
+#                      and the tree score matrix (repeat-row repair = 0)
 #   ABL=a  ./eval.sh   baseline data/prompt/adapters, few-shot judge only —
 #                      isolates how much of any EAR movement is the judge swap
 #   ABL=b  ./eval.sh   baseline data/adapters, hr prompt + few-shot judge —
@@ -26,20 +30,27 @@ source ~/.bashrc
 set -eo pipefail
 
 WHICH="${1:-both}"
-MULTS="${MULTS:-1 2 3 4}"
+MULTS="${MULTS-1 2 3 4}"  # no colon: MULTS= means "single adapter", not "default"
 
 # Track selection: prompt flags, which datasets, which adapters, result tag.
 HR_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-hr-v1"
 HR_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-hr-v1"
 BASE_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-v4"
 BASE_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-v2"
+TREE_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-tree-v1"
+TREE_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-tree-v1"
 ADAPTER_KIND="bab-adapter"
-case "${ABL:-${HR:+hr}}" in
+case "${ABL:-${HR:+hr}${TREE:+tree}}" in
     hr)
         TRACK_DESC="heard-reply"
         EVAL_FLAGS="--heard-reply --fewshot-judge"
         DEFAULT_QWEN25="$HR_DS_QWEN25"; DEFAULT_QWEN3="$HR_DS_QWEN3"
         ADAPTER_KIND="bab-hr-adapter"; DEFAULT_TAG="hr" ;;
+    tree)
+        TRACK_DESC="decision-table"
+        EVAL_FLAGS="--score-matrix tree"
+        DEFAULT_QWEN25="$TREE_DS_QWEN25"; DEFAULT_QWEN3="$TREE_DS_QWEN3"
+        ADAPTER_KIND="bab-tree-adapter"; DEFAULT_TAG="tree" ;;
     a)
         TRACK_DESC="ablation A (judge swap only)"
         EVAL_FLAGS="--fewshot-judge"
@@ -95,6 +106,10 @@ run_family() {
     local model_name="${model_path##*/}" n
 
     run_eval "$model_path" "$ds_id"
+    if [[ -z "$MULTS" ]]; then
+        run_eval "$model_path" "$ds_id" "${ADAPTER_PREFIX}/${model_name}-${ADAPTER_KIND%-adapter}-sft"
+        return
+    fi
     for n in $MULTS; do
         run_eval "$model_path" "$ds_id" "${ADAPTER_PREFIX}/${model_name}-${ADAPTER_KIND}-${n}x"
     done
