@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Beam-consensus labeling: N-best ASR only, per-kind judges, label-as-ground-truth eval</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5b5b5b; --rule: #ddd;
+    --code-bg: #f4f4f5; --accent: #8a3ffc; --bad: #c0392b; --ok: #1a7f37;
+    --card: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#15161a; --fg:#e8e8ea; --muted:#a0a0a8; --rule:#33343a;
+      --code-bg:#1e1f25; --accent:#b794ff; --bad:#ff6b6b; --ok:#4fd07a; --card:#1b1c22; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 880px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem;
+  }
+  h1 { font-size: 1.7rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.8rem; border-bottom: 1px solid var(--rule); padding-bottom: .4rem; }
+  h3 { font-size: 1.02rem; margin-top: 1.6rem; color: var(--accent); }
+  h4 { font-size: .95rem; margin-top: 1.3rem; margin-bottom: .3rem; }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .87em; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg); padding: .9rem 1rem; border-radius: 8px;
+    overflow-x: auto; line-height: 1.5; border: 1px solid var(--rule);
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--rule); padding: .45rem .6rem; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); }
+  .card {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1rem 1.2rem; margin: 1rem 0;
+  }
+  .step-badge {
+    display: inline-block; background: var(--accent); color: #fff;
+    border-radius: 999px; width: 1.6em; height: 1.6em; line-height: 1.6em;
+    text-align: center; font-weight: 600; font-size: .85em; margin-right: .5em;
+  }
+  .risk { border-left: 3px solid var(--bad); padding-left: .9rem; margin: .8rem 0; }
+  .good { color: var(--ok); }
+  .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  .kind-answer { color: var(--ok); font-weight: 600; }
+  .kind-repair { color: var(--accent); font-weight: 600; }
+  .kind-repeat { color: var(--bad); font-weight: 600; }
+  ul { padding-left: 1.3rem; }
+  li { margin: .3rem 0; }
+  del { color: var(--bad); }
+  ins { color: var(--ok); text-decoration: none; }
+  .q { border-left: 3px solid var(--accent); padding-left: .9rem; margin: .9rem 0; }
+  footer { margin-top: 3rem; color: var(--muted); font-size: .85rem; border-top: 1px solid var(--rule); padding-top: 1rem; }
+</style>
+</head>
+<body>
+
+<h1>Beam-consensus labeling</h1>
+<p class="subtitle">One probe pass, decoded with beam search into <em>K</em> hypotheses. The LLM diffs the command against each hypothesis separately, intersects the per-hypothesis loss lists into one consensus, and that consensus becomes the row's ground truth &mdash; both for the SFT target and for the eval judge. The task-response pass and the score matrix are both removed.</p>
+
+<div class="card">
+<strong>What changes, in one line each</strong>
+<ul>
+  <li><strong>Probe:</strong> two greedy decodes (ASR + task reply) &rarr; <em>one</em> beam-search ASR decode, <code>num_beams=8, num_return_sequences=4</code>. Cheaper in decodes, more expensive per decode.</li>
+  <li><strong>Evidence:</strong> a single transcript that may be wrong in one unlucky way &rarr; four hypotheses whose <em>disagreement</em> is itself the signal.</li>
+  <li><strong>Labeler:</strong> one call, per-hypothesis loss lists first, then the consensus, then the kind. No decision table, no cross-pass reconciliation.</li>
+  <li><strong>Judge:</strong> one 130-line type classifier + a score matrix &rarr; three short kind-specific rubrics that each emit a score directly. The row's own label picks the rubric.</li>
+  <li><strong>Repair scoring:</strong> a correct answer on a <code>repair</code> row now scores <span class="bad">0</span>, not 1. Only a question targeting the piece the label says was lost scores 1.</li>
+  <li><strong>Packaging:</strong> new <code>--beam-label</code> flag in <code>babble_data.py</code>, new <code>--judge-mode per-kind</code> in <code>babble_eval_qwen.py</code>, new <code>-beam-v1</code> dataset ids. The three existing tracks stay runnable.</li>
+</ul>
+</div>
+
+<div class="card">
+<strong>Decisions taken</strong>
+<ul>
+  <li><strong>Beam search, K=4</strong> (<code>num_beams=8</code>, return top 4) rather than temperature sampling &mdash; reproducible across reruns, and the diversity comes from acoustic ambiguity rather than decoding noise.</li>
+  <li><strong>The task-response pass is dropped entirely.</strong> Nothing reads it in this track, so decoding it is dead GPU time. <code>omni_response</code> stays in the schema as <code>""</code>.</li>
+  <li><strong>Classifier and target writer are separate calls</strong> &mdash; see the reasoning under step&nbsp;4. The target writer still receives the classifier's conclusion, which is what the "conclude, then write the reply from that conclusion" requirement asks for.</li>
+  <li><strong>Partial credit stays</strong> on <code>repair</code> and <code>repeat</code> rows: 1 / 0.5 / 0, with 0.5 reserved for a refusal that avoids hallucinating but shows no task-aware repair intent.</li>
+  <li><strong>A content-naming capability decline scores 1 on <code>answer</code> rows.</strong> The benchmark measures whether the audio got through, not whether the model is willing to act.</li>
+</ul>
+</div>
+
+<h2>Why beams, concretely</h2>
+
+<p>With one transcript, every difference from the command is ambiguous between two causes: the noise destroyed the piece, or the decoder took one bad turn on a piece that was perfectly audible. The current labelers spend most of their length trying to referee that with prose rules ("a correct reply always overrides a bad transcript", "do not rationalize meaning-changing swaps as a spelling variant"). Four hypotheses answer it structurally:</p>
+
+<table>
+<tr><th>Pattern across the 4 hypotheses</th><th>Reading</th><th>Consequence</th></tr>
+<tr>
+  <td>All four have the piece correctly</td>
+  <td>Audible</td>
+  <td><span class="kind-answer">survived</span></td>
+</tr>
+<tr>
+  <td>Some have it, some don't</td>
+  <td>Marginal but recoverable &mdash; the model <em>can</em> hear it</td>
+  <td><span class="kind-answer">survived</span> (intersection rule)</td>
+</tr>
+<tr>
+  <td>All four miss it, all with the <em>same</em> wrong word</td>
+  <td>Confidently misheard as one specific thing</td>
+  <td><span class="kind-repair">lost</span>, and <code>misheard_as</code> is set &rarr; the target may offer both alternatives</td>
+</tr>
+<tr>
+  <td>All four miss it, each with a <em>different</em> wrong word</td>
+  <td>Lost, with nothing stable to guess at</td>
+  <td><span class="kind-repair">lost</span>, <code>misheard_as</code> empty &rarr; the target must ask openly, never offer a guess</td>
+</tr>
+<tr>
+  <td>The four hypotheses barely agree with each other at all</td>
+  <td>Nothing was reliably heard</td>
+  <td><code>unintelligible: true</code> &rarr; <span class="kind-repeat">repeat</span></td>
+</tr>
+</table>
+
+<p>The last two rows are the part the single-transcript track could not express. Today, "grubhub" heard as "grandma" and "grubhub" heard as four mutually inconsistent noises look identical to the labeler &mdash; both are <em>one</em> wrong word &mdash; so both get an offer-the-alternative repair question. Only the first deserves one.</p>
+
+<div class="card">
+<strong>Step 1 result &mdash; measured, 40 distinct SLURP test utterances per band, <code>num_beams=8, n_best=4</code></strong>
+<table>
+<tr><th>band</th><th>uniq</th><th>pairWER</th><th>H1 recall</th><th>any-hyp</th><th>&ge;2-hyp</th><th>gain</th></tr>
+<tr><td>answer</td><td>3.70</td><td>0.26</td><td>86%</td><td>91%</td><td>85%</td><td class="good">+5%</td></tr>
+<tr><td>repair</td><td>3.70</td><td>0.29</td><td>77%</td><td>85%</td><td>78%</td><td class="good">+8%</td></tr>
+<tr><td>repeat</td><td>3.83</td><td>0.32</td><td>63%</td><td>71%</td><td>66%</td><td class="good">+8%</td></tr>
+</table>
+<p>Recall is over the command's content words (stopwords and wake words removed), after normalizing the <code>ten am</code> / <code>ten a m</code> / <code>10 a m</code> family together. <strong>Row-level: 30&ndash;32% of repair/repeat-band probes have at least one content word recovered only by a non-top beam</strong> (20% on the answer band) &mdash; that, not the +8% word-level gain, is the size of the effect, since one recovered piece moves a row between kinds.</p>
+<p>Three consequences, all folded into the steps below:</p>
+<ul>
+  <li><strong>Beams do not collapse</strong>, so plain beam search stands; diverse beam search is not needed.</li>
+  <li><strong>The &ge;2-hypothesis fallback is dead.</strong> At 78% / 66% against an H1 baseline of 77% / 63% it is within noise of doing nothing &mdash; recovered pieces are recovered by exactly one beam, never two. The <code>&ge;1</code> rule in STEP 2 is the only version with an effect, so there is no intermediate setting to retreat to.</li>
+  <li><strong><code>pairWER</code> is a weak degradation signal</strong> &mdash; 0.26 even on the answer band, rising only to 0.32. Beam disagreement has a noisy floor; recall (86 &rarr; 77 &rarr; 63%) is what actually tracks SNR. STEP 4's <code>unintelligible</code> test therefore has to rest on the command-relative clause, not on beams disagreeing with each other.</li>
+</ul>
+</div>
+
+<p class="muted">Also observed, and expected: the SNR band does not predict the kind. A 1.0&nbsp;dB probe produced four hypotheses agreeing on <em>"first meeting with powell for tomorrow"</em> and differing only in the final slot &mdash; a clean one-piece repair from the "repeat" band. Correct by construction, since the labeler assigns the kind, but it means <code>probe_by_kinds</code> will spend more probe batches hunting the <code>repeat</code> slot than the disjoint bands imply.</p>
+
+<h2>Steps</h2>
+
+<h3><span class="step-badge">1</span> Beam decoding in <code>base_generate_batch</code></h3>
+
+<p><code>babble_data.py</code> currently decodes greedily and returns one string per conversation. Add an <code>n_best</code> parameter; when it is 1 the function behaves exactly as it does now, so the other three tracks are untouched.</p>
+
+<pre><code>ASR_N_BEST = 4
+ASR_NUM_BEAMS = 8
+
+@torch.inference_mode()
+def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
+    ...
+    gen_kwargs = dict(do_sample=False)
+    if n_best > 1:
+        gen_kwargs = dict(
+            do_sample=False,
+            num_beams=ASR_NUM_BEAMS,
+            num_return_sequences=n_best,
+        )
+    out = base_model.generate(**inputs, max_new_tokens=max_new_tokens,
+                              eos_token_id=IM_END_ID, pad_token_id=IM_END_ID,
+                              **gen_kwargs)
+    ...
+    # generate() returns (B * n_best, T) grouped by input; regroup so the
+    # caller gets one list of hypotheses per conversation
+    if n_best > 1:
+        return [decoded[i:i + n_best] for i in range(0, len(decoded), n_best)]
+    return decoded</code></pre>
+
+<p><strong>Memory.</strong> <code>PROBE_BATCH_SIZE = 16</code> with <code>num_beams=8</code> means 128 sequences in flight against a 30&nbsp;s audio context. Drop <code>PROBE_BATCH_SIZE</code> to 8 for this track and keep <code>ASR_MAX_NEW_TOKENS = 64</code>; the removed task-response decode buys most of that time back. <code>MAX_PROBES</code> stays 3.</p>
+
+<p><strong>Before writing anything else</strong>, run this on ~20 probe audios at each of the three SNR bands and dump the four hypotheses per audio to stdout. This is the run that decides the beam-diversity question above, and it is a two-line change to the existing script, not a new one.</p>
+
+<h3><span class="step-badge">2</span> The beam classifier prompt</h3>
+
+<p>New <code>BEAM_LOSS_SYSTEM</code> in <code>babble_data.py</code>, sharing the key-piece definition and the example set with <code>ASR_LOSS_SYSTEM</code> &mdash; those examples are already tuned against real SLURP failures (wake words, auxiliary verbs, spacing differences) and none of that changes. What is new is the per-hypothesis structure and the intersection rule.</p>
+
+<p>The output order <em>is</em> the reasoning chain, since the model runs with <code>enable_thinking: False</code>. Per-hypothesis lists must come first, then the consensus, then the kind &mdash; never the reverse.</p>
+
+<pre><code>BEAM_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice assistant.
+
+You get the user's real spoken COMMAND, and HYPOTHESES -- the top {K} guesses a
+speech recognizer produced for the SAME noisy recording of that command, best
+first. They are alternative readings of one audio, not separate recordings.
+
+[... key-piece definition, filler/wake-word/auxiliary-verb exclusions, and the
+worked examples, carried over verbatim from ASR_LOSS_SYSTEM ...]
+
+Work in this order.
+
+STEP 1. Take each hypothesis on its own and list the key pieces of the COMMAND
+that did not survive in THAT hypothesis. Judge each one independently; do not
+let a later hypothesis change what you said about an earlier one.
+
+STEP 2. Intersect. A piece is LOST only if it is missing or wrong in EVERY
+hypothesis. If even one hypothesis has it right, the piece was audible and it
+SURVIVED, however badly the other hypotheses mangled it.
+
+STEP 3. For each lost piece, look at what the hypotheses put in its place.
+  - If they all agree on the same wrong word (or on trivial variants of it),
+    that word goes in "misheard_as": the device has one specific, plausible
+    mishearing it can offer back to the user.
+  - If they disagree about what the wrong word was, "misheard_as" stays "" --
+    there is no stable guess, so the piece was simply not heard.
+
+STEP 4. Set "unintelligible" to true when the hypotheses collectively share
+barely any words or sounds with the COMMAND -- they read as some other
+sentence entirely. This is the case where nothing is reliable enough to build
+a question on. Judge this against the COMMAND. The hypotheses differing from
+EACH OTHER is normal at every noise level and is not by itself evidence of
+anything.
+
+STEP 5. Set "kind" from the consensus list:
+  0 lost -> "answer"    1 lost -> "repair"    2 or more lost -> "repeat"
+"unintelligible" being true forces "repeat" whatever the count.
+
+Return ONLY JSON:
+{"per_hypothesis": [{"n": 1, "lost": [...], "heard_instead": "..."}, ...],
+ "lost": [...], "misheard_as": "...", "unintelligible": true|false,
+ "kind": "answer" | "repair" | "repeat"}
+
+"per_hypothesis" must have exactly one entry per hypothesis, in order.
+Quote "lost" using the words of the real COMMAND."""</code></pre>
+
+<p><strong>Bundling.</strong> Keep the existing rule that several words misheard as one specific similar-sounding phrase are <em>one</em> lost entry, and unrelated losses in different spots stay separate. Under the intersection rule this now has to hold at STEP&nbsp;1, per hypothesis, before the intersection sees it.</p>
+
+<p><strong>User message</strong> stays tiny so the rubric remains a cacheable prefix on the vLLM box:</p>
+<pre><code>BEAM_LOSS_USER = "COMMAND: {sentence}\n" + "\n".join(f"HYP {i}: {{h{i}}}" for i in ...)</code></pre>
+
+<h3><span class="step-badge">3</span> <code>label_beam()</code> and the code-side guards</h3>
+
+<p>A thin wrapper, in the shape of the existing <code>label_asr</code>, keeping the two guards that already exist because both failure modes are real and neither is worth another LLM call.</p>
+
+<pre><code>def label_beam(sentence, hyps):
+    """(command, [hyp1..hypK]) -> {kind, anchor, misheard_as, missing, reason} | None."""
+    obj = gpt_json(BEAM_LOSS_SYSTEM, BEAM_LOSS_USER.format(...),
+                   temperature=CLASSIFY_TEMPERATURE, max_tokens=CLASSIFY_MAX_TOKENS)
+    if obj is None:
+        return None
+    lost = drop_wake_only([...])          # existing helper: SLURP's "olly" is never a key piece
+    if obj["unintelligible"]:
+        kind = "repeat"
+    else:
+        kind = {0: "answer", 1: "repair"}.get(len(lost), "repeat")
+    anchor = lost[0] if kind == "repair" else ""
+    # existing guard: an "anchor" spanning most of the command's content words
+    # is a repeat request wearing a repair's clothes
+    if kind == "repair" and breadth(anchor, sentence) &gt;= ANCHOR_BREADTH_MAX:
+        kind, anchor = "repeat", ""
+    if kind == "repair" and not anchor:
+        return None                        # unusable row, caller drops the probe
+    ...</code></pre>
+
+<p>Also carried over: <code>per_hypothesis</code> is stored on the row (as <code>beam_losses</code>) so a mislabeled row can be diagnosed without re-running the GPU pass. Cheap, and the tree track's <code>asr_bucket</code>/<code>resp_bucket</code> columns earned their keep exactly this way.</p>
+
+<h3><span class="step-badge">4</span> Target generation &mdash; a second call, not the same one</h3>
+
+<p>The requirement is that the reply be written <em>from</em> the conclusion about what was lost. Both a single call and two calls satisfy that; two calls is the better trade here, for four reasons:</p>
+
+<ul>
+  <li><strong>Temperature conflict.</strong> The label wants <code>temperature=0.0</code> so a rerun reproduces the dataset. The reply wants <code>0.7</code> so 4000 training targets do not all open the same way. One call cannot have both.</li>
+  <li><strong>Reuse.</strong> <code>ANSWER_TARGET_SYSTEM</code>, <code>REPAIR_TARGET_SYSTEM</code> and <code>REPEAT_TARGET_SYSTEM</code> already exist and are tuned (the no-fabrication rule for private/volatile data, the never-reveal-the-lost-word rule with its single misheard-as exception, the no-content-leak rule for repeats). Folding them into the classifier means restating all of it and re-tuning it.</li>
+  <li><strong>Failure isolation.</strong> <code>write_target</code> retries up to 3 times on an empty target. In a merged call each retry re-rolls the label too, so a formatting hiccup can silently change the row's kind.</li>
+  <li><strong>Prefix cache.</strong> The classifier rubric is long and fires on every probe; the reply rules would ride along on all of them. Split, the repair and repeat rubrics only fire for the probes that need them.</li>
+</ul>
+
+<p>The extra call is short and network-bound against a local vLLM box, and it overlaps with the next probe batch's GPU work &mdash; it does not move the wall clock.</p>
+
+<p>Two edits to <code>write_target</code>:</p>
+<ul>
+  <li><code>REPAIR_TARGET_USER</code> takes the hypothesis list instead of a single <code>HEARD</code>, plus the <code>LOST-PIECE</code> and optional <code>MISHEARD-AS</code> the classifier concluded. Add one line to <code>REPAIR_TARGET_SYSTEM</code>: <em>"You are shown several alternative transcriptions of the same audio; ground your question in what they agree on."</em></li>
+  <li><code>REPEAT_TARGET_USER</code> takes the best hypothesis only &mdash; the repeat target must not reference content anyway, so the rest are noise in the prompt.</li>
+</ul>
+
+<h3><span class="step-badge">5</span> Wiring the track into <code>probe_by_kinds</code></h3>
+
+<pre><code>track.add_argument("--beam-label", action="store_true",
+    help="One beam-search ASR pass per probe; label off the K hypotheses' "
+         "consensus alone. No task-response pass.")</code></pre>
+
+<p>In <code>probe_by_kinds</code>, add a third branch alongside <code>heard-reply</code> and the shared two-pass/tree branch:</p>
+
+<pre><code>if TRACK == "beam":
+    with GPU_LOCK:
+        convs = [_conv(a, asr_sysp, ASR_PROMPT) for a in audios]
+        hyp_lists = base_generate_batch(convs, ASR_MAX_NEW_TOKENS, n_best=ASR_N_BEST)
+    transcripts = [h[0] for h in hyp_lists]     # best beam, for the row + logs
+    responses = ["" for _ in hyp_lists]          # no task-response pass in this track
+    with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
+        labels = list(ex.map(lambda h: label_beam(sentence, h), hyp_lists))</code></pre>
+
+<p>Everything downstream &mdash; the results dict, <code>build_triplets</code>, <code>build_answer_rows</code>, <code>make_row</code> &mdash; already keys off <code>label["kind"]</code> and needs only the new <code>beam_losses</code> column threaded through. SNR bands use the existing <code>SLOT_SNR_DISJOINT</code> and <code>CLEAN_ANSWER_PROB</code>, same as the other two non-default tracks.</p>
+
+<p><strong>Row schema delta:</strong> <code>+ beam_hypotheses</code> (list[str]), <code>+ beam_losses</code> (JSON string of <code>per_hypothesis</code>), <code>+ unintelligible</code> (bool); <code>omni_response</code> becomes <code>""</code>; <code>asr_bucket</code>/<code>resp_bucket</code> become <code>""</code>. <code>asr_transcript</code>, <code>lost</code>, <code>swapped</code>, <code>anchor</code>, <code>target</code>, <code>kind</code> keep their current meaning, so <code>sft_qwen.py</code> needs no change at all.</p>
+
+<h3><span class="step-badge">6</span> Build the dataset</h3>
+
+<pre><code>conda activate qwen25omni
+# small first, read the printed rows and the kind counter
+python babble_data.py --beam-label --ds-id keylazy/slurp-babble-beam-smoke \
+    --n-test 10 --n-train 10 --n-extra-ans 0 --no-push
+
+# full
+python babble_data.py --beam-label \
+    --ds-id keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1</code></pre>
+
+<p>What to check in the small build, in order of how likely it is to be wrong:</p>
+<ol>
+  <li>Are the four hypotheses actually different? (the step&nbsp;1 question, now visible per row)</li>
+  <li>How often does the intersection rule flip a piece from lost to survived? If it is near 0%, the beams are not diverse and this track collapses back to the single-transcript one.</li>
+  <li>How often is <code>misheard_as</code> empty on a <code>repair</code> row? That fraction is the new capability &mdash; open questions instead of bad offered alternatives.</li>
+  <li>The <code>probe</code> skip rate. Beams biased toward the LM prior may make it hard to hit the <code>repeat</code> slot within <code>MAX_PROBES</code>; if so, lower the repeat SNR band rather than raising <code>MAX_PROBES</code>.</li>
+</ol>
+
+<h2>Eval: the label is the ground truth</h2>
+
+<p>Two things change together and they are separable flags, so each can be ablated on the existing datasets.</p>
+
+<h3><span class="step-badge">7</span> Three per-kind judges replace the type classifier</h3>
+
+<p>Today the judge classifies the response into one of four <em>types</em> and a matrix converts (target kind, judged type) into a score. That indirection is what lets a correct answer earn 1.0 on a <code>repair</code> row. Removing it means the judge scores directly, under the rubric for the row's own kind &mdash; and the repair judge can be told <em>which piece</em> was lost, which the type classifier structurally could not use.</p>
+
+<p>Add to <code>prompts.py</code>; add <code>--judge-mode {type,per-kind}</code> to <code>babble_eval_qwen.py</code>, default <code>type</code> so every existing result file stays reproducible.</p>
+
+<h4><code>ANSWER_JUDGE_SYSTEM</code> &mdash; scores 1 / 0</h4>
+<p>Sees: the command, the response. The paper's answerable-condition rubric, with the refusal carve-out you need and the paper does not.</p>
+<ul>
+  <li><strong>1</strong> &mdash; carries out the task, answers it, says it is looking it up, or paraphrases it back; <em>and</em> every specific detail it asserts matches the command. Also 1 for a capability decline or a hand-off to the user ("I can't check last night's game score", "you can see your alarms in the clock app") <strong>provided it restates at least one real content word from the command</strong> &mdash; entity, action, name, place, time or quantity. That restatement is the proof the audio got through, which is the only thing this benchmark measures. Also 1 for an on-topic reply to a phatic prompt, and for a question about a detail the command never gave.</li>
+  <li><strong>0</strong> &mdash; asks to repeat or clarify; expresses doubt about what was said; refuses with no content word from the command ("I'm sorry, I can't help with that"); asserts a detail contradicting the command; off-topic; empty or garbled.</li>
+</ul>
+<p class="muted">The content-word test is lifted verbatim from <code>RESPONSE_TYPE_SYSTEM</code>, where it is already tuned against real base-model output. It is the whole reason C does not collapse on a refusal-prone base model.</p>
+
+<h4><code>REPAIR_JUDGE_SYSTEM</code> &mdash; scores 1 / 0.5 / 0</h4>
+<p>Sees: the command, <strong>the lost piece from the label</strong> (and <code>misheard_as</code> if set), the response.</p>
+<ul>
+  <li><strong>1</strong> &mdash; a targeted question or confirmation about <em>that</em> piece, treating the rest of the command as heard. Includes the offer-alternatives form when <code>misheard_as</code> is set, and a task-aware refusal that explicitly names that piece as the thing it could not catch. The question does not have to quote the piece; it has to be answerable by supplying it.</li>
+  <li><strong>0.5</strong> &mdash; avoids hallucinating but is not targeted: a generic refusal ("I don't know", "I can't answer that"), a full repeat request, or a targeted question about the <em>wrong</em> piece &mdash; one the label says survived.</li>
+  <li><strong>0</strong> &mdash; <span class="bad">performs the task or answers it</span>, whether or not the answer happens to be right; fills the lost piece with a guess; asserts any specific value for it; off-topic; empty.</li>
+</ul>
+<div class="risk">
+This is the cell the whole experiment turns on. Under <code>SCORE_MATRICES["legacy"]</code> and <code>["tree"]</code> alike, <code>repair &rarr; answer</code> scored <strong>1.0</strong>; here it scores <strong>0</strong>. Expect R to drop sharply for every model, base and fine-tuned. That is intended &mdash; the old cell was rewarding a model for confidently answering a command it demonstrably could not fully hear &mdash; but it makes numbers non-comparable with every run in <code>results/</code>. Say so explicitly wherever the two are shown together.
+</div>
+
+<h4><code>REPEAT_JUDGE_SYSTEM</code> &mdash; scores 1 / 0.5 / 0</h4>
+<p>Sees: the command, the response. Not the lost list &mdash; on a repeat row essentially everything is lost, so it carries no information.</p>
+<ul>
+  <li><strong>1</strong> &mdash; asks for the whole command again, or states it could not catch the request, committing to no specific content. A generic frame ("your request", "that") is fine.</li>
+  <li><strong>0.5</strong> &mdash; a generic refusal with no repeat intent and no content ("I don't know", "I can't help with that").</li>
+  <li><strong>0</strong> &mdash; asserts or guesses any specific content; <em>or</em> asks a targeted question about one detail, since nothing was reliably heard for that question to be anchored on, so the anchor is itself a guess. Also 0 for off-topic and empty.</li>
+</ul>
+<p class="muted">The targeted-question-scores-0 line matches the one cell <code>SCORE_MATRICES["tree"]</code> already changed, so that cell's effect is not re-litigated here.</p>
+
+<h4>Output shape</h4>
+<p>Same contract as the current judges &mdash; reason before score, so the model commits to a justification before a number, with thinking off:</p>
+<pre><code>{"reason": "&lt;one or two short sentences, under 40 words&gt;", "score": 1 | 0.5 | 0}</code></pre>
+
+<h3><span class="step-badge">8</span> Eval plumbing</h3>
+
+<ul>
+  <li><code>make_judge</code> gains a score-parsing path: <code>float(data["score"])</code> validated against <code>{0.0, 0.5, 1.0}</code>, falling back to <code>0.0</code> with <code>reason="parse failure"</code> and a counter in the summary, mirroring how the current <code>"bad"</code> fallback works.</li>
+  <li><code>process_row</code> picks <code>JUDGE_BY_KIND[row["kind"]]</code> and builds the user message per kind &mdash; the repair one interpolates <code>row["lost"]</code> / <code>row["swapped"]</code>, the other two do not.</li>
+  <li>C, R, F and <code>harmonic3</code> are unchanged, so <code>results/viz.ipynb</code> keeps working: the summary line still carries <code>C</code>, <code>R</code>, <code>F</code>, <code>EAR</code>. Add <code>"judge_mode": "per-kind"</code> to it, and replace the <code>confusion</code> dict with a per-kind score histogram (<code>{"repair@1": 12, "repair@0.5": 30, ...}</code>) &mdash; there are no types left to confuse. Keep the <code>confusion</code> key present and empty under <code>--judge-mode per-kind</code> if the notebook's loader indexes it unconditionally.</li>
+  <li>Output tag: <code>results/bab_results_&lt;name&gt;_beam.jsonl</code>.</li>
+</ul>
+
+<pre><code>VLLM=http://$(cat /gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt):8000/v1
+
+# base model
+python babble_eval_qwen.py --judge-mode per-kind \
+    --dataset keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1 \
+    --model-path Qwen/Qwen2.5-Omni-3B --judge-base-url "$VLLM"
+
+# adapter
+python sft_qwen.py --ds-id keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1 \
+    --hub-id keylazy/Qwen2.5-Omni-3B-bab-beam-sft --push
+python babble_eval_qwen.py --judge-mode per-kind \
+    --dataset keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1 \
+    --model-path Qwen/Qwen2.5-Omni-3B \
+    --adapter-path ./Qwen2.5-Omni-3B-bab-beam-sft --judge-base-url "$VLLM"</code></pre>
+
+<h2>Ablations this design buys for free</h2>
+<p>Both flags are independent of the data track, so each isolates one variable against runs you already have:</p>
+<table>
+<tr><th>Run</th><th>Isolates</th></tr>
+<tr><td><code>--judge-mode per-kind</code> on the existing <code>-v4</code> tree dataset</td><td>The judge change alone &mdash; how much of the R drop is the strict repair cell, independent of beam labeling.</td></tr>
+<tr><td><code>--judge-mode type</code> on the new <code>-beam-v1</code> dataset</td><td>The label change alone &mdash; whether beam-consensus labels are better labels under the metric you already trust.</td></tr>
+<tr><td>Both, vs. the tree adapter on the tree dataset</td><td>The headline number.</td></tr>
+</table>
+
+<h2>Scope check: what does NOT change</h2>
+<ul>
+  <li><code>sft_qwen.py</code> &mdash; nothing. It reads <code>audio</code> + <code>target</code>, both unchanged in meaning.</li>
+  <li>The three existing data tracks, their datasets, their adapters, and every file in <code>results/</code>.</li>
+  <li>The babble mixing itself: pool, 3 speakers, SNR formula, clipping guard, <code>CLEAN_ANSWER_PROB</code>.</li>
+  <li>The kinds. Still <code>answer</code> / <code>repair</code> / <code>repeat</code>, still <code>EAR = 3CRF/(CR+CF+RF)</code>.</li>
+  <li><code>TASK_PROMPT</code> at both build and eval time.</li>
+</ul>
+
+<h2>Risks</h2>
+<p class="muted"><del>Beams collapse.</del> Retired &mdash; measured at 3.7&ndash;3.8 unique of 4 in step&nbsp;1.</p>
+<div class="risk"><strong>The intersection rule is too permissive.</strong> One lucky beam clears a piece the user genuinely could not be understood on, so <code>answer</code> rows fill with damaged audio and the model learns to over-answer. Step&nbsp;1 partly bounds this &mdash; <code>any-hyp</code> recall is 85% / 71% on the repair and repeat bands, nowhere near saturation &mdash; but it measures word recovery, not whether the recovered word was <em>audible</em> or merely a lucky LM prior. <span class="bad">There is no graceful mitigation:</span> the &ge;2-hypothesis variant is within noise of the single-transcript baseline, so tightening the rule reverts the track rather than adjusting it. If step&nbsp;6 shows <code>answer</code> rows swallowing damaged audio, the lever is <code>ASR_N_BEST</code> (4 &rarr; 2), not the intersection threshold.</div>
+<div class="risk"><strong>Dropping the response pass loses a real witness.</strong> The tree track's evidence was that a reply sometimes proves a piece got through when the ASR mangled it. Beam consensus is a different way to catch the same case, and it should be strictly better at it &mdash; but if answer-row recall drops sharply versus the tree dataset, that is the cause, and the fix is to re-add the response pass as a tiebreaker only on <code>repair</code>-labeled probes.</div>
+<div class="risk"><strong>Two rubric families to maintain.</strong> <code>prompts.py</code> would carry the type judge, the few-shot type judge, and three per-kind judges. If the per-kind judges win, delete <code>RESPONSE_TYPE_FEWSHOT_SYSTEM</code> rather than carrying three.</div>
+
+<footer>
+Order of work: step 1 alone first &mdash; it is two lines and it can invalidate the rest. Then 2&ndash;6 (data), then 7&ndash;8 (eval), which can be built and run against the existing <code>-v4</code> dataset while the beam build is still going.
+</footer>
+
+</body>
+</html>

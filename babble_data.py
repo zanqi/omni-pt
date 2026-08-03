@@ -70,7 +70,7 @@ N_TRAIN_EXTRA_ANS = 3000
 
 # Classification + Target generation are served by the local vLLM judge
 # box. Its slurm job records the node it landed on in VLLM_HOST_FILE.
-TARGET_MODEL = "Qwen/Qwen3.5-122B-A10B-FP8" # "Qwen/Qwen3.6-35B-A3B-FP8"
+TARGET_MODEL = "Qwen/Qwen3.5-122B-A10B-FP8"  # "Qwen/Qwen3.6-35B-A3B-FP8"
 VLLM_HOST_FILE = "/gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt"
 MASK_DS_ID = "keylazy/slurp-ear-sft"
 AUDIO_ROOT = "babble_audio"
@@ -111,6 +111,8 @@ TARGET_RETRIES = 3
 CLASSIFY_WORKERS = 8  # parallel classifier calls to vLLM
 
 ASR_MAX_NEW_TOKENS = 64
+ASR_N_BEST = 4
+ASR_NUM_BEAMS = 8
 RESP_MAX_NEW_TOKENS = 256  # task response from base omni model
 
 KINDS = ("answer", "repair", "repeat")
@@ -139,7 +141,7 @@ IM_END_ID = None
 # ---
 
 ASR_SYSTEM_PROMPT = "You are a speech recognition model."
-ASR_PROMPT = "Transcribe the English audio into text without any punctuation marks." # from Qwen2.5-Omni github cookbooks
+ASR_PROMPT = "Transcribe the English audio into text without any punctuation marks."  # from Qwen2.5-Omni github cookbooks
 
 
 def _conv(audio, system_prompt, user_prompt):
@@ -161,17 +163,7 @@ def _conv(audio, system_prompt, user_prompt):
 
 
 @torch.inference_mode()
-def base_generate_batch(convs, max_new_tokens, prefill=None):
-    """prefill, if given, is literal text appended to the rendered prompt so
-    the model continues from there instead of opening with something else
-    (e.g. --heard-reply forces HEARD_PREFILL so a refusal on bad audio can't
-    skip the required format). The prefill is prepended back onto the decoded
-    text, so callers see the same string they'd get if the model had opened
-    with it spontaneously."""
-    # the omni processor logs a root-logger warning per conversation whenever
-    # the system prompt isn't the talker default (our ASR prompt never is). We
-    # only decode text, so mute it for just this call -- an int compare in
-    # isEnabledFor, cheaper than filtering the emitted records by message.
+def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
     logging.disable(logging.WARNING)
     try:
         texts = base_processor.apply_chat_template(
@@ -190,12 +182,19 @@ def base_generate_batch(convs, max_new_tokens, prefill=None):
         return_tensors="pt",
         padding=True,
     ).to(base_model.device, dtype=base_model.dtype)
+    gen_kwargs = dict(do_sample=False)
+    if n_best > 1:
+        gen_kwargs = dict(
+            do_sample=False,
+            num_beams=ASR_NUM_BEAMS,
+            num_return_sequences=n_best,
+        )
     out = base_model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
-        do_sample=False,
         eos_token_id=IM_END_ID,
         pad_token_id=IM_END_ID,
+        **gen_kwargs,
     )
     gen = out[:, inputs["input_ids"].shape[1] :]
     decoded = [
@@ -204,6 +203,9 @@ def base_generate_batch(convs, max_new_tokens, prefill=None):
     ]
     if prefill is not None:
         decoded = [f"{prefill}{d}" for d in decoded]
+    if n_best > 1:
+        # group by input
+        return [decoded[i : i + n_best] for i in range(0, len(decoded), n_best)]
     return decoded
 
 
@@ -956,12 +958,23 @@ RESP_FORMS = ("answer", "repair", "repeat", "bad")
 # list it -- so a lost piece made only of these is dropped before the table
 # sees it. Otherwise a garbled wake word becomes a repair anchor and the
 # target asks the user to re-confirm their assistant's name.
-WAKE_WORDS = {"hey", "ok", "okay", "olly", "ollie", "alexa", "siri", "google",
-              "assistant", "computer"}
+WAKE_WORDS = {
+    "hey",
+    "ok",
+    "okay",
+    "olly",
+    "ollie",
+    "alexa",
+    "siri",
+    "google",
+    "assistant",
+    "computer",
+}
 
 
 def drop_wake_only(pieces):
     return [p for p in pieces if set(_normalize_text(p).split()) - WAKE_WORDS]
+
 
 # a repair anchor covering this fraction of the command's content words or
 # more is not targeted at one piece -- treat the probe as "repeat" instead
@@ -969,9 +982,34 @@ ANCHOR_BREADTH_MAX = 0.6
 
 # dropped before intersecting two free-text quotes of the same lost piece
 PIECE_STOPWORDS = {
-    "a", "an", "and", "any", "are", "at", "be", "by", "do", "for", "from",
-    "i", "in", "is", "it", "me", "my", "of", "on", "please", "s", "that",
-    "the", "this", "to", "what", "you", "your",
+    "a",
+    "an",
+    "and",
+    "any",
+    "are",
+    "at",
+    "be",
+    "by",
+    "do",
+    "for",
+    "from",
+    "i",
+    "in",
+    "is",
+    "it",
+    "me",
+    "my",
+    "of",
+    "on",
+    "please",
+    "s",
+    "that",
+    "the",
+    "this",
+    "to",
+    "what",
+    "you",
+    "your",
 }
 
 
@@ -1390,8 +1428,10 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                 responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)
 
             # same two witnesses either way; only how they're labeled differs
-            label_one = classify if TRACK == "two-pass" else (
-                lambda t, r: label_tree(sentence, t, r)
+            label_one = (
+                classify
+                if TRACK == "two-pass"
+                else (lambda t, r: label_tree(sentence, t, r))
             )
             with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
                 labels = list(
@@ -1547,7 +1587,10 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
 
         if TRACK == "heard-reply":
             # already written, one call per probe audio alongside its label
-            return {"triplet": triplet, "targets": {k: triplet[k]["target"] for k in KINDS}}
+            return {
+                "triplet": triplet,
+                "targets": {k: triplet[k]["target"] for k in KINDS},
+            }
 
         if TRACK == "tree":
             # one call per probe: the table anchored the repair question on
@@ -1692,7 +1735,9 @@ def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
         path = os.path.join(AUDIO_DIR, f"{split}_{slurp_id}_answer.wav")
         sf.write(path, built["probe"]["audio"], AUDIO_SAMPLING_RATE)
         rows.append(
-            make_row("answer", built["target"], path, built["probe"], slurp_id, sentence)
+            make_row(
+                "answer", built["target"], path, built["probe"], slurp_id, sentence
+            )
         )
 
         pbar.update(1)
@@ -1780,7 +1825,6 @@ if __name__ == "__main__":
         mask_ds = load_dataset(MASK_DS_ID, split=split, streaming=True)
         for r in mask_ds.select_columns(["slurp_id"]):
             seen_ids.add(r["slurp_id"])
-
 
     test_babble_pool = collect_babble_pool("test")
     test_rows = build_triplets("test", args.n_test, seen_ids, test_babble_pool)
