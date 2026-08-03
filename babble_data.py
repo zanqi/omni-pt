@@ -976,9 +976,13 @@ def drop_wake_only(pieces):
     return [p for p in pieces if set(_normalize_text(p).split()) - WAKE_WORDS]
 
 
-# a repair anchor covering this fraction of the command's content words or
-# more is not targeted at one piece -- treat the probe as "repeat" instead
-ANCHOR_BREADTH_MAX = 0.6
+LOST_MAX_PCT = 0.6
+
+
+def lost_too_much(lost, sentence):
+    cmd = set(_normalize_text(sentence).split()) - PIECE_STOPWORDS
+    anc = set(_normalize_text(lost).split()) - PIECE_STOPWORDS
+    return bool(cmd) and len(anc & cmd) / len(cmd) >= LOST_MAX_PCT
 
 # dropped before intersecting two free-text quotes of the same lost piece
 PIECE_STOPWORDS = {
@@ -1138,18 +1142,8 @@ def decide_kind(sentence, asr, resp):
         else:
             kind, anchor, misheard = "repeat", "", ""
 
-    # A "targeted" question covering most of the command is a repeat request
-    # wearing a repair's clothes -- it asks the user to say nearly everything
-    # again. Three separate paths can produce one: the reply labeler reading
-    # "i'm not sure what you mean by <garbled>" as a repair, either labeler
-    # bundling several unrelated losses into one entry, or a command whose
-    # only key piece is the lost one. Checking the final anchor catches all
-    # three at once.
-    if kind == "repair":
-        cmd = set(_normalize_text(sentence).split()) - PIECE_STOPWORDS
-        anc = set(_normalize_text(anchor).split()) - PIECE_STOPWORDS
-        if cmd and len(anc & cmd) / len(cmd) >= ANCHOR_BREADTH_MAX:
-            kind, anchor, misheard = "repeat", "", ""
+    if kind == "repair" and lost_too_much(anchor, sentence):
+        kind, anchor, misheard = "repeat", "", ""
 
     if kind == "repair" and not anchor:
         return None
@@ -1416,6 +1410,71 @@ the whole thing"""
 # hypothesis -- the count is left to the caller so ASR_N_BEST can change
 # without touching the prompt.
 BEAM_LOSS_USER = "COMMAND: {sentence}\n{hypotheses}"
+
+
+def label_beam(sentence, hyps):
+    """(command, [hyp1..hypK]) -> label dict | None.
+
+    Kind is recomputed here rather than taken from the model, because
+    drop_wake_only can shorten the consensus list after the model has counted
+    it -- a lone wake-word entry would otherwise make an "answer" probe a
+    "repair" whose question asks the user to re-confirm the assistant's own
+    name. The model's own "kind" is therefore ignored.
+    """
+    hyps = [h for h in hyps if h and h.strip()]
+    if not hyps:
+        return None
+
+    obj = gpt_json(
+        BEAM_LOSS_SYSTEM,
+        BEAM_LOSS_USER.format(
+            sentence=_normalize_text(sentence),
+            hypotheses="\n".join(
+                f"HYP {i}: {_normalize_text(h)}" for i, h in enumerate(hyps, 1)
+            ),
+        ),
+        temperature=CLASSIFY_TEMPERATURE,
+        max_tokens=CLASSIFY_MAX_TOKENS,
+    )
+    if obj is None:
+        return None
+
+    lost = drop_wake_only(
+        [str(s).strip() for s in obj.get("lost", []) if str(s).strip()]
+    )
+    unintelligible = bool(obj.get("unintelligible", False))
+
+    if unintelligible:
+        kind = "repeat"
+    else:
+        kind = {0: "answer", 1: "repair"}.get(len(lost), "repeat")
+    anchor = lost[0] if kind == "repair" else ""
+    misheard = str(obj.get("misheard_as", "")).strip() if kind == "repair" else ""
+    if kind == "repair" and lost_too_much(anchor, sentence):
+        # one bundled entry spanning most of the command: a repeat request
+        # wearing a repair's clothes
+        kind, anchor, misheard = "repeat", "", ""
+    if kind == "repair" and not anchor:
+        # unusable: a repair with no piece to anchor the question on
+        return None
+
+    per_hyp = obj.get("per_hypothesis", [])
+    return {
+        # "missing" rather than "lost", to match the other labelers
+        "missing": [anchor] if kind == "repair" else (lost if kind == "repeat" else []),
+        "kind": kind,
+        "anchor": anchor,
+        "misheard_as": misheard,
+        "unintelligible": unintelligible,
+        # kept on the row so a mislabeled probe can be diagnosed without
+        # re-running the GPU pass
+        "per_hypothesis": per_hyp,
+        "reason": (
+            f"{len(hyps)} hyps | consensus lost: {'; '.join(lost) or 'none'}"
+            f"{' (unintelligible)' if unintelligible else ''}"
+            + (f" | misheard as: {misheard}" if misheard else "")
+        ),
+    }
 
 
 # ---
