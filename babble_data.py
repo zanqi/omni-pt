@@ -1194,6 +1194,231 @@ def label_tree(sentence, transcript, response):
 
 
 # ---
+# --beam-label: one labeler over the N-best ASR hypotheses
+# ---
+
+BEAM_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice \
+assistant.
+
+You get the user's real spoken COMMAND, and HYPOTHESES -- the speech \
+recognizer's top guesses for the SAME noisy recording of that command, best \
+first. They are alternative readings of ONE audio, not separate recordings, so \
+between them they show you everything the recognizer was able to hear.
+
+Key pieces of a command are entities, names, places, times, dates, quantities, \
+titles, and the requested action. Filler words ("please", "could you", "hey"), \
+the wake word or the assistant's name, and words whose meaning the rest of the \
+command already implies are never key pieces. Neither are spelling, spacing, or \
+other minor wording differences (e.g. "mockingbird" heard as "mocking bird", \
+"ten am" as "ten a m"), a synonym that asks for the same thing ("increase" \
+heard as "raise"), or a question rephrased in different grammar that still \
+asks for the same thing ("what does X mean" heard as "what is X", or "do you \
+think" heard as "you think").
+
+An auxiliary or light verb that only frames the request is not a key piece on \
+its own -- "does", "do", "is", "can you", "give me", "tell me", "get me", \
+"put". The key piece is what is being asked FOR, not the words wrapping the \
+asking. Words that change WHAT is asked do count -- "how many", "how long", \
+"where", "when" carry the actual question.
+
+A name rendered as a close phonetic match is NOT a lost piece: "pawel" heard \
+as "powell", "divya" as "deevya". The recognizer heard the name and spelled it \
+its own way, so the slot is filled and the user has nothing to clarify. It IS \
+a lost piece when the substitute is a different word rather than a spelling of \
+the same sounds -- "mona" heard as "monday" (a weekday, not that name), \
+"eminem" as "edna meyer".
+
+Work in this order.
+
+STEP 1. Take each hypothesis on its own and list the key pieces of the COMMAND \
+that did not survive in THAT hypothesis, with what it put in their place. \
+Judge each hypothesis independently; do not let a later one change what you \
+said about an earlier one.
+
+STEP 2. Intersect. A piece is LOST only if it is missing or wrong in EVERY \
+hypothesis. If even ONE hypothesis has it right, the piece was audible and it \
+SURVIVED -- however badly every other hypothesis mangled it, and even if that \
+one hypothesis is the last and worst-ranked. This is not a majority vote.
+
+STEP 3. For each lost piece, look at what the hypotheses put in its place.
+- If they all agree on the same wrong word, or on trivial variants of one \
+wrong word, that word goes in "misheard_as": there is one specific, plausible \
+mishearing the device can offer back to the user.
+- If they disagree about what the wrong word was, or some simply drop the \
+piece, "misheard_as" stays "" -- there is no stable guess, so the piece was \
+just not heard.
+
+STEP 4. Set "unintelligible" to true when the hypotheses collectively share \
+barely any words or sounds with the COMMAND -- they read as some other \
+sentence entirely -- so nothing survived that a question could be built on. \
+Judge this against the COMMAND. The hypotheses differing from EACH OTHER is \
+normal at every noise level, including clean audio, and is never by itself \
+evidence of a loss.
+
+STEP 5. Set "kind" from the consensus list:
+  0 lost -> "answer"    1 lost -> "repair"    2 or more lost -> "repeat"
+"unintelligible" being true forces "repeat" whatever the count.
+
+Return ONLY JSON:
+{"per_hypothesis": [{"n": 1, "lost": [...], "heard_instead": "..."}, ...], \
+"lost": [...], "misheard_as": "...", "unintelligible": true|false, \
+"kind": "answer" | "repair" | "repeat"}
+
+"per_hypothesis" must have exactly one entry per hypothesis, in order. Quote \
+"lost" using the words of the real COMMAND.
+
+"lost" does not need one entry per missing word -- bundle several words into \
+ONE entry when they are a single point of confusion: a whole phrase misheard \
+as one SPECIFIC, similar-sounding phrase is one entry for the true phrase, \
+with the misheard phrase in "misheard_as". Only bundle that way when the \
+hypotheses agree on a genuine close call -- most of the words or their sounds \
+carry over, so the misheard phrase is a plausible thing to guess and offer \
+back. Keep entries separate when the losses are unrelated to each other (a \
+mishearing in one spot, a different piece dropped elsewhere). When \
+"unintelligible" is true, give one bundled entry naming everything unclear.
+
+Examples:
+
+COMMAND: turn up the brightness
+HYP 1: turn up the brightness
+HYP 2: turn up the brigtness
+HYP 3: turn up the brigthness
+HYP 4: turn up the bright ness
+{"per_hypothesis": [{"n": 1, "lost": [], "heard_instead": ""}, \
+{"n": 2, "lost": [], "heard_instead": ""}, \
+{"n": 3, "lost": [], "heard_instead": ""}, \
+{"n": 4, "lost": [], "heard_instead": ""}], \
+"lost": [], "misheard_as": "", "unintelligible": false, "kind": "answer"}
+   -- four different strings and not one disagreement about content: \
+misspellings and spacing are never losses. Never let the hypotheses merely \
+BEING different stand in for a lost piece
+
+COMMAND: put meeting with pawel for tomorrow ten am
+HYP 1: meeting with powell for tomorrow at 10 a m
+HYP 2: meeting with powell for tomorrow at ten a m
+HYP 3: meeting with powell for tomorrow at 10 a m
+HYP 4: meeting with powell for tomorrow at ten a m
+{"per_hypothesis": [{"n": 1, "lost": [], "heard_instead": ""}, \
+{"n": 2, "lost": [], "heard_instead": ""}, \
+{"n": 3, "lost": [], "heard_instead": ""}, \
+{"n": 4, "lost": [], "heard_instead": ""}], \
+"lost": [], "misheard_as": "", "unintelligible": false, "kind": "answer"}
+   -- "powell" is how the recognizer spells the name it heard, phonetically \
+the same, so there is nothing for the user to clarify; "put" only frames the \
+request; "ten a m" and "10 a m" are renderings of the same time
+
+COMMAND: hey olly play playlist tactics from music
+HYP 1: a r i play playlist tactics for music
+HYP 2: hey ali play playlist tactics for music
+HYP 3: are we play playlist tactics from music
+HYP 4: a really play playlist tactics for music
+{"per_hypothesis": [{"n": 1, "lost": [], "heard_instead": ""}, \
+{"n": 2, "lost": [], "heard_instead": ""}, \
+{"n": 3, "lost": [], "heard_instead": ""}, \
+{"n": 4, "lost": [], "heard_instead": ""}], \
+"lost": [], "misheard_as": "", "unintelligible": false, "kind": "answer"}
+   -- the wake word is mangled beyond recognition in three hypotheses and it \
+STILL is not a lost piece. Never list it, however garbled or absent: the \
+assistant is already listening, so nothing about the task depends on hearing \
+its own name
+
+COMMAND: what is the exchange rate of us dollar to pound sterling
+HYP 1: what is the exchange rate of us to pound
+HYP 2: what is the exchange rate of us to pound
+HYP 3: what is the exchange rate of us to pounds
+HYP 4: what is the exchange rate of us dollar to pound sterling
+{"per_hypothesis": [{"n": 1, "lost": ["dollar", "sterling"], "heard_instead": ""}, \
+{"n": 2, "lost": ["dollar", "sterling"], "heard_instead": ""}, \
+{"n": 3, "lost": ["dollar", "sterling"], "heard_instead": ""}, \
+{"n": 4, "lost": [], "heard_instead": ""}], \
+"lost": [], "misheard_as": "", "unintelligible": false, "kind": "answer"}
+   -- three hypotheses out of four dropped both currencies, and it does not \
+matter: the last one has them, so they were audible. Intersection, not a vote
+
+COMMAND: increase the brightness of the lights
+HYP 1: increase the brightness of the lights
+HYP 2: raise the brightness of the lights
+HYP 3: reduce the brightness of the lights
+HYP 4: with the brightness of the lights
+{"per_hypothesis": [{"n": 1, "lost": [], "heard_instead": ""}, \
+{"n": 2, "lost": [], "heard_instead": ""}, \
+{"n": 3, "lost": ["increase"], "heard_instead": "reduce"}, \
+{"n": 4, "lost": ["increase"], "heard_instead": "with"}], \
+"lost": [], "misheard_as": "", "unintelligible": false, "kind": "answer"}
+   -- hypothesis 3 reverses the action, which would be the worst kind of loss \
+if it were the only witness; hypothesis 1 has it, so the action was heard. \
+"raise" in hypothesis 2 is a synonym asking for the same thing, not a loss
+
+COMMAND: event reminder mona tuesday
+HYP 1: event reminder monday tuesday
+HYP 2: event reminder monday tuesday
+HYP 3: event reminder monday to sunday
+HYP 4: event reminder monday to thursday
+{"per_hypothesis": [{"n": 1, "lost": ["mona"], "heard_instead": "monday"}, \
+{"n": 2, "lost": ["mona"], "heard_instead": "monday"}, \
+{"n": 3, "lost": ["mona", "tuesday"], "heard_instead": "monday, to sunday"}, \
+{"n": 4, "lost": ["mona", "tuesday"], "heard_instead": "monday, to thursday"}], \
+"lost": ["mona"], "misheard_as": "monday", "unintelligible": false, \
+"kind": "repair"}
+   -- "tuesday" survived in the first two hypotheses, so only the name is \
+lost. Unlike "pawel" heard as "powell", "monday" is a different word -- a \
+weekday, not a spelling of that name -- and all four hypotheses agree on it, \
+so it is a specific thing worth offering back to the user
+
+COMMAND: put meeting with pawel for tomorrow ten am
+HYP 1: her meeting will be available tomorrow at ten a m
+HYP 2: her meeting will be available for tomorrow at ten a m
+HYP 3: her meeting with a well for two more at ten a m
+HYP 4: her meeting will be over for two more at ten a m
+{"per_hypothesis": [{"n": 1, "lost": ["pawel"], "heard_instead": ""}, \
+{"n": 2, "lost": ["pawel"], "heard_instead": ""}, \
+{"n": 3, "lost": ["pawel", "for tomorrow"], "heard_instead": "a well, two more"}, \
+{"n": 4, "lost": ["pawel", "for tomorrow"], "heard_instead": "two more"}], \
+"lost": ["pawel"], "misheard_as": "", "unintelligible": false, \
+"kind": "repair"}
+   -- "for tomorrow" and "ten am" survived in the first two hypotheses, so the \
+name is the only loss. Two hypotheses drop it entirely and one turns it into \
+"a well": there is no single wrong word they agree on, so nothing specific can \
+be offered back and "misheard_as" stays empty. Contrast the previous example
+
+COMMAND: take out the milk from the shopping list
+HYP 1: we got the milk for the shop in there
+HYP 2: we got the milk for the shop today
+HYP 3: you got the milk for the shop in there
+HYP 4: we caught the milk for the shop in there
+{"per_hypothesis": [{"n": 1, "lost": ["take out", "shopping list"], "heard_instead": "got, the shop in there"}, \
+{"n": 2, "lost": ["take out", "shopping list"], "heard_instead": "got, the shop today"}, \
+{"n": 3, "lost": ["take out", "shopping list"], "heard_instead": "got, the shop in there"}, \
+{"n": 4, "lost": ["take out", "shopping list"], "heard_instead": "caught, the shop in there"}], \
+"lost": ["take out", "shopping list"], "misheard_as": "", \
+"unintelligible": false, "kind": "repeat"}
+   -- "milk" got through in all four, so this is not unintelligible. But the \
+action and the list are both gone, and they are two unrelated points of \
+confusion rather than one, so no single question could recover them
+
+COMMAND: event reminder mona tuesday
+HYP 1: we went to mind our own business
+HYP 2: we went to mindo when it was snowing
+HYP 3: he went to mind the man at the door
+HYP 4: we went to minder manchester
+{"per_hypothesis": [{"n": 1, "lost": ["event reminder", "mona", "tuesday"], "heard_instead": ""}, \
+{"n": 2, "lost": ["event reminder", "mona", "tuesday"], "heard_instead": ""}, \
+{"n": 3, "lost": ["event reminder", "mona", "tuesday"], "heard_instead": ""}, \
+{"n": 4, "lost": ["event reminder", "mona", "tuesday"], "heard_instead": ""}], \
+"lost": ["event reminder mona tuesday"], "misheard_as": "", \
+"unintelligible": true, "kind": "repeat"}
+   -- the four hypotheses read as four different sentences, none of them the \
+command; nothing survived to anchor a question on, so one bundled entry names \
+the whole thing"""
+
+
+# `hypotheses` is the caller-built block, one "HYP <i>: <text>" line per
+# hypothesis -- the count is left to the caller so ASR_N_BEST can change
+# without touching the prompt.
+BEAM_LOSS_USER = "COMMAND: {sentence}\n{hypotheses}"
+
+
+# ---
 # --tree-label: one target per probe
 # ---
 
