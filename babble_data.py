@@ -984,6 +984,7 @@ def lost_too_much(lost, sentence):
     anc = set(_normalize_text(lost).split()) - PIECE_STOPWORDS
     return bool(cmd) and len(anc & cmd) / len(cmd) >= LOST_MAX_PCT
 
+
 # dropped before intersecting two free-text quotes of the same lost piece
 PIECE_STOPWORDS = {
     "a",
@@ -1496,6 +1497,10 @@ You get the user's real COMMAND, the HEARD text the device caught, and the \
 LOST-PIECE that did not get through. If MISHEARD-AS is given, the device \
 heard that similar-sounding wrong word in place of the lost piece.
 
+HEARD may hold several alternative transcriptions of the same audio (HYP 1, \
+HYP 2, ...), best guess first -- they are competing readings of one recording, \
+not separate things the user said. Ground your question in what they agree on.
+
 Write ONE short natural question (under 20 words) recovering ONLY that piece. \
 Test: if the user replied with just the missing words, the command would be \
 complete.
@@ -1515,10 +1520,11 @@ Do NOT default to starting with "Sorry".
 Return ONLY JSON: {"repair": "..."}"""
 
 
+# `heard` is one quoted transcript on the single-pass tracks, and a "HYP <i>:"
+# block on --beam-label; the writer is told in the system prompt how to read
+# either shape.
 REPAIR_TARGET_USER = (
-    'COMMAND:\n"{sentence}"\n\n'
-    'HEARD:\n"{transcript}"\n'
-    'LOST-PIECE: "{anchor}"{swap_note}'
+    'COMMAND:\n"{sentence}"\n\n' "HEARD:\n{heard}\n" 'LOST-PIECE: "{anchor}"{swap_note}'
 )
 
 
@@ -1528,8 +1534,7 @@ a targeted question to be possible.
 
 Write ONE short natural request (under 15 words) asking the user to say the \
 whole thing again.
-- Do NOT reference, guess, or hint at ANY content from the real command or \
-from the garbled text -- the assistant cannot trust any of it.
+-- the assistant did not catch the user command
 - Mentioning the noise is fine and helps explain why.
 - Sound like natural speech and vary the phrasing ("It's really loud here -- \
 what was that?", "I couldn't catch that over the noise, could you say it \
@@ -1538,27 +1543,39 @@ again?"). Do NOT default to starting with "Sorry".
 Return ONLY JSON: {"repeat": "..."}"""
 
 
-REPEAT_TARGET_USER = 'GARBLED:\n"{transcript}"'
+REPEAT_TARGET_USER = "Write the request."
 
 
 def write_target(sentence, kind, probe):
-    """One SFT target for one already-labeled tree-track probe."""
+    """One SFT target for one already-labeled tree- or beam-track probe.
+
+    Deliberately a second call, after the labeler: the label wants
+    temperature 0 so a rerun reproduces the dataset while the reply wants 0.7
+    so a few thousand targets don't all open the same way, and a target retry
+    here must not re-roll the row's kind.
+    """
     if kind == "answer":
         system = ANSWER_TARGET_SYSTEM
         user = ANSWER_TARGET_USER.format(sentence=sentence)
     elif kind == "repair":
+        hyps = probe.get("hypotheses") or []
         system = REPAIR_TARGET_SYSTEM
         user = REPAIR_TARGET_USER.format(
             sentence=sentence,
-            transcript=probe["transcript"],
+            heard=(
+                "\n".join(f'HYP {i}: "{h}"' for i, h in enumerate(hyps, 1))
+                if len(hyps) > 1
+                else f'"{probe["transcript"]}"'
+            ),
             anchor=probe["anchor"],
             swap_note=(
                 f'\nMISHEARD-AS: "{probe["swapped"][0]}"' if probe["swapped"] else ""
             ),
         )
     else:
+        # nothing from the probe: a repeat reply is content-free by definition
         system = REPEAT_TARGET_SYSTEM
-        user = REPEAT_TARGET_USER.format(transcript=probe["transcript"])
+        user = REPEAT_TARGET_USER
 
     for attempt in range(TARGET_RETRIES):
         obj = gpt_json(system, user, temperature=0.7, max_tokens=TARGET_MAX_TOKENS)
@@ -1876,8 +1893,8 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
                 "targets": {k: triplet[k]["target"] for k in KINDS},
             }
 
-        if TRACK == "tree":
-            # one call per probe: the table anchored the repair question on
+        if TRACK in ("tree", "beam"):
+            # one call per probe: the label anchored the repair question on
             # that probe's own losses, not the utterance's
             targets = {k: write_target(sentence, k, triplet[k]) for k in KINDS}
             if not all(targets.values()):
@@ -1985,7 +2002,7 @@ def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
         if TRACK == "heard-reply":
             return {"probe": probe, "target": probe["target"]}
 
-        if TRACK == "tree":
+        if TRACK in ("tree", "beam"):
             target = write_target(sentence, "answer", probe)
             return {"probe": probe, "target": target} if target else {"skip": "targets"}
 
