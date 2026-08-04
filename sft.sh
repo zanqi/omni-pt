@@ -23,6 +23,8 @@
 #                         # adapters named <model>-bab-hr-adapter-<n>x
 #   TREE=1 ./sft.sh       # decision-table track — tree-v1 datasets, plain
 #                         # TASK_PROMPT, adapters <model>-bab-tree-adapter-<n>x
+#   BEAM=1 ./sft.sh       # beam-consensus track — beam-v1 datasets, plain
+#                         # TASK_PROMPT, adapters <model>-bab-beam-adapter-<n>x
 #
 # One GPU, sequential — run it under salloc/srun or wrap it in an sbatch job.
 source ~/.bashrc
@@ -42,6 +44,12 @@ elif [[ -n "${TREE:-}" ]]; then
     ADAPTER_KIND="bab-tree-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-tree-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-tree-v1"
+elif [[ -n "${BEAM:-}" ]]; then
+    # beam rows carry the same audio + target columns, so training is identical
+    # to the tree track's: plain prompt, no extra flag
+    ADAPTER_KIND="bab-beam-adapter"
+    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1"
+    DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-beam-v1"
 else
     ADAPTER_KIND="bab-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-v4"

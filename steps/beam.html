@@ -134,8 +134,28 @@
 <p>Three consequences, all folded into the steps below:</p>
 <ul>
   <li><strong>Beams do not collapse</strong>, so plain beam search stands; diverse beam search is not needed.</li>
-  <li><strong>The &ge;2-hypothesis fallback is dead.</strong> At 78% / 66% against an H1 baseline of 77% / 63% it is within noise of doing nothing &mdash; recovered pieces are recovered by exactly one beam, never two. The <code>&ge;1</code> rule in STEP 2 is the only version with an effect, so there is no intermediate setting to retreat to.</li>
+  <li><strong>The &ge;2-hypothesis fallback is dead at this <code>n_best</code>, but not in general.</strong> At <code>n_best=4</code> it scores 77% / 65% against an H1 baseline of 77% / 63% &mdash; recovered pieces come from exactly one beam, so requiring two is the same as trusting the top beam. The <code>n_best</code> sweep (next card) shows it becomes a real option at <code>n_best</code>&nbsp;&ge;&nbsp;6, where it reaches 85% on the repair band.</li>
   <li><strong><code>pairWER</code> is a weak degradation signal</strong> &mdash; 0.26 even on the answer band, rising only to 0.32. Beam disagreement has a noisy floor; recall (86 &rarr; 77 &rarr; 63%) is what actually tracks SNR. STEP 4's <code>unintelligible</code> test therefore has to rest on the command-relative clause, not on beams disagreeing with each other.</li>
+</ul>
+</div>
+
+<div class="card">
+<strong><code>n_best</code> sweep &mdash; <code>lost_recall.py</code>, one decode per audio at <code>num_beams=8</code> scored at every prefix length</strong>
+<p class="muted">Beam search is deterministic and independent of <code>num_return_sequences</code>, so the top <em>k</em> hypotheses are a prefix of the top 8 and the whole sweep costs one run. <code>n_best=1</code> is the current single-transcript track. Full records in <code>results/lost_recall.jsonl</code>, hypotheses in <code>logs/lost_recall.log</code>.</p>
+<table>
+<tr><th><code>n_best</code></th><th>gain: answer</th><th>gain: repair</th><th>gain: repeat</th><th>rows w/ recovery (repair / repeat)</th><th>&ge;2-hyp on repair</th></tr>
+<tr><td>1</td><td>+0%</td><td>+0%</td><td>+0%</td><td>0% / 0%</td><td>&mdash;</td></tr>
+<tr><td>2</td><td>+4%</td><td>+5%</td><td>+4%</td><td>18% / 15%</td><td>68%</td></tr>
+<tr><td>3</td><td>+5%</td><td>+7%</td><td>+6%</td><td>28% / 25%</td><td>75%</td></tr>
+<tr><td><strong>4</strong></td><td>+5%</td><td><strong>+9%</strong></td><td>+8%</td><td><strong>32% / 30%</strong></td><td>77%</td></tr>
+<tr><td>5</td><td>+6%</td><td>+9%</td><td>+11%</td><td>32% / 35%</td><td>82%</td></tr>
+<tr><td>6</td><td>+7%</td><td>+9%</td><td>+11%</td><td>32% / 38%</td><td class="good">85%</td></tr>
+<tr><td>8</td><td>+9%</td><td>+10%</td><td>+12%</td><td>35% / 38%</td><td class="good">85%</td></tr>
+</table>
+<ul>
+  <li><strong><code>ASR_N_BEST = 4</code> stands.</strong> The repair band &mdash; the one the anchor is drawn from &mdash; plateaus there at +9% and 32% of rows, gaining 1pp by <code>n_best=8</code>. Everything above 4 accrues mostly to <code>repeat</code>, the bucket where extra recovery matters least, and each added hypothesis is another <code>per_hypothesis</code> entry for the labeler to keep straight.</li>
+  <li><strong>GPU cost is set by <code>num_beams</code>, not <code>n_best</code></strong> &mdash; the beams are all computed either way; <code>n_best</code> only decides how many are returned. Raising it costs labeler prompt tokens, not decode time. So the choice of 4 is about labeler reliability, not compute.</li>
+  <li><strong>H1 recall is flat at 86 / 77 / 63% across the whole sweep</strong>, which is the check that prefix-scoring is valid.</li>
 </ul>
 </div>
 
@@ -375,11 +395,11 @@ python babble_eval_qwen.py --judge-mode per-kind \
 
 # adapter
 python sft_qwen.py --ds-id keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1 \
-    --hub-id keylazy/Qwen2.5-Omni-3B-bab-beam-sft --push
+    --run-name Qwen2.5-Omni-3B-bab-beam-sft
 python babble_eval_qwen.py --judge-mode per-kind \
     --dataset keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1 \
     --model-path Qwen/Qwen2.5-Omni-3B \
-    --adapter-path ./Qwen2.5-Omni-3B-bab-beam-sft --judge-base-url "$VLLM"</code></pre>
+    --adapter-path ./checkpoints/Qwen2.5-Omni-3B-bab-beam-sft --judge-base-url "$VLLM"</code></pre>
 
 <h2>Ablations this design buys for free</h2>
 <p>Both flags are independent of the data track, so each isolates one variable against runs you already have:</p>
@@ -401,7 +421,7 @@ python babble_eval_qwen.py --judge-mode per-kind \
 
 <h2>Risks</h2>
 <p class="muted"><del>Beams collapse.</del> Retired &mdash; measured at 3.7&ndash;3.8 unique of 4 in step&nbsp;1.</p>
-<div class="risk"><strong>The intersection rule is too permissive.</strong> One lucky beam clears a piece the user genuinely could not be understood on, so <code>answer</code> rows fill with damaged audio and the model learns to over-answer. Step&nbsp;1 partly bounds this &mdash; <code>any-hyp</code> recall is 85% / 71% on the repair and repeat bands, nowhere near saturation &mdash; but it measures word recovery, not whether the recovered word was <em>audible</em> or merely a lucky LM prior. <span class="bad">There is no graceful mitigation:</span> the &ge;2-hypothesis variant is within noise of the single-transcript baseline, so tightening the rule reverts the track rather than adjusting it. If step&nbsp;6 shows <code>answer</code> rows swallowing damaged audio, the lever is <code>ASR_N_BEST</code> (4 &rarr; 2), not the intersection threshold.</div>
+<div class="risk"><strong>The intersection rule is too permissive.</strong> One lucky beam clears a piece the user genuinely could not be understood on, so <code>answer</code> rows fill with damaged audio and the model learns to over-answer. Step&nbsp;1 partly bounds this &mdash; <code>any-hyp</code> recall is 86% / 71% on the repair and repeat bands, nowhere near saturation &mdash; but it measures word recovery, not whether the recovered word was <em>audible</em> or merely a lucky LM prior. If step&nbsp;6 shows this happening, the mitigation is <code>n_best=6</code> with the <code>&ge;2</code> rule, per the sweep below &mdash; not a lower <code>ASR_N_BEST</code>.</div>
 <div class="risk"><strong>Dropping the response pass loses a real witness.</strong> The tree track's evidence was that a reply sometimes proves a piece got through when the ASR mangled it. Beam consensus is a different way to catch the same case, and it should be strictly better at it &mdash; but if answer-row recall drops sharply versus the tree dataset, that is the cause, and the fix is to re-add the response pass as a tiebreaker only on <code>repair</code>-labeled probes.</div>
 <div class="risk"><strong>Two rubric families to maintain.</strong> <code>prompts.py</code> would carry the type judge, the few-shot type judge, and three per-kind judges. If the per-kind judges win, delete <code>RESPONSE_TYPE_FEWSHOT_SYSTEM</code> rather than carrying three.</div>
 

@@ -132,13 +132,13 @@ export OPENAI_API_KEY=...                 # required by data-builder scripts and
 python slurp_sft_data_qwen.py             # EAR (word-masking) track
 python babble_data.py                     # babble (background-noise) track
 
-# 2. LoRA SFT
-python sft_qwen.py --push                 # full run, pushes adapter to --hub-id
+# 2. LoRA SFT -- adapter lands in checkpoints/<run-name>, also pushed to keylazy/<run-name>
+python sft_qwen.py --run-name Qwen2.5-Omni-3B-bab-sft
 
 # 3. evaluate
 python slurp_ear_eval_qwen.py --num-rows 100
 python babble_eval_qwen.py --judge-base-url openai --judge-model gpt-4o
-python babble_eval_qwen.py --model-path Qwen/Qwen2.5-Omni-3B --adapter-path ./Qwen2.5-Omni-3B-bab-sft \
+python babble_eval_qwen.py --model-path Qwen/Qwen2.5-Omni-3B --adapter-path ./checkpoints/Qwen2.5-Omni-3B-bab-sft \
     --judge-base-url openai --judge-model gpt-4o
 ```
 

@@ -16,6 +16,8 @@ source ~/.bashrc
 #                            # labeler, disjoint SNR bands) -> ...-hr-v1 ids
 #   TREE=1 ./babble_data.sh  # the decision-table track (same two probe passes,
 #                            # labeled independently) -> ...-tree-v1 ids
+#   BEAM=1 ./babble_data.sh  # the beam-consensus track (one N-best ASR pass, no
+#                            # task-response pass) -> ...-beam-v1 ids
 set -eo pipefail
 
 WHICH="${1:-both}"
@@ -27,6 +29,10 @@ elif [[ -n "${TREE:-}" ]]; then
     TRACK_FLAG="--tree-label"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-tree-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-tree-v1"
+elif [[ -n "${BEAM:-}" ]]; then
+    TRACK_FLAG="--beam-label"
+    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1"
+    DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-beam-v1"
 else
     TRACK_FLAG=""
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-v3"

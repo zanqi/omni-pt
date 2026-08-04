@@ -23,6 +23,9 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from util import QWEN25_SYSTEM_PROMPT, detect_model_family
 from prompts import task_prompt
 
+# every trained adapter lands under here, gitignored as one directory
+CHECKPOINT_DIR = "checkpoints"
+
 AUDIO_SAMPLING_RATE = 16000
 MAX_AUDIO_SECONDS = 30
 
@@ -325,7 +328,11 @@ def main():
         help="Names both the output dir and the hub repo. "
         "Defaults to <omni-path basename>-bab-sft.",
     )
-    ap.add_argument("--out", default=None, help="Overrides the ./<run-name> output dir.")
+    ap.add_argument(
+        "--out",
+        default=None,
+        help=f"Overrides the {CHECKPOINT_DIR}/<run-name> output dir.",
+    )
     args = ap.parse_args()
 
     family = detect_model_family(args.omni_path)
@@ -337,7 +344,7 @@ def main():
         f"{model_name}-bab-hr-sft" if args.heard_reply else f"{model_name}-bab-sft"
     )
     hub_id = f"keylazy/{run_name}"
-    out = args.out or f"./{run_name}"
+    out = args.out or f"{CHECKPOINT_DIR}/{run_name}"
 
     system_prompt = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
 

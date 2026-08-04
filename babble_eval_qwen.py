@@ -30,6 +30,9 @@ from datasets import load_dataset, Audio
 from openai import OpenAI
 from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
 from prompts import (
+    ANSWER_JUDGE_SYSTEM,
+    REPAIR_JUDGE_SYSTEM,
+    REPEAT_JUDGE_SYSTEM,
     RESPONSE_TYPE_FEWSHOT_SYSTEM,
     RESPONSE_TYPE_SYSTEM,
     split_heard_reply,
@@ -61,6 +64,17 @@ SCORE_MATRICES = {
         "repeat": {"answer": 1.0, "repair": 0.0, "repeat": 1.0, "bad": 0.0},
     },
 }
+
+# --judge-mode per-kind: the row's label picks the rubric and the judge returns
+# the score itself, so there is no type to convert and no cell that can hand a
+# repair row 1.0 for a confident answer.
+JUDGE_BY_KIND = {
+    "answer": ANSWER_JUDGE_SYSTEM,
+    "repair": REPAIR_JUDGE_SYSTEM,
+    "repeat": REPEAT_JUDGE_SYSTEM,
+}
+VALID_SCORES = (0.0, 0.5, 1.0)
+PARSE_FAIL_REASON = "Error parsing judge output"
 
 
 def get_audio(field):
@@ -140,7 +154,14 @@ def make_judge(
     judge_model: str,
     base_url: str = "",
     max_tokens: int = 4096,
+    per_kind: bool = False,
 ):
+    """-> _judge(system, user) -> (judged type, reason).
+
+    Under per_kind the rubric emits the score directly, so the first element is
+    a float from VALID_SCORES instead of a type name. Either way an unparseable
+    reply scores 0 and says so in the reason, which the caller counts.
+    """
     is_openai = base_url in (None, "", "openai")
     if is_openai:
         client = OpenAI()
@@ -182,12 +203,17 @@ def make_judge(
 
         try:
             data = json.loads(text)
-            jtype = str(data.get("type", "bad")).strip().lower()
-            if jtype in JUDGED_TYPES:
-                return jtype, data.get("reason")
-        except (json.JSONDecodeError, TypeError, ValueError):
+            if per_kind:
+                score = float(data["score"])
+                if score in VALID_SCORES:
+                    return score, data.get("reason")
+            else:
+                jtype = str(data.get("type", "bad")).strip().lower()
+                if jtype in JUDGED_TYPES:
+                    return jtype, data.get("reason")
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             pass
-        return "bad", "Error parsing judge output"
+        return (0.0 if per_kind else "bad"), PARSE_FAIL_REASON
 
     return _judge
 
@@ -255,6 +281,17 @@ def main():
         "under 'tree' measures the cell change on its own.",
     )
     ap.add_argument(
+        "--judge-mode",
+        default="type",
+        choices=["type", "per-kind"],
+        help="'type' classifies the reply into one of four types and converts "
+        "it with --score-matrix. 'per-kind' picks a rubric from the row's own "
+        "label and has it score directly -- the repair rubric is told which "
+        "piece was lost, and a confident answer on a repair row scores 0 "
+        "instead of 1.0, so numbers are NOT comparable with 'type' runs. "
+        "Independent of the data track, so it can be ablated on any dataset.",
+    )
+    ap.add_argument(
         "--fewshot-judge",
         action="store_true",
         help="Judge with RESPONSE_TYPE_FEWSHOT_SYSTEM instead of the rule "
@@ -277,7 +314,8 @@ def main():
     # the default name is keyed only on the model/adapter, so fold the track in
     # -- otherwise an hr run silently overwrites the baseline result file
     # eval.ipynb reads
-    tag = "hr" if args.heard_reply else "v2"
+    per_kind = args.judge_mode == "per-kind"
+    tag = "hr" if args.heard_reply else "beam" if per_kind else "v2"
     out_path = args.out or f"results/bab_results_{model_name}_{tag}.jsonl"
     judge_system = (
         RESPONSE_TYPE_FEWSHOT_SYSTEM if args.fewshot_judge else RESPONSE_TYPE_SYSTEM
@@ -285,8 +323,8 @@ def main():
     score_matrix = SCORE_MATRICES[args.score_matrix]
     print(
         f"prompt: {'heard-reply' if args.heard_reply else 'plain'} | "
-        f"judge: {'few-shot' if args.fewshot_judge else 'rules'} | "
-        f"scores: {args.score_matrix}"
+        f"judge: {'per-kind' if per_kind else 'few-shot' if args.fewshot_judge else 'rules'} | "
+        f"scores: {'direct' if per_kind else args.score_matrix}"
     )
 
     ds = load_dataset(args.dataset, split=args.split)
@@ -302,11 +340,13 @@ def main():
         args.judge_model,
         base_url=args.judge_base_url,
         max_tokens=args.judge_max_tokens,
+        per_kind=per_kind,
     )
 
     scores = {"answer": 0.0, "repair": 0.0, "repeat": 0.0}
     counts = {"answer": 0, "repair": 0, "repeat": 0}
-    confusion = Counter() # (target kind, judge type) -> n
+    confusion = Counter()  # (target kind, judge type) -> n; type mode only
+    hist = Counter()  # "<kind>@<score>" -> n; per-kind mode only
     metric_name = {"answer": "C", "repair": "R", "repeat": "F"}
 
     def imap_ordered(items, work, workers):
@@ -350,21 +390,39 @@ def main():
         if args.heard_reply:
             heard, reply = split_heard_reply(resp)
 
-        user = (
-            f'Original Spoken Command: "{row["sentence"]}"\n'
-            f'Model Response: "{reply}"\n'
-        )
-        judged_type, reason = judge_fn(judge_system, user)
+        if per_kind:
+            # the row's label is the ground truth, so the repair rubric gets
+            # the piece it says was lost -- the type classifier had no slot for
+            # it. The other two kinds carry no such information: on an answer
+            # row nothing was lost, and on a repeat row essentially everything
+            # was.
+            user = f'Original Spoken Command: "{row["sentence"]}"\n'
+            if kind == "repair":
+                user += f"Lost Piece: {_fmt_lost(row['lost'])}\n"
+                if row.get("swapped"):
+                    user += f'Misheard As: "{row["swapped"][0]}"\n'
+            user += f'Model Response: "{reply}"\n'
+            score, reason = judge_fn(JUDGE_BY_KIND[kind], user)
+            judged_type = ""
+        else:
+            user = (
+                f'Original Spoken Command: "{row["sentence"]}"\n'
+                f'Model Response: "{reply}"\n'
+            )
+            judged_type, reason = judge_fn(judge_system, user)
+            score = score_matrix[kind][judged_type]
+
         return {
             "resp": resp,
             "heard": heard,
             "reply": reply,
             "judged_type": judged_type,
             "reason": reason,
-            "score": score_matrix[kind][judged_type],
+            "score": score,
         }
 
     parse_failures = 0
+    judge_failures = 0
     with open(out_path, "w", encoding="utf-8") as fout:
         for i, (row, result) in enumerate(imap_ordered(ds, process_row, ROW_WORKERS)):
             kind = row["kind"]
@@ -380,7 +438,12 @@ def main():
 
             scores[kind] += score
             counts[kind] += 1
-            confusion[(kind, judged_type)] += 1
+            if per_kind:
+                hist[f"{kind}@{score:g}"] += 1
+            else:
+                confusion[(kind, judged_type)] += 1
+            if reason == PARSE_FAIL_REASON:
+                judge_failures += 1
             if args.heard_reply and not result["heard"]:
                 parse_failures += 1
 
@@ -406,8 +469,9 @@ def main():
 
             print(
                 f"[{i+1}/{len(ds)}] id={row['id']} slurp_id={row['slurp_id']} "
-                f"kind={kind} snr={row['snr_db']} judged={judged_type} "
-                f"{metric_name[kind]}={score}"
+                f"kind={kind} snr={row['snr_db']} "
+                + ("" if per_kind else f"judged={judged_type} ")
+                + f"{metric_name[kind]}={score}"
             )
             print(f"    CMD : {sentence}")
             print(f"    ASR : {asr_transcript}")
@@ -438,8 +502,10 @@ def main():
                     "judge_model": args.judge_model,
                     "heard_reply": args.heard_reply,
                     "fewshot_judge": args.fewshot_judge,
+                    "judge_mode": args.judge_mode,
                     "score_matrix": args.score_matrix,
                     "heard_parse_failures": parse_failures,
+                    "judge_parse_failures": judge_failures,
                     "answer_rows": counts["answer"],
                     "repair_rows": counts["repair"],
                     "repeat_rows": counts["repeat"],
@@ -447,9 +513,13 @@ def main():
                     "R": R,
                     "F": F,
                     "EAR": EAR,
+                    # per-kind mode has no types left to confuse, so it reports
+                    # a score histogram instead -- but the key stays present
+                    # and empty, since results/viz.ipynb indexes it directly
                     "confusion": {
                         f"{k}->{t}": n for (k, t), n in sorted(confusion.items())
                     },
+                    "score_hist": dict(sorted(hist.items())),
                 },
                 ensure_ascii=False,
             )
@@ -475,10 +545,18 @@ def main():
             f"heard-parse failures: {parse_failures}/{sum(counts.values())} "
             "(judged on raw output)"
         )
-    print("\nconfusion (target kind -> judged type):")
-    for k in ("answer", "repair", "repeat"):
-        cells = " ".join(f"{t}:{confusion[(k, t)]:3d}" for t in JUDGED_TYPES)
-        print(f"  {k:8s} {cells}")
+    if judge_failures:
+        print(f"judge parse failures: {judge_failures}/{sum(counts.values())} (scored 0)")
+    if per_kind:
+        print("\nscores per kind:")
+        for k in ("answer", "repair", "repeat"):
+            cells = " ".join(f"{s:g}:{hist[f'{k}@{s:g}']:3d}" for s in VALID_SCORES)
+            print(f"  {k:8s} {cells}")
+    else:
+        print("\nconfusion (target kind -> judged type):")
+        for k in ("answer", "repair", "repeat"):
+            cells = " ".join(f"{t}:{confusion[(k, t)]:3d}" for t in JUDGED_TYPES)
+            print(f"  {k:8s} {cells}")
     print("======")
     print(f"Per-sample results + summary written to {out_path}")
 

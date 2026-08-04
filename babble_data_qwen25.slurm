@@ -23,6 +23,7 @@
 # and the conda activate live in babble_data.sh, so they stay in one place.
 #
 #   TREE=1 N_EXTRA_ANS=1000 sbatch babble_data_qwen25.slurm
+#   BEAM=1 sbatch babble_data_qwen25.slurm
 #   HR=1 sbatch babble_data_qwen25.slurm
 #   DS_QWEN25=me/my-ds sbatch babble_data_qwen25.slurm
 #   sbatch babble_data_qwen25.slurm            # default two-pass track

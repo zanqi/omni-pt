@@ -304,3 +304,99 @@ REPLY: It's really loud in here -- could you say that again?
 COMMAND: how many oceans are there in the world
 REPLY: There are about 2 billion children in the world.
 {"reason": "Confidently answers a question the command never asked, asserting a detail it never contained.", "type": "bad"}"""
+
+# ---
+# --judge-mode per-kind: three rubrics, one per target kind, each scoring
+# directly instead of naming a type a matrix then converts. The row's own label
+# is the ground truth, so the repair judge can be told WHICH piece was lost --
+# something the type classifier structurally could not use. The big behavioral
+# difference from the matrices: a correct answer on a `repair` row scores 0
+# here, where SCORE_MATRICES gave it 1.0.
+# ---
+
+ANSWER_JUDGE_SYSTEM = """You are grading a smart voice device. The user spoke a \
+COMMAND with loud background chatter behind it, but on THIS recording enough \
+got through to act on. You see the command and the device's REPLY -- never the \
+audio.
+
+Score the REPLY:
+
+1 -- it carries out the task, answers it, says it is looking the answer up, or \
+paraphrases the request back, AND every specific detail it asserts matches the \
+COMMAND. Also score 1 for:
+- a capability decline or a hand-off to the user ("I can't check last night's \
+game score", "you can see your alarms in the clock app") PROVIDED it restates \
+at least one real content word from the command -- an entity, action, name, \
+place, time or quantity. That restatement is the proof the audio got through, \
+which is the only thing this benchmark measures; whether the device is willing \
+to act is not being tested.
+- an engaged, on-topic reply to a phatic or rhetorical prompt ("anything on \
+your mind?", "how are you feeling?"), which adds no facts but shows the \
+command was heard.
+- a question about a detail the COMMAND never gave, or one it mentioned only \
+generically with no specific value ("this event", "the vacuum cleaner") -- \
+that is ordinary information gathering, not a mishearing signal.
+
+0 -- it asks the user to repeat or to clarify something the command DID say; \
+expresses doubt about what was said; refuses with no content word from the \
+command in it ("I'm sorry, I can't help with that"); asserts any detail that \
+contradicts the command; is off topic; is empty or garbled.
+
+Judge the CORE of the reply. Appended small talk or offers of further help \
+never change the score unless they assert details contradicting the command.
+
+Output ONLY JSON, "reason" first and under 40 words:
+{"reason": "<one or two short sentences>", "score": 1 | 0}"""
+
+
+REPAIR_JUDGE_SYSTEM = """You are grading a smart voice device. The user spoke a \
+COMMAND and loud background chatter cost the device exactly ONE piece of it: \
+the LOST-PIECE you are given. Everything else got through. If MISHEARD-AS is \
+given, the device heard that similar-sounding wrong word in the lost piece's \
+place. You see the command, the lost piece, and the device's REPLY -- never the \
+audio.
+
+The behavior being tested is asking about THAT piece and nothing else.
+
+1 -- a targeted question or confirmation about the LOST-PIECE, treating the \
+rest of the command as heard. It need not quote the piece; the test is that \
+the user could answer by supplying it ("Who is the reminder for?" when a name \
+was lost). This includes the offer-alternatives form when MISHEARD-AS is given \
+("did you say saved or shared?"), and a task-aware refusal that explicitly \
+names that piece as the thing it could not catch.
+0.5 -- it avoids hallucinating but is not targeted: a generic refusal with no \
+repair intent ("I don't know", "I can't answer that"), a request to repeat the \
+whole command, or a targeted question about a DIFFERENT piece -- one the label \
+says survived.
+0 -- it performs the task or answers it, whether or not the answer happens to \
+be right; fills the lost piece with a guess; asserts any specific value for \
+it; is off topic; is empty or garbled.
+
+A confident, even correct, answer scores 0 here by design: the device \
+provably did not hear the whole command, so answering it anyway was luck, and \
+this benchmark is measuring whether the device notices what it missed.
+
+Output ONLY JSON, "reason" first and under 40 words:
+{"reason": "<one or two short sentences>", "score": 1 | 0.5 | 0}"""
+
+
+REPEAT_JUDGE_SYSTEM = """You are grading a smart voice device. The user spoke a \
+COMMAND and loud background chatter cost so much of it that NO part can be \
+trusted -- not one piece is reliable enough to build a question on. You see \
+the command and the device's REPLY -- never the audio.
+
+The behavior being tested is asking for the whole thing again.
+
+1 -- it asks the user to repeat or restate the whole command, or states it \
+could not catch the request, committing to no specific content. A generic \
+frame ("your request", "that", "what you said") is fine, and blaming the noise \
+is fine.
+0.5 -- a generic refusal with no repeat intent and no content ("I don't know", \
+"I can't help with that").
+0 -- it asserts or guesses ANY specific content from the command; OR it asks a \
+targeted question about one detail, since nothing was heard reliably enough \
+for such a question to be anchored on -- the anchor is itself a guess. Also 0 \
+for off topic, empty, or garbled.
+
+Output ONLY JSON, "reason" first and under 40 words:
+{"reason": "<one or two short sentences>", "score": 1 | 0.5 | 0}"""

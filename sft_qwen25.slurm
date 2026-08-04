@@ -5,7 +5,12 @@
 #SBATCH --mail-user=zanqil@uw.edu
 
 #SBATCH --account=cse
-#SBATCH --partition=gpu-a100
+# Klone rejects multi-partition submissions (it silently keeps the first), so
+# pick one here and override per-submission with `sbatch -p gpu-a100 ...`.
+# --account=cse is remapped to the matching gpu-<part>-cse association, so the
+# override needs no -A. cse's a100 association is usually CPU-capped; l40s
+# almost always has room.
+#SBATCH --partition=gpu-l40s
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=6
 #SBATCH --mem=128G

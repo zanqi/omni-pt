@@ -15,12 +15,23 @@
 #   MULTS="4" ./eval.sh qwen3     # base + the 4x adapter only
 #   MULTS= ./eval.sh qwen25       # base + the single <model>-bab[-<track>]-sft
 #                                 # adapter trained by `MULTS= ./sft.sh`
-#   ADAPTER_PREFIX=keylazy ./eval.sh   # eval the pushed hub adapters, not ./<dir>
+#   ADAPTER_PREFIX=keylazy ./eval.sh   # eval the pushed hub adapters, not checkpoints/
 #
 # Tracks (each writes its own TAG so nothing overwrites a prior run's file):
 #   HR=1   ./eval.sh   hr-v1 data, TASK_PROMPT_HR, few-shot judge, hr adapters
 #   TREE=1 ./eval.sh   tree-v1 data, plain prompt, rules judge, tree adapters,
 #                      and the tree score matrix (repeat-row repair = 0)
+#   BEAM=1 ./eval.sh   beam-v1 data, plain prompt, beam adapters, and the three
+#                      per-kind judges instead of the type judge + matrix. The
+#                      repair rubric sees the lost piece and scores a confident
+#                      answer 0, so R is NOT comparable with the other tracks.
+# The judge and the labels are separable, so each can be isolated by crossing a
+# track's flags with another track's dataset + adapters (ADAPTER_KIND overrides
+# the track default):
+#   BEAM=1 DS_QWEN25="$TREE_DS" ADAPTER_KIND=bab-tree-adapter TAG=tree-perkind \
+#       ./eval.sh qwen25       # the per-kind judge alone, on tree labels
+#   TREE=1 DS_QWEN25="$BEAM_DS" ADAPTER_KIND=bab-beam-adapter TAG=beam-typejudge \
+#       ./eval.sh qwen25       # beam labels alone, under the judge you trust
 #   ABL=a  ./eval.sh   baseline data/prompt/adapters, few-shot judge only —
 #                      isolates how much of any EAR movement is the judge swap
 #   ABL=b  ./eval.sh   baseline data/adapters, hr prompt + few-shot judge —
@@ -39,8 +50,13 @@ BASE_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-v4"
 BASE_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-v2"
 TREE_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-tree-v1"
 TREE_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-tree-v1"
+BEAM_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1"
+BEAM_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-beam-v1"
+# captured before the case overwrites it, so a crossed run (one track's flags
+# against another's adapters) can name the adapters explicitly
+ADAPTER_KIND_ENV="${ADAPTER_KIND:-}"
 ADAPTER_KIND="bab-adapter"
-case "${ABL:-${HR:+hr}${TREE:+tree}}" in
+case "${ABL:-${HR:+hr}${TREE:+tree}${BEAM:+beam}}" in
     hr)
         TRACK_DESC="heard-reply"
         EVAL_FLAGS="--heard-reply --fewshot-judge"
@@ -51,6 +67,11 @@ case "${ABL:-${HR:+hr}${TREE:+tree}}" in
         EVAL_FLAGS="--score-matrix tree"
         DEFAULT_QWEN25="$TREE_DS_QWEN25"; DEFAULT_QWEN3="$TREE_DS_QWEN3"
         ADAPTER_KIND="bab-tree-adapter"; DEFAULT_TAG="tree" ;;
+    beam)
+        TRACK_DESC="beam-consensus"
+        EVAL_FLAGS="--judge-mode per-kind"
+        DEFAULT_QWEN25="$BEAM_DS_QWEN25"; DEFAULT_QWEN3="$BEAM_DS_QWEN3"
+        ADAPTER_KIND="bab-beam-adapter"; DEFAULT_TAG="beam" ;;
     a)
         TRACK_DESC="ablation A (judge swap only)"
         EVAL_FLAGS="--fewshot-judge"
@@ -68,11 +89,13 @@ case "${ABL:-${HR:+hr}${TREE:+tree}}" in
         DEFAULT_TAG="v4" ;;
 esac
 
+[[ -n "$ADAPTER_KIND_ENV" ]] && ADAPTER_KIND="$ADAPTER_KIND_ENV"
 DS_QWEN25="${DS_QWEN25:-$DEFAULT_QWEN25}"
 DS_QWEN3="${DS_QWEN3:-$DEFAULT_QWEN3}"
-# Where the adapters live: "." for sft.sh's local output dirs, "keylazy" for the
-# pushed hub copies. Either way the result filename uses the adapter basename.
-ADAPTER_PREFIX="${ADAPTER_PREFIX:-.}"
+# Where the adapters live: "checkpoints" for sft.sh's local output dirs,
+# "keylazy" for the pushed hub copies. Either way the result filename uses the
+# adapter basename.
+ADAPTER_PREFIX="${ADAPTER_PREFIX:-checkpoints}"
 OUT_DIR="${OUT_DIR:-results}"
 TAG="${TAG:-$DEFAULT_TAG}"
 

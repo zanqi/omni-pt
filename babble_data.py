@@ -1,7 +1,7 @@
 """
 Build babble-noise slurp dataset for conversational-repair training.
 
-Three tracks, selected by --heard-reply / --tree-label:
+Four tracks, selected by --heard-reply / --tree-label / --beam-label:
 
 Default (two-pass): for each noisy probe the omni base model produces an ASR
 transcript and, separately, a task response. The LLM sees (original sentence,
@@ -18,6 +18,15 @@ what the reply demonstrates it heard. decide_kind() then resolves the pair of
 labels with a fixed table, which also names the one piece a repair question
 should anchor on. A clean result from EITHER pass alone means "answer";
 "repeat" needs both passes to have failed badly.
+
+--beam-label: ONE probe pass, an ASR decode with beam search returning the
+ASR_N_BEST best hypotheses for the same noisy audio. There is no task-response
+pass -- the hypotheses' disagreement replaces the reply as the second witness.
+label_beam diffs the command against each hypothesis separately and intersects
+the per-hypothesis loss lists: a key piece counts as lost only if EVERY
+hypothesis missed it, so one beam hearing it correctly proves it was audible.
+What the hypotheses put in a lost piece's place decides whether the repair
+question can offer an alternative back ("misheard_as") or has to ask openly.
 
 --heard-reply (one pass): the base model answers TASK_PROMPT_HR, which asks
 for `Heard: <what got through>` then `Reply: <the response>`, so a single
@@ -66,7 +75,7 @@ MAX_AUDIO_SECONDS = 30
 
 N_TRAIN_TRIPLETS = 1000
 N_TEST_TRIPLETS = 50
-N_TRAIN_EXTRA_ANS = 3000
+N_TRAIN_EXTRA_ANS = 1000
 
 # Classification + Target generation are served by the local vLLM judge
 # box. Its slurm job records the node it landed on in VLLM_HOST_FILE.
@@ -83,6 +92,10 @@ BABBLE_SPEAKERS = 3
 BABBLE_CLIP_MAX_SEC = 10  # trim pool clips to save memory
 
 PROBE_BATCH_SIZE = 16
+# --beam-label runs ASR_NUM_BEAMS sequences per probe against a 30s audio
+# context, so the batch has to shrink to keep the same beams-in-flight budget.
+# The dropped task-response pass buys the wall clock back.
+BEAM_PROBE_BATCH_SIZE = 8
 MAX_PROBES = 3
 ANSWER_PROBE_BATCH_SIZE = 4
 UTTERANCE_WORKERS = 4
@@ -1413,14 +1426,56 @@ the whole thing"""
 BEAM_LOSS_USER = "COMMAND: {sentence}\n{hypotheses}"
 
 
+# A consensus entry made only of these carries no task information, whatever
+# the rubric's prose says: the first smoke build returned "i", "please", "can",
+# "from" and "s" as lost pieces. Wider than PIECE_STOPWORDS, which is tuned for
+# a different job (intersecting two free-text quotes) and is shared with the
+# other tracks, so it stays as it is.
+NON_PIECE_WORDS = (
+    PIECE_STOPWORDS
+    | WAKE_WORDS
+    | {
+        "am",
+        "as",
+        "been",
+        "being",
+        "can",
+        "could",
+        "did",
+        "does",
+        "had",
+        "has",
+        "have",
+        "he",
+        "her",
+        "him",
+        "may",
+        "might",
+        "must",
+        "shall",
+        "she",
+        "should",
+        "them",
+        "they",
+        "us",
+        "was",
+        "we",
+        "were",
+        "will",
+        "would",
+    }
+)
+
+
 def label_beam(sentence, hyps):
     """(command, [hyp1..hypK]) -> label dict | None.
 
-    Kind is recomputed here rather than taken from the model, because
-    drop_wake_only can shorten the consensus list after the model has counted
-    it -- a lone wake-word entry would otherwise make an "answer" probe a
-    "repair" whose question asks the user to re-confirm the assistant's own
-    name. The model's own "kind" is therefore ignored.
+    Kind is recomputed here rather than taken from the model, because the
+    filters below can shorten the consensus list after the model has counted
+    it -- a lone wake-word or function-word entry would otherwise make an
+    "answer" probe a "repair" whose question asks the user to re-confirm the
+    assistant's own name, or pair with one real loss to file a repair as a
+    repeat. The model's own "kind" is therefore ignored.
     """
     hyps = [h for h in hyps if h and h.strip()]
     if not hyps:
@@ -1440,9 +1495,11 @@ def label_beam(sentence, hyps):
     if obj is None:
         return None
 
-    lost = drop_wake_only(
-        [str(s).strip() for s in obj.get("lost", []) if str(s).strip()]
-    )
+    lost = [
+        p
+        for p in (str(s).strip() for s in obj.get("lost", []))
+        if p and set(_normalize_text(p).split()) - NON_PIECE_WORDS
+    ]
     unintelligible = bool(obj.get("unintelligible", False))
 
     if unintelligible:
@@ -1512,10 +1569,18 @@ assistant followed everything except this one piece.
 you may ask a confirmation question offering the true word AND the misheard \
 word as alternatives ("did you say saved or shared?") -- never the true word \
 alone.
+- With NO MISHEARD-AS there is nothing to offer back, so do not try to confirm \
+a word at all: ask openly for the KIND of thing that went missing, never the \
+thing itself. LOST-PIECE "radio" -> "I got turn on the living room, but which \
+device?"; LOST-PIECE "mona" -> "Who is the reminder for?"; LOST-PIECE \
+"grubhub" -> "Which app should I order from?". Naming the lost word in this \
+case is the one way to fail this task outright.
 - Sound like natural speech, not a form. Vary the structure freely: \
 "Which...?", "How long before...?", "Who should...?", "What time...?", \
 "Where...?", or a statement plus a question ("I lost one part -- where to?"). \
-Do NOT default to starting with "Sorry".
+Do NOT default to starting with "Sorry", and when you do offer alternatives do \
+NOT always frame them as "did you say X or Y" -- "was that X, or was it Y?", "I got \
+either X or Y there -- which was it?" and a statement plus the choice all work.
 
 Return ONLY JSON: {"repair": "..."}"""
 
@@ -1528,13 +1593,16 @@ REPAIR_TARGET_USER = (
 )
 
 
+# The sys prompt said do not reference the garbeled text, but the user prompt
+# appended it. This is to force the llm to generate varying response.
 REPEAT_TARGET_SYSTEM = """You are writing the reply a smart voice assistant \
 should give when background chatter cost it too much of a spoken command for \
 a targeted question to be possible.
 
 Write ONE short natural request (under 15 words) asking the user to say the \
 whole thing again.
--- the assistant did not catch the user command
+- Do NOT reference, guess, or hint at ANY content from the real command or \
+from the garbled text -- the assistant cannot trust any of it.
 - Mentioning the noise is fine and helps explain why.
 - Sound like natural speech and vary the phrasing ("It's really loud here -- \
 what was that?", "I couldn't catch that over the noise, could you say it \
@@ -1543,7 +1611,7 @@ again?"). Do NOT default to starting with "Sorry".
 Return ONLY JSON: {"repeat": "..."}"""
 
 
-REPEAT_TARGET_USER = "Write the request."
+REPEAT_TARGET_USER = 'GARBLED:\n"{transcript}"'
 
 
 def write_target(sentence, kind, probe):
@@ -1577,14 +1645,29 @@ def write_target(sentence, kind, probe):
         system = REPEAT_TARGET_SYSTEM
         user = REPEAT_TARGET_USER
 
+    # a repair question may name the lost piece ONLY as one of two
+    # alternatives against what was misheard in its place; with no MISHEARD-AS
+    # to offer, the writer sometimes reaches for that form anyway and simply
+    # says the word ("Did you say recent emails or just any emails?"), which
+    # trains the model to speak what it claims it could not hear
+    leakable = (
+        set(_normalize_text(probe["anchor"]).split()) - NON_PIECE_WORDS
+        if kind == "repair" and not probe["swapped"]
+        else set()
+    )
+
     for attempt in range(TARGET_RETRIES):
         obj = gpt_json(system, user, temperature=0.7, max_tokens=TARGET_MAX_TOKENS)
         if obj is None:
             time.sleep(2**attempt)
             continue
         target = str(obj.get(kind, "")).strip()
-        if target:
-            return target
+        if not target:
+            continue
+        if leakable & set(_normalize_text(target).split()):
+            skip["target-leak"] += 1
+            continue
+        return target
     return ""
 
 
@@ -1697,7 +1780,23 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
         audios, snrs = make_probe_batch(missing_slots)
 
         sysp = QWEN25_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-        if TRACK == "heard-reply":
+        # only --beam-label fills this in; the others keep one transcript
+        hyp_lists = [[] for _ in audios]
+        if TRACK == "beam":
+            with GPU_LOCK:
+                asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
+                convs = [_conv(a, asr_sysp, ASR_PROMPT) for a in audios]
+                hyp_lists = base_generate_batch(
+                    convs, ASR_MAX_NEW_TOKENS, n_best=ASR_N_BEST
+                )
+            # the top beam is what the row and the logs call the transcript
+            transcripts = [h[0] for h in hyp_lists]
+            # no task-response pass on this track: nothing reads it, so
+            # decoding it would be dead GPU time
+            responses = ["" for _ in hyp_lists]
+            with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
+                labels = list(ex.map(lambda h: label_beam(sentence, h), hyp_lists))
+        elif TRACK == "heard-reply":
             with GPU_LOCK:
                 convs = [_conv(a, sysp, task_prompt(True)) for a in audios]
                 outs = base_generate_batch(
@@ -1742,8 +1841,8 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                     )
                 )
 
-        for snr, noisy, transcript, response, label in zip(
-            snrs, audios, transcripts, responses, labels
+        for snr, noisy, transcript, response, hyps, label in zip(
+            snrs, audios, transcripts, responses, hyp_lists, labels
         ):
             if label is None:
                 continue
@@ -1765,6 +1864,13 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                     "asr_bucket": label.get("asr_bucket", ""),
                     "resp_bucket": label.get("resp_bucket", ""),
                     "anchor": label.get("anchor", ""),
+                    # beam track only: all K hypotheses (the repair target
+                    # writer grounds its question in these), the per-hypothesis
+                    # loss lists behind the consensus, and whether the
+                    # hypotheses read as some other sentence entirely
+                    "hypotheses": list(hyps),
+                    "beam_losses": label.get("per_hypothesis", []),
+                    "unintelligible": label.get("unintelligible", False),
                 }
 
     return results
@@ -1840,6 +1946,16 @@ def make_row(kind, target, path, probe, slurp_id, sentence):
         "asr_bucket": probe["asr_bucket"],
         "resp_bucket": probe["resp_bucket"],
         "anchor": probe["anchor"],
+        # beam track: the K hypotheses this row's label was intersected from,
+        # and the per-hypothesis loss lists as JSON so a mislabeled row can be
+        # diagnosed without re-running the GPU pass. Empty on the other tracks.
+        "beam_hypotheses": probe["hypotheses"],
+        "beam_losses": (
+            json.dumps(probe["beam_losses"], ensure_ascii=False)
+            if probe["beam_losses"]
+            else ""
+        ),
+        "unintelligible": probe["unintelligible"],
         "slurp_id": slurp_id,
         "sentence": sentence,
         "source": "babble",
@@ -1883,8 +1999,11 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
             PROBE_BATCH_SIZE,
             random.Random(f"{SEED}:{slurp_id}"),
         )
-        if any(v is None for v in triplet.values()):
-            return {"skip": "probe"}
+        starved = [k for k, v in triplet.items() if v is None]
+        if starved:
+            # name the slot that never filled: the kind is the labeler's call,
+            # not the SNR band's, so which band starves is not predictable
+            return {"skip": f"probe:{','.join(starved)}"}
 
         if TRACK == "heard-reply":
             # already written, one call per probe audio alongside its label
@@ -2096,12 +2215,24 @@ if __name__ == "__main__":
         "against the command and resolved by decide_kind()'s table, which "
         "also names the piece a repair question anchors on.",
     )
+    track.add_argument(
+        "--beam-label",
+        action="store_true",
+        help="One beam-search ASR pass per probe; label off the K hypotheses' "
+        "consensus alone, a piece counting as lost only if every hypothesis "
+        "missed it. No task-response pass.",
+    )
     args = ap.parse_args()
 
     TRACK = (
-        "heard-reply" if args.heard_reply else "tree" if args.tree_label else "two-pass"
+        "heard-reply"
+        if args.heard_reply
+        else "tree" if args.tree_label else "beam" if args.beam_label else "two-pass"
     )
     log(f"track: {TRACK}")
+    if TRACK == "beam":
+        PROBE_BATCH_SIZE = BEAM_PROBE_BATCH_SIZE
+        log(f"probe batch size: {PROBE_BATCH_SIZE} (beams: {ASR_NUM_BEAMS})")
 
     # ---
     # point AUDIO_DIR at a fresh per-dataset subdir of AUDIO_ROOT.
