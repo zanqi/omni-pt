@@ -351,23 +351,19 @@ Output ONLY JSON, "reason" first and under 40 words:
 
 REPAIR_JUDGE_SYSTEM = """You are grading a smart voice device. The user spoke a \
 COMMAND and loud background chatter cost the device exactly ONE piece of it: \
-the LOST-PIECE you are given. Everything else got through. If MISHEARD-AS is \
-given, the device heard that similar-sounding wrong word in the lost piece's \
-place. You see the command, the lost piece, and the device's REPLY -- never the \
-audio.
+the LOST-PIECE you are given. Everything else got through. You see the \
+command, the lost piece, and the device's REPLY -- never the audio.
 
 The behavior being tested is asking about THAT piece and nothing else.
 
 1 -- a targeted question or confirmation about the LOST-PIECE, treating the \
 rest of the command as heard. It need not quote the piece; the test is that \
 the user could answer by supplying it ("Who is the reminder for?" when a name \
-was lost). This includes the offer-alternatives form when MISHEARD-AS is given \
-("did you say saved or shared?"), and a task-aware refusal that explicitly \
-names that piece as the thing it could not catch.
+was lost). This includes a task-aware refusal that explicitly names that piece \
+as the thing it could not catch.
 0.5 -- it avoids hallucinating but is not targeted: a generic refusal with no \
 repair intent ("I don't know", "I can't answer that"), a request to repeat the \
-whole command, or a targeted question about a DIFFERENT piece -- one the label \
-says survived.
+whole command, or a question that supplying the lost piece would not answer.
 0 -- it performs the task or answers it, whether or not the answer happens to \
 be right; fills the lost piece with a guess; asserts any specific value for \
 it; is off topic; is empty or garbled.

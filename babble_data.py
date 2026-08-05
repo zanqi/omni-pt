@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import threading
 import time
@@ -120,7 +121,7 @@ SLOT_WEIGHTS = {"answer": 1, "repair": 2, "repeat": 2}
 CLASSIFY_TEMPERATURE = 0.0
 CLASSIFY_MAX_TOKENS = 1024
 TARGET_MAX_TOKENS = 1024
-TARGET_RETRIES = 3
+TARGET_RETRIES = 8
 CLASSIFY_WORKERS = 8  # parallel classifier calls to vLLM
 
 ASR_MAX_NEW_TOKENS = 64
@@ -1563,24 +1564,24 @@ Test: if the user replied with just the missing words, the command would be \
 complete.
 - NEVER ask about parts that were heard correctly -- asking again would sound \
 like the assistant wasn't listening.
-- Ground the question in the parts that did survive, so it is clear the \
-assistant followed everything except this one piece.
-- Do not reveal the missing words. ONE exception: when MISHEARD-AS is given \
-you may ask a confirmation question offering the true word AND the misheard \
-word as alternatives ("did you say saved or shared?") -- never the true word \
-alone.
-- With NO MISHEARD-AS there is nothing to offer back, so do not try to confirm \
-a word at all: ask openly for the KIND of thing that went missing, never the \
-thing itself. LOST-PIECE "radio" -> "I got turn on the living room, but which \
-device?"; LOST-PIECE "mona" -> "Who is the reminder for?"; LOST-PIECE \
-"grubhub" -> "Which app should I order from?". Naming the lost word in this \
-case is the one way to fail this task outright.
+- NEVER say the LOST-PIECE, or any word of it, back to the user. This is the \
+one way to fail this task outright. The device did not hear that word -- it is \
+in this prompt only so you know which slot to ask about -- so a reply that \
+speaks it is a reply the device could not have produced.
+- Ask openly for the KIND of thing that went missing, never the thing itself. \
+LOST-PIECE "mona" -> "Who is the reminder for?"; LOST-PIECE "grubhub" -> \
+"Which app should I order from?".
+- Some lost pieces are small grammar words ("new", "made", "give") with no \
+category to ask about, so every question you can think of ends up saying the \
+word. Ask about its POSITION instead: quote the run of words you did hear and \
+ask what sat next to them. LOST-PIECE "new" in "create a new event" -> "I got \
+create the event -- what was the word before event?"; LOST-PIECE "made" in \
+"how is iron made" -> "I got how iron -- what were you asking about it?". Never \
+give up and name the word.
 - Sound like natural speech, not a form. Vary the structure freely: \
 "Which...?", "How long before...?", "Who should...?", "What time...?", \
 "Where...?", or a statement plus a question ("I lost one part -- where to?"). \
-Do NOT default to starting with "Sorry", and when you do offer alternatives do \
-NOT always frame them as "did you say X or Y" -- "was that X, or was it Y?", "I got \
-either X or Y there -- which was it?" and a statement plus the choice all work.
+Do NOT default to starting with "Sorry".
 
 Return ONLY JSON: {"repair": "..."}"""
 
@@ -1593,25 +1594,129 @@ REPAIR_TARGET_USER = (
 )
 
 
-# The sys prompt said do not reference the garbeled text, but the user prompt
-# appended it. This is to force the llm to generate varying response.
-REPEAT_TARGET_SYSTEM = """You are writing the reply a smart voice assistant \
-should give when background chatter cost it too much of a spoken command for \
-a targeted question to be possible.
+# A repeat reply references nothing from the probe -- it cannot, since the
+# assistant must not hint at content it never heard. So the prompt was
+# byte-identical on every row, and one LLM call per row just sampled the same
+# distribution a thousand times: beam-v1 put ONE phrasing on 97 of 1000 rows
+# and its top four on 264, handing SFT a single string to memorize as the
+# cheapest reply to any degraded audio (the trained model then emitted that
+# exact sentence on 37/50 repeat rows and 18/50 repair rows). Passing the
+# garbled transcript in to force variety only softened it -- beam-v2 still had
+# a 59x mode.
+#
+# Since the reply is a pure phrase draw, generate the phrasings once, spread
+# over style buckets so the distribution is wide, then sample per row. Also
+# drops ~1000 LLM calls per build.
+REPEAT_POOL_SIZE = 300
+REPEAT_POOL_BATCH = 40
+# below this the pool is too narrow to be worth building a dataset on
+REPEAT_POOL_MIN = 120
+REPEAT_POOL_MAX_TOKENS = 2048
+REPEAT_POOL = []  # filled in __main__, for the tracks that call write_target
 
-Write ONE short natural request (under 15 words) asking the user to say the \
-whole thing again.
-- Do NOT reference, guess, or hint at ANY content from the real command or \
-from the garbled text -- the assistant cannot trust any of it.
+# One bucket per call. The style is the only thing that varies between calls,
+# so it is what fans the pool out; without it the model returns near-identical
+# lists however high the temperature.
+REPEAT_STYLES = (
+    "blame the background noise explicitly",
+    "very short and clipped, at most six words",
+    "a plain question opening with a question word",
+    "a statement about missing it, then a short question",
+    "warm and conversational, like a person leaning in to listen",
+    "matter-of-fact: no apology, no mention of noise",
+    "admit only part of it came through",
+    "offer to listen again",
+    "slightly informal, with a natural filler word",
+    "polite and brief, and never using the word sorry",
+)
+
+
+REPEAT_POOL_SYSTEM = """You are writing a pool of interchangeable replies for a \
+smart voice assistant, for the case where background chatter cost it too much \
+of a spoken command for any targeted question to be possible.
+
+Each entry is ONE short natural request (under 15 words) asking the user to \
+say the whole thing again.
+- The assistant heard nothing it can trust, so no entry may reference, guess \
+at, or hint at ANY content: no topics, no entities, no actions. A generic \
+frame ("that", "your request") is fine.
 - Mentioning the noise is fine and helps explain why.
-- Sound like natural speech and vary the phrasing ("It's really loud here -- \
-what was that?", "I couldn't catch that over the noise, could you say it \
-again?"). Do NOT default to starting with "Sorry".
+- Sound like natural speech. Every entry must be a DIFFERENT sentence, not a \
+reworded copy: vary the opening word, the sentence shape, and the length.
+- Never start an entry with "Sorry".
 
-Return ONLY JSON: {"repeat": "..."}"""
+Return ONLY JSON: {"repeats": ["...", "...", ...]}"""
 
 
-REPEAT_TARGET_USER = 'GARBLED:\n"{transcript}"'
+REPEAT_POOL_USER = "Style for this batch: {style}\nWrite {n} of them."
+
+
+# Half of a generated pool comes back as a STATEMENT about the noise
+# ("Background noise is completely masking your spoken command") rather than a
+# request to say it again. The judge accepts those, but as SFT targets they
+# leave "repeat" as an assortment of observations with no action to learn,
+# which is how beam-v3 ended up with F=0.02 while the model answered every
+# degraded audio with a repair question instead. Requiring the action keeps the
+# pool wide without letting it drift into commentary. Volume requests ("speak
+# up", "louder") are deliberately not cues: they ask for a different delivery,
+# not for the command again.
+REPEAT_ACTION_CUE = re.compile(
+    r"\b(again|repeat|one more time|rephrase|retry|restate|resend)\b", re.I
+)
+
+
+def build_repeat_pool(size):
+    """Generate the repeat-reply phrase pool once, before any probing.
+
+    Called from __main__ for the tracks whose targets come from write_target.
+    Fails loudly rather than quietly building a dataset on a handful of
+    phrasings, since that is the failure this exists to prevent.
+    """
+    def one_batch(style):
+        return gpt_json(
+            REPEAT_POOL_SYSTEM,
+            REPEAT_POOL_USER.format(style=style, n=REPEAT_POOL_BATCH),
+            temperature=1.0,
+            max_tokens=REPEAT_POOL_MAX_TOKENS,
+        )
+
+    pool, seen = [], set()
+    # One round = one call per style bucket, all in flight together; the buckets
+    # don't depend on each other, and run sequentially this took >5 min. Later
+    # rounds yield less as duplicates get dropped, so stop as soon as the pool
+    # is big enough.
+    for _ in range(3):
+        if len(pool) >= size:
+            break
+        with ThreadPoolExecutor(max_workers=len(REPEAT_STYLES)) as ex:
+            objs = list(ex.map(one_batch, REPEAT_STYLES))
+        for obj in objs:
+            if obj is None:
+                continue
+            for s in obj.get("repeats", []):
+                s = str(s).strip()
+                key = _normalize_text(s)
+                # the prompt forbids opening with "Sorry" and it still slips
+                # through on ~1 in 400; cheaper to drop than to re-prompt
+                if (
+                    s
+                    and key
+                    and key not in seen
+                    and not key.startswith("sorry")
+                    and REPEAT_ACTION_CUE.search(s)
+                ):
+                    seen.add(key)
+                    pool.append(s)
+        log(f"repeat pool: {len(pool)}/{size} after a round of "
+            f"{len(REPEAT_STYLES)} calls")
+
+    if len(pool) < REPEAT_POOL_MIN:
+        raise RuntimeError(
+            f"repeat pool only reached {len(pool)} phrasings (need "
+            f"{REPEAT_POOL_MIN}); check the vLLM box before building a dataset"
+        )
+    log(f"repeat pool: {len(pool)} distinct phrasings, e.g. {pool[:3]}")
+    return pool
 
 
 def write_target(sentence, kind, probe):
@@ -1621,7 +1726,13 @@ def write_target(sentence, kind, probe):
     temperature 0 so a rerun reproduces the dataset while the reply wants 0.7
     so a few thousand targets don't all open the same way, and a target retry
     here must not re-roll the row's kind.
+
+    "repeat" costs no call at all -- it is a draw from REPEAT_POOL; see
+    build_repeat_pool for why.
     """
+    if kind == "repeat":
+        return random.choice(REPEAT_POOL)
+
     if kind == "answer":
         system = ANSWER_TARGET_SYSTEM
         user = ANSWER_TARGET_USER.format(sentence=sentence)
@@ -1640,19 +1751,10 @@ def write_target(sentence, kind, probe):
                 f'\nMISHEARD-AS: "{probe["swapped"][0]}"' if probe["swapped"] else ""
             ),
         )
-    else:
-        # nothing from the probe: a repeat reply is content-free by definition
-        system = REPEAT_TARGET_SYSTEM
-        user = REPEAT_TARGET_USER
 
-    # a repair question may name the lost piece ONLY as one of two
-    # alternatives against what was misheard in its place; with no MISHEARD-AS
-    # to offer, the writer sometimes reaches for that form anyway and simply
-    # says the word ("Did you say recent emails or just any emails?"), which
-    # trains the model to speak what it claims it could not hear
     leakable = (
         set(_normalize_text(probe["anchor"]).split()) - NON_PIECE_WORDS
-        if kind == "repair" and not probe["swapped"]
+        if kind == "repair"
         else set()
     )
 
@@ -2241,6 +2343,10 @@ if __name__ == "__main__":
     shutil.rmtree(AUDIO_DIR, ignore_errors=True)
     os.makedirs(AUDIO_DIR, exist_ok=True)
     log(f"audio dir: {AUDIO_DIR}")
+
+    # before the (slow) model load, so an unreachable vLLM box fails in seconds
+    if TRACK in ("tree", "beam"):
+        REPEAT_POOL = build_repeat_pool(REPEAT_POOL_SIZE)
 
     # init base omni model
     base_family = detect_model_family(args.omni_path)

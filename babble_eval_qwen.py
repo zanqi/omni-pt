@@ -398,9 +398,14 @@ def main():
             # was.
             user = f'Original Spoken Command: "{row["sentence"]}"\n'
             if kind == "repair":
+                # the misheard word is deliberately NOT passed: given it, the
+                # judge credited any "did you say A or B?" reply as a targeted
+                # question, even when neither A nor B was the lost piece or the
+                # misheard word (4 of the 5 rows the beam-v1 adapter scored 1.0
+                # on). Without it the rubric falls back to its general test --
+                # would supplying the lost piece answer this question -- which
+                # those replies fail on their face.
                 user += f"Lost Piece: {_fmt_lost(row['lost'])}\n"
-                if row.get("swapped"):
-                    user += f'Misheard As: "{row["swapped"][0]}"\n'
             user += f'Model Response: "{reply}"\n'
             score, reason = judge_fn(JUDGE_BY_KIND[kind], user)
             judged_type = ""
