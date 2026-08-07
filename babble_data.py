@@ -46,6 +46,7 @@ import os
 import random
 import re
 import shutil
+import tempfile
 import threading
 import time
 from collections import Counter, deque
@@ -85,6 +86,7 @@ VLLM_HOST_FILE = "/gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt"
 MASK_DS_ID = "keylazy/slurp-ear-sft"
 AUDIO_ROOT = "babble_audio"
 AUDIO_DIR = None  # set in __main__ basedon ds name
+PROBE_DIR = None  # scratch wavs the probes listen to, under AUDIO_DIR
 SEED = 42
 ROW_ID = itertools.count(1)
 
@@ -1780,11 +1782,12 @@ def write_target(sentence, kind, probe):
 
 def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
     def make_probe_batch(kinds_need):
+        """return a list of wav paths and a list of snr vals"""
         length = len(clean)
         clean_power = float(np.mean(clean**2))
         bands = SLOT_SNR if TRACK == "two-pass" else SLOT_SNR_DISJOINT
-        audios, snrs = [], []
-        while len(audios) < batch_size:
+        paths, snrs = [], []
+        while len(paths) < batch_size:
             weights = [SLOT_WEIGHTS[k] for k in kinds_need]
             slot = rng.choices(kinds_need, weights=weights, k=1)[0]
 
@@ -1795,41 +1798,46 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             ):
                 # keep noise-free audio in the answer band; snr_db=None reads
                 # as "clean" everywhere downstream
-                audios.append(clean)
-                snrs.append(None)
-                continue
+                noisy, snr = clean, None
+            else:
+                # mix a babble
+                babble = np.zeros(length, dtype=np.float32)
+                for b in rng.sample(pool, BABBLE_SPEAKERS):
+                    if len(b) < length:
+                        b = np.pad(b, (0, length - len(b)), "wrap")
+                    else:
+                        start = rng.randint(0, len(b) - length)
+                        b = b[start : start + length]
+                    babble += b
+                babble /= BABBLE_SPEAKERS
 
-            # mix a babble
-            babble = np.zeros(length, dtype=np.float32)
-            for b in rng.sample(pool, BABBLE_SPEAKERS):
-                if len(b) < length:
-                    b = np.pad(b, (0, length - len(b)), "wrap")
-                else:
-                    start = rng.randint(0, len(b) - length)
-                    b = b[start : start + length]
-                babble += b
-            babble /= BABBLE_SPEAKERS
+                # sample snr, round to 1 decimal digit
+                snr = round(rng.uniform(*bands[slot]), 1)
 
-            # sample snr, round to 1 decimal digit
-            snr = round(rng.uniform(*bands[slot]), 1)
+                # synthesize noisy audio
+                # SNR = 10*log10(clean_power / babble_power)
+                #   -> target_babble_power = clean_power / 10^(SNR/10)
+                #   -> scale babble = sqrt(target_power / current_power)
+                current_babble_power = float(np.mean(babble**2))
+                target_babble_power = clean_power / (10 ** (snr / 10))
+                scale = np.sqrt(target_babble_power / current_babble_power)
+                noisy = clean + scale * babble
+                peak = float(np.max(np.abs(noisy)))
+                if peak > 1.0:
+                    # avoid clipping on save; rescaling do not change SNR
+                    noisy = noisy / peak
+                noisy = noisy.astype(np.float32)
 
-            # synthesize noisy audio
-            # SNR = 10*log10(clean_power / babble_power)
-            #   -> target_babble_power = clean_power / 10^(SNR/10)
-            #   -> scale babble = sqrt(target_power / current_power)
-            current_babble_power = float(np.mean(babble**2))
-            target_babble_power = clean_power / (10 ** (snr / 10))
-            scale = np.sqrt(target_babble_power / current_babble_power)
-            noisy = clean + scale * babble
-            peak = float(np.max(np.abs(noisy)))
-            if peak > 1.0:
-                # avoid clipping on save; rescaling do not change SNR
-                noisy = noisy / peak
-            noisy = noisy.astype(np.float32)
-
-            audios.append(noisy)
+            # the probe reads this file rather than the float32 array, so the
+            # model that gets labeled hears the exact PCM_16 samples the row
+            # will ship -- feeding it the pre-quantization array made the base
+            # model answer a slightly different audio at eval time
+            fd, path = tempfile.mkstemp(suffix=".wav", dir=PROBE_DIR)
+            os.close(fd)
+            sf.write(path, noisy, AUDIO_SAMPLING_RATE)
+            paths.append(path)
             snrs.append(snr)
-        return audios, snrs
+        return paths, snrs
 
     def classify(transcript, response, retries=2):
         user = CLASSIFY_USER.format(
@@ -1879,15 +1887,15 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
         missing_slots = [k for k, v in results.items() if v is None]
         if not missing_slots:
             break
-        audios, snrs = make_probe_batch(missing_slots)
+        paths, snrs = make_probe_batch(missing_slots)
 
         sysp = QWEN25_SYSTEM_PROMPT if base_family == "qwen2.5" else None
         # only --beam-label fills this in; the others keep one transcript
-        hyp_lists = [[] for _ in audios]
+        hyp_lists = [[] for _ in paths]
         if TRACK == "beam":
             with GPU_LOCK:
                 asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-                convs = [_conv(a, asr_sysp, ASR_PROMPT) for a in audios]
+                convs = [_conv(p, asr_sysp, ASR_PROMPT) for p in paths]
                 hyp_lists = base_generate_batch(
                     convs, ASR_MAX_NEW_TOKENS, n_best=ASR_N_BEST
                 )
@@ -1900,7 +1908,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                 labels = list(ex.map(lambda h: label_beam(sentence, h), hyp_lists))
         elif TRACK == "heard-reply":
             with GPU_LOCK:
-                convs = [_conv(a, sysp, task_prompt(True)) for a in audios]
+                convs = [_conv(p, sysp, task_prompt(True)) for p in paths]
                 outs = base_generate_batch(
                     convs, RESP_MAX_NEW_TOKENS, prefill=HEARD_PREFILL
                 )
@@ -1922,11 +1930,11 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             with GPU_LOCK:
                 # get batch omni asr respond
                 asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-                convs = [_conv(a, asr_sysp, ASR_PROMPT) for a in audios]
+                convs = [_conv(p, asr_sysp, ASR_PROMPT) for p in paths]
                 transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
 
                 # get batch omni assistant respond
-                convs = [_conv(a, sysp, TASK_PROMPT) for a in audios]
+                convs = [_conv(p, sysp, TASK_PROMPT) for p in paths]
                 responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)
 
             # same two witnesses either way; only how they're labeled differs
@@ -1943,8 +1951,8 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                     )
                 )
 
-        for snr, noisy, transcript, response, hyps, label in zip(
-            snrs, audios, transcripts, responses, hyp_lists, labels
+        for snr, probe_path, transcript, response, hyps, label in zip(
+            snrs, paths, transcripts, responses, hyp_lists, labels
         ):
             if label is None:
                 continue
@@ -1952,7 +1960,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             if kind in results and results[kind] is None:
                 results[kind] = {
                     "snr_db": snr,
-                    "audio": noisy,
+                    "audio": probe_path,
                     "transcript": transcript,
                     "response": response,
                     "lost": label["missing"],
@@ -1974,6 +1982,12 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                     "beam_losses": label.get("per_hypothesis", []),
                     "unintelligible": label.get("unintelligible", False),
                 }
+
+        # clean up non-kept wav files
+        kept = {r["audio"] for r in results.values() if r}
+        for p in paths:
+            if p not in kept:
+                os.remove(p)
 
     return results
 
@@ -2172,7 +2186,9 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
         for kind in KINDS:
             probe = built["triplet"][kind]
             path = os.path.join(AUDIO_DIR, f"{split}_{slurp_id}_{kind}.wav")
-            sf.write(path, probe["audio"], AUDIO_SAMPLING_RATE)
+            # move from temp folder to audio dir
+            # ready for hf upload
+            os.replace(probe["audio"], path)
             rows.append(
                 make_row(kind, built["targets"][kind], path, probe, slurp_id, sentence)
             )
@@ -2255,7 +2271,7 @@ def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
         sentence = row["sentence"]
 
         path = os.path.join(AUDIO_DIR, f"{split}_{slurp_id}_answer.wav")
-        sf.write(path, built["probe"]["audio"], AUDIO_SAMPLING_RATE)
+        os.replace(built["probe"]["audio"], path)
         rows.append(
             make_row(
                 "answer", built["target"], path, built["probe"], slurp_id, sentence
@@ -2342,6 +2358,10 @@ if __name__ == "__main__":
     AUDIO_DIR = os.path.join(AUDIO_ROOT, args.ds_id.split("/")[-1])
     shutil.rmtree(AUDIO_DIR, ignore_errors=True)
     os.makedirs(AUDIO_DIR, exist_ok=True)
+    # kept probes are moved out of here into AUDIO_DIR; what stays behind
+    # belongs to utterances that were later skipped, so it is dropped below
+    PROBE_DIR = os.path.join(AUDIO_DIR, "probes")
+    os.makedirs(PROBE_DIR, exist_ok=True)
     log(f"audio dir: {AUDIO_DIR}")
 
     # before the (slow) model load, so an unreachable vLLM box fails in seconds
@@ -2376,6 +2396,9 @@ if __name__ == "__main__":
             seen_ids,
             train_babble_pool,
         )
+
+    # whatever is left belongs to utterances that never became rows
+    shutil.rmtree(PROBE_DIR, ignore_errors=True)
 
     # sits with the wavs it references, so a dataset's audio and its row
     # metadata stay together under one gitignored folder

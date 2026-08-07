@@ -410,7 +410,7 @@ def main():
         # leak evidence into the type decision. A model that ignores the
         # two-line contract is scored on its raw output rather than penalized
         # twice; the summary counts how often that happened.
-        heard, reply = ("", resp)
+        heard, reply = ("", "")
         if args.heard_reply:
             heard, reply = split_heard_reply(resp)
 
