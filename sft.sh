@@ -25,6 +25,15 @@
 #                         # TASK_PROMPT, adapters <model>-bab-tree-adapter-<n>x
 #   BEAM=1 ./sft.sh       # beam-consensus track — beam-v1 datasets, plain
 #                         # TASK_PROMPT, adapters <model>-bab-beam-adapter-<n>x
+#   CR=1 ./sft.sh         # C/R-only track — beam-v3 datasets with the repeat
+#                         # rows dropped and answer capped to match repair
+#                         # (1K:1K), adapters <model>-bab-cr[-adapter-<n>x]
+#   EPOCHS=6 ADAPTER_KIND=bab-cr6-adapter CR=1 MULTS= ./sft.sh qwen25
+#                         # step-matched CR: half the rows of a beam run, so
+#                         # twice the epochs to land on the same 750 steps.
+#                         # ADAPTER_KIND renames the output so it doesn't
+#                         # overwrite the 3-epoch adapter; pass the same
+#                         # ADAPTER_KIND to eval.sh to score it.
 #
 # One GPU, sequential — run it under salloc/srun or wrap it in an sbatch job.
 source ~/.bashrc
@@ -32,9 +41,17 @@ set -eo pipefail
 
 WHICH="${1:-both}"
 MULTS="${MULTS-1 2 3 4}"  # no colon: MULTS= means "single run", not "default"
+EPOCHS="${EPOCHS:-3}"
+# captured before the track case overwrites it, so a step-matched or otherwise
+# renamed run can keep a prior adapter of the same track intact (mirrors eval.sh)
+ADAPTER_KIND_ENV="${ADAPTER_KIND:-}"
 
 # the tree track trains under the plain prompt, so only HR passes a flag
 HR_FLAG=""
+# extra per-track flags (currently only CR's kind filter) and the sweep's
+# non-answer caps, which CR shrinks to 'repair' alone
+EXTRA_FLAGS=""
+FIXED_CAPS="repair=1000,repeat=1000"
 if [[ -n "${HR:-}" ]]; then
     HR_FLAG="--heard-reply"
     ADAPTER_KIND="bab-hr-adapter"
@@ -50,42 +67,62 @@ elif [[ -n "${BEAM:-}" ]]; then
     ADAPTER_KIND="bab-beam-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-beam-v1"
+elif [[ -n "${CR:-}" ]]; then
+    # C/R only: the beam-v3 rows as built, minus every repeat row, with answer
+    # cut from 2K to the 1K that matches repair. Same audio and targets as the
+    # beam track, so the only variable is the removed third dimension.
+    EXTRA_FLAGS="--kinds answer,repair"
+    FIXED_CAPS="repair=1000"
+    SINGLE_CAPS="answer=1000,repair=1000"
+    ADAPTER_KIND="bab-cr-adapter"
+    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v3"
+    DEFAULT_QWEN3=""  # no qwen3 beam dataset exists; pass DS_QWEN3 explicitly
 else
     ADAPTER_KIND="bab-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-v4"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-v2"
 fi
+[[ -n "$ADAPTER_KIND_ENV" ]] && ADAPTER_KIND="$ADAPTER_KIND_ENV"
 DS_QWEN25="${DS_QWEN25:-$DEFAULT_QWEN25}"
 DS_QWEN3="${DS_QWEN3:-$DEFAULT_QWEN3}"
+# caps for the single-run path: empty for every track but CR, which must still
+# cut the surplus answer rows even when it isn't sweeping the mix
+SINGLE_CAPS="${SINGLE_CAPS:-}"
 
 run_sweep() {
     local omni_path="$1" ds_id="$2"
     local model_name="${omni_path##*/}"
     local n run_name
 
+    if [[ -z "$ds_id" ]]; then
+        echo "no dataset for ${model_name} on this track — set DS_QWEN25/DS_QWEN3" >&2
+        exit 1
+    fi
+
     if [[ -z "$MULTS" ]]; then
-        # train on the split exactly as built -- no --train-caps, so the
-        # dataset's own answer:repair:repeat mix is what the model sees
+        # train on the split as built -- no --train-caps unless the track needs
+        # one, so the dataset's own answer:repair:repeat mix is what the model sees
         run_name="${model_name}-${ADAPTER_KIND%-adapter}-sft"
-        echo "=== ${run_name}: full train split <- ${ds_id} ==="
-        python -u sft_qwen.py $HR_FLAG \
+        echo "=== ${run_name}: train split ${SINGLE_CAPS:-as built}, ${EPOCHS} epochs <- ${ds_id} ==="
+        python -u sft_qwen.py $HR_FLAG $EXTRA_FLAGS \
             --omni-path "$omni_path" \
             --ds-id "$ds_id" \
+            ${SINGLE_CAPS:+--train-caps "$SINGLE_CAPS"} \
             --run-name "$run_name" \
-            --epochs 3
+            --epochs "$EPOCHS"
         echo "=== ${run_name} done ==="
         return
     fi
 
     for n in $MULTS; do
         run_name="${model_name}-${ADAPTER_KIND}-${n}x"
-        echo "=== ${run_name}: answer=$((n * 1000)) repair=1000 repeat=1000 <- ${ds_id} ==="
-        python -u sft_qwen.py $HR_FLAG \
+        echo "=== ${run_name}: answer=$((n * 1000)) ${FIXED_CAPS}, ${EPOCHS} epochs <- ${ds_id} ==="
+        python -u sft_qwen.py $HR_FLAG $EXTRA_FLAGS \
             --omni-path "$omni_path" \
             --ds-id "$ds_id" \
-            --train-caps "answer=$((n * 1000)),repair=1000,repeat=1000" \
+            --train-caps "answer=$((n * 1000)),${FIXED_CAPS}" \
             --run-name "$run_name" \
-            --epochs 3
+            --epochs "$EPOCHS"
         echo "=== ${run_name} done ==="
     done
 }

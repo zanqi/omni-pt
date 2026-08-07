@@ -26,6 +26,7 @@
 # starts the moment training finishes.
 #
 #   BEAM=1 sbatch sft_eval_qwen25.slurm    # beam-consensus track (per-kind judges)
+#   CR=1 sbatch sft_eval_qwen25.slurm      # C/R-only track (beam-v3 data, no repeat rows)
 #   TREE=1 sbatch sft_eval_qwen25.slurm    # decision-table track
 #   HR=1 sbatch sft_eval_qwen25.slurm      # Heard:/Reply: track
 #   sbatch sft_eval_qwen25.slurm           # default two-pass track

@@ -6,7 +6,9 @@ the omni model.
   C   = mean task-competence over the answerable audio
   R   = mean conversational-repair over the unanswerable audio
   F   = mean full-repair score over the `repair_full` rows
-  EAR = 3 * C * R * F / (C*R + C*F + R*F)
+  EAR = harmonic mean of the scores of the evaluated kinds
+        (3 * C*R*F / (C*R + C*F + R*F) with all three;
+         2 * C*R / (C+R) under --kinds answer,repair)
 
 Judging is done by a local vLLM server (default) or the OpenAI API.
 
@@ -228,11 +230,12 @@ def _fmt_lost(lost):
     return "; ".join(f'"{s}"' for s in lost)
 
 
-def harmonic3(c, r, f):
-    denom = c * r + c * f + r * f
-    if denom == 0:
+def harmonic(*vals):
+    """Harmonic mean of the per-kind scores, 0.0 if any of them is 0.
+    n=3 is 3*C*R*F/(C*R + C*F + R*F); n=2 is 2*C*R/(C+R)."""
+    if any(v == 0 for v in vals):
         return 0.0
-    return 3.0 * c * r * f / denom
+    return len(vals) / sum(1.0 / v for v in vals)
 
 
 def main():
@@ -264,6 +267,15 @@ def main():
         default=4096,
     )
     ap.add_argument("--num-rows", type=int, default=150)
+    ap.add_argument(
+        "--kinds",
+        default="answer,repair,repeat",
+        help="Which row kinds to evaluate, comma-separated. Dropping a kind "
+        "drops its judge call and its factor in EAR, so 'answer,repair' scores "
+        "C and R only (EAR = 2*C*R/(C+R)) on a dataset built with all three. "
+        "Filtering happens before --num-rows, so the row budget is spent "
+        "entirely on the kinds asked for.",
+    )
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument(
         "--heard-reply",
@@ -315,7 +327,13 @@ def main():
     # -- otherwise an hr run silently overwrites the baseline result file
     # eval.ipynb reads
     per_kind = args.judge_mode == "per-kind"
+    kinds = [k.strip() for k in args.kinds.split(",") if k.strip()]
+    unknown = [k for k in kinds if k not in JUDGE_BY_KIND]
+    if unknown:
+        raise SystemExit(f"--kinds: unknown kind(s) {unknown}")
     tag = "hr" if args.heard_reply else "beam" if per_kind else "v2"
+    if kinds != ["answer", "repair", "repeat"]:
+        tag = "-".join(kinds)
     out_path = args.out or f"results/bab_results_{model_name}_{tag}.jsonl"
     judge_system = (
         RESPONSE_TYPE_FEWSHOT_SYSTEM if args.fewshot_judge else RESPONSE_TYPE_SYSTEM
@@ -324,12 +342,18 @@ def main():
     print(
         f"prompt: {'heard-reply' if args.heard_reply else 'plain'} | "
         f"judge: {'per-kind' if per_kind else 'few-shot' if args.fewshot_judge else 'rules'} | "
-        f"scores: {'direct' if per_kind else args.score_matrix}"
+        f"scores: {'direct' if per_kind else args.score_matrix} | "
+        f"kinds: {','.join(kinds)}"
     )
 
     ds = load_dataset(args.dataset, split=args.split)
 
     ds = ds.cast_column("audio", Audio(sampling_rate=AUDIO_SAMPLING_RATE))
+    if len(kinds) < 3:
+        # before the --num-rows slice, so the budget buys only wanted kinds
+        keep = [i for i, k in enumerate(ds["kind"]) if k in kinds]
+        print(f"kind filter: {len(ds)} -> {len(keep)} rows")
+        ds = ds.select(keep)
     if args.num_rows != -1:
         ds = ds.select(range(min(args.num_rows, len(ds))))
 
@@ -495,7 +519,10 @@ def main():
         C = scores["answer"] / counts["answer"] if counts["answer"] else 0.0
         R = scores["repair"] / counts["repair"] if counts["repair"] else 0.0
         F = scores["repeat"] / counts["repeat"] if counts["repeat"] else 0.0
-        EAR = harmonic3(C, R, F)
+        # a kind that wasn't evaluated is absent from EAR, and reported as null
+        # rather than 0.0 so nothing downstream reads it as a failed dimension
+        means = {"answer": C, "repair": R, "repeat": F}
+        EAR = harmonic(*(means[k] for k in kinds))
 
         fout.write(
             json.dumps(
@@ -509,14 +536,15 @@ def main():
                     "fewshot_judge": args.fewshot_judge,
                     "judge_mode": args.judge_mode,
                     "score_matrix": args.score_matrix,
+                    "kinds": kinds,
                     "heard_parse_failures": parse_failures,
                     "judge_parse_failures": judge_failures,
                     "answer_rows": counts["answer"],
                     "repair_rows": counts["repair"],
                     "repeat_rows": counts["repeat"],
-                    "C": C,
-                    "R": R,
-                    "F": F,
+                    "C": C if "answer" in kinds else None,
+                    "R": R if "repair" in kinds else None,
+                    "F": F if "repeat" in kinds else None,
                     "EAR": EAR,
                     # per-kind mode has no types left to confuse, so it reports
                     # a score histogram instead -- but the key stays present
@@ -538,12 +566,10 @@ def main():
     )
     print(
         f"Final Eval - {model_desc} "
-        f"({counts['answer']} answer / {counts['repair']} repair / "
-        f"{counts['repeat']} repeat rows)"
+        f"({' / '.join(f'{counts[k]} {k}' for k in kinds)} rows)"
     )
-    print(f"C  : {C: .3f}")
-    print(f"R  : {R: .3f}")
-    print(f"F  : {F: .3f}")
+    for k in kinds:
+        print(f"{metric_name[k]}  : {means[k]: .3f}")
     print(f"EAR: {EAR: .3f}")
     if args.heard_reply:
         print(
@@ -554,12 +580,12 @@ def main():
         print(f"judge parse failures: {judge_failures}/{sum(counts.values())} (scored 0)")
     if per_kind:
         print("\nscores per kind:")
-        for k in ("answer", "repair", "repeat"):
+        for k in kinds:
             cells = " ".join(f"{s:g}:{hist[f'{k}@{s:g}']:3d}" for s in VALID_SCORES)
             print(f"  {k:8s} {cells}")
     else:
         print("\nconfusion (target kind -> judged type):")
-        for k in ("answer", "repair", "repeat"):
+        for k in kinds:
             cells = " ".join(f"{t}:{confusion[(k, t)]:3d}" for t in JUDGED_TYPES)
             print(f"  {k:8s} {cells}")
     print("======")

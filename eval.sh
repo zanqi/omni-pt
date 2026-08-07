@@ -25,6 +25,15 @@
 #                      per-kind judges instead of the type judge + matrix. The
 #                      repair rubric sees the lost piece and scores a confident
 #                      answer 0, so R is NOT comparable with the other tracks.
+#   CR=1   ./eval.sh   C/R only — beam-v3 data with the repeat rows filtered
+#                      out, the same per-kind judges for answer/repair, and
+#                      EAR = 2*C*R/(C+R). C and R stay comparable with a beam
+#                      run; EAR does not (two factors instead of three).
+#                      The as-built CR split is half a beam split, so the
+#                      3-epoch adapter sees half the steps — score the
+#                      step-matched 6-epoch one instead:
+#                      CR=1 MULTS= ADAPTER_KIND=bab-cr6-adapter TAG=cr-e6 \
+#                          ./eval.sh qwen25
 # The judge and the labels are separable, so each can be isolated by crossing a
 # track's flags with another track's dataset + adapters (ADAPTER_KIND overrides
 # the track default):
@@ -52,11 +61,13 @@ TREE_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-tree-v1"
 TREE_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-tree-v1"
 BEAM_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1"
 BEAM_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-beam-v1"
+CR_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v3"
+CR_DS_QWEN3=""  # no qwen3 beam dataset exists; pass DS_QWEN3 explicitly
 # captured before the case overwrites it, so a crossed run (one track's flags
 # against another's adapters) can name the adapters explicitly
 ADAPTER_KIND_ENV="${ADAPTER_KIND:-}"
 ADAPTER_KIND="bab-adapter"
-case "${ABL:-${HR:+hr}${TREE:+tree}${BEAM:+beam}}" in
+case "${ABL:-${HR:+hr}${TREE:+tree}${BEAM:+beam}${CR:+cr}}" in
     hr)
         TRACK_DESC="heard-reply"
         EVAL_FLAGS="--heard-reply --fewshot-judge"
@@ -72,6 +83,11 @@ case "${ABL:-${HR:+hr}${TREE:+tree}${BEAM:+beam}}" in
         EVAL_FLAGS="--judge-mode per-kind"
         DEFAULT_QWEN25="$BEAM_DS_QWEN25"; DEFAULT_QWEN3="$BEAM_DS_QWEN3"
         ADAPTER_KIND="bab-beam-adapter"; DEFAULT_TAG="beam" ;;
+    cr)
+        TRACK_DESC="C/R only (no repeat rows, no F)"
+        EVAL_FLAGS="--judge-mode per-kind --kinds answer,repair"
+        DEFAULT_QWEN25="$CR_DS_QWEN25"; DEFAULT_QWEN3="$CR_DS_QWEN3"
+        ADAPTER_KIND="bab-cr-adapter"; DEFAULT_TAG="cr" ;;
     a)
         TRACK_DESC="ablation A (judge swap only)"
         EVAL_FLAGS="--fewshot-judge"
@@ -127,6 +143,11 @@ run_eval() {
 run_family() {
     local model_path="$1" ds_id="$2"
     local model_name="${model_path##*/}" n
+
+    if [[ -z "$ds_id" ]]; then
+        echo "no dataset for ${model_name} on this track — set DS_QWEN25/DS_QWEN3" >&2
+        exit 1
+    fi
 
     run_eval "$model_path" "$ds_id"
     if [[ -z "$MULTS" ]]; then

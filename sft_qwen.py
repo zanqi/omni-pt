@@ -62,9 +62,13 @@ class SlurpDataset(torch.utils.data.Dataset):
         }
 
 
-def load_ds_split(ds_id, split, limit=None):
+def load_ds_split(ds_id, split, limit=None, kinds=None):
     ds = load_dataset(ds_id, split=split)
     ds = ds.cast_column("audio", Audio(sampling_rate=AUDIO_SAMPLING_RATE))
+    if kinds:
+        keep = [i for i, k in enumerate(ds["kind"]) if k in kinds]
+        print(f"{split}: kind filter {kinds} -> {len(keep)}/{len(ds)} rows")
+        ds = ds.select(keep)
     if limit is not None:
         ds = ds.select(range(min(limit, len(ds))))
     return ds
@@ -316,6 +320,13 @@ def main():
     )
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument(
+        "--kinds",
+        default=None,
+        help="Keep only these row kinds, comma-separated, in BOTH the train and "
+        "eval splits, e.g. 'answer,repair' to train the C/R-only variant on a "
+        "dataset that also carries repeat rows.",
+    )
+    ap.add_argument(
         "--train-caps",
         default=None,
         help="Per-kind row budget for the train split, e.g. "
@@ -349,7 +360,8 @@ def main():
     system_prompt = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
 
     print(f"Loading SFT dataset {args.ds_id} ...")
-    train_hf = load_ds_split(args.ds_id, args.train_split)
+    kinds = [k.strip() for k in args.kinds.split(",")] if args.kinds else None
+    train_hf = load_ds_split(args.ds_id, args.train_split, kinds=kinds)
 
     if args.train_caps:
         # --- subsample the train split to a target answer:repair:repeat mix ---
@@ -381,7 +393,7 @@ def main():
 
     eval_ds = None
     if not args.no_eval and not args.smoke:
-        eval_hf = load_ds_split(args.ds_id, args.eval_split)
+        eval_hf = load_ds_split(args.ds_id, args.eval_split, kinds=kinds)
         eval_ds = SlurpDataset(eval_hf, answerable_token=args.answerable_token)
 
     processor = load_processor(args.omni_path, family)
