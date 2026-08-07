@@ -698,48 +698,28 @@ ASR_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice \
 assistant.
 
 You get the user's real spoken COMMAND, and HEARD -- what a speech recognizer \
-caught after loud background chatter. Compare them and list the key pieces of \
-the command that did not survive: entities, names, places, times, dates, \
-quantities, titles, and the requested action. Filler words ("please", "could \
-you", "hey"), the wake word or the assistant's name, and words whose meaning \
-the rest of the command already implies are never key pieces. Neither are \
-spelling, spacing, or other minor wording differences (e.g. "mockingbird" \
-heard as "mocking bird"), or a question rephrased in different grammar that \
-still asks for the same thing (e.g. "what does X mean" heard as "what is X", \
-or "do you think" heard as "you think") -- these are never lost pieces, even \
-when a real key piece is lost alongside them.
+caught after loud background chatter. List the key pieces of the command that \
+did not survive: entities, names, places, times, dates, quantities, titles, \
+and the requested action. Judge HEARD and nothing else; another labeler reads \
+the assistant's reply separately.
 
-An auxiliary or light verb that only frames the request is not a key piece on \
-its own -- "does", "do", "is", "can you", "give me", "tell me", "get me". The \
-key piece is what is being asked FOR, not the words wrapping the asking. \
-Dropping "give" from "give me a current traffic report" loses nothing: it \
-still reads as a request for the traffic report. Words that change WHAT is \
-asked are a different matter and do count -- "how many", "how long", "where", \
-"when" carry the actual question.
+Not key pieces, ever: filler words, the wake word or assistant's name, the \
+verbs that merely frame a request ("do", "does", "give me", "tell me"), and \
+wording that leaves the same thing being asked (spelling, spacing, number, \
+grammar). Question words are key pieces -- "how many", "how long", "where", \
+"when" carry what is actually being asked.
 
-Judge HEARD and nothing else. Do not reason about what a reply to this audio \
-might have recovered; another labeler handles that separately.
+Bundle several words into ONE "lost" entry when they are a single point of \
+confusion -- a phrase misheard as one specific, similar-sounding phrase. Keep \
+entries separate when the losses are unrelated.
 
-Return ONLY JSON: {"lost": [...], "misheard_as": "...", \
-"unintelligible": true|false}
+Set "unintelligible" when HEARD is destroyed past telling pieces apart, so \
+there is nothing specific enough to guess at; give one entry naming what is \
+unclear. The flag, not the length of the list, marks this case.
 
-Quote "lost" using the words of the real COMMAND. "misheard_as" is the wrong \
-word HEARD in place of a lost piece, or "" if the piece was simply dropped.
-
-"lost" does not need one entry per missing word -- bundle several words into \
-ONE entry when they are a single point of confusion: a whole phrase misheard \
-as one SPECIFIC, similar-sounding phrase is one entry for the true phrase, \
-with the misheard phrase in "misheard_as". Only bundle that way when HEARD is \
-a genuine close call -- most of the words or their sounds carry over, so the \
-misheard phrase is a plausible thing to guess and offer back. Keep entries \
-separate when the losses are unrelated to each other (a mishearing in one \
-spot, a different piece dropped elsewhere).
-
-Set "unintelligible" to true when HEARD is destroyed past telling pieces \
-apart -- it reads as a different, unrelated sentence, shares barely any words \
-or sounds, or says nothing at all -- so there is no plausible guess to offer. \
-Give one "lost" entry naming everything unclear and set the flag: the flag, \
-not the length of the list, is what marks this case. Otherwise it is false.
+Return ONLY JSON, quoting "lost" in the words of the real COMMAND, with the \
+wrong word HEARD in "misheard_as" (or "" if the piece was simply dropped):
+{"lost": [...], "misheard_as": "...", "unintelligible": true|false}
 
 Examples:
 
@@ -747,27 +727,11 @@ COMMAND: find some classical music by beethoven and play it
 HEARD:   find some classical music by beethoven and play it
 {"lost": [], "misheard_as": "", "unintelligible": false}
 
-COMMAND: hey olly are there any alarms set
-HEARD:   hey ollie are there any alarms
-{"lost": [], "misheard_as": "", "unintelligible": false}
-   -- the wake word and "set" are not key pieces
-
 COMMAND: hey olly play playlist tactics from music
 HEARD:   a r i play playlist tactics for music
 {"lost": [], "misheard_as": "", "unintelligible": false}
-   -- the wake word is mangled beyond recognition and it STILL is not a lost \
-piece. Never list it, however garbled or absent: the assistant is already \
-listening, so nothing about the task depends on hearing its own name
-
-COMMAND: do you think it's going to rain tomorrow
-HEARD:   you think it is going to rain tomorrow
-{"lost": [], "misheard_as": "", "unintelligible": false}
-   -- "do" is just the auxiliary opening the question; dropping it doesn't \
-change what's being asked
-
-COMMAND: how many oceans are there in the world
-HEARD:   how many children are there in the world
-{"lost": ["oceans"], "misheard_as": "children", "unintelligible": false}
+   -- the wake word is mangled beyond recognition and still is not a lost \
+piece: the assistant is already listening
 
 COMMAND: give me a current traffic report
 HEARD:   me a current traffic report come in and
@@ -777,14 +741,16 @@ HEARD:   me a current traffic report come in and
 COMMAND: does artificial intelligence have consciousness
 HEARD:   thus artificial intelligence have consciousness
 {"lost": [], "misheard_as": "", "unintelligible": false}
-   -- "does" only opens the question, so a wrong word in its place changes \
-nothing about what is being asked
+   -- a wrong word in place of the framing verb changes nothing
 
 COMMAND: tell me why relationships are so hard
 HEARD:   why relationship is so hard
 {"lost": [], "misheard_as": "", "unintelligible": false}
-   -- "tell me" only frames the request, and singular/plural is a minor \
-wording difference
+   -- framing verb plus a singular/plural difference
+
+COMMAND: how many oceans are there in the world
+HEARD:   how many children are there in the world
+{"lost": ["oceans"], "misheard_as": "children", "unintelligible": false}
 
 COMMAND: i have a meeting by two pm today please remind me
 HEARD:   i have a meeting at two p m today
@@ -793,30 +759,25 @@ HEARD:   i have a meeting at two p m today
 COMMAND: play mocking bird by eminem
 HEARD:   play mockingbird by edna meyer
 {"lost": ["eminem"], "misheard_as": "edna meyer", "unintelligible": false}
-   -- "mocking bird" vs "mockingbird" is a spacing difference, not a lost \
-piece; only the artist name was actually misheard
+   -- "mocking bird" vs "mockingbird" is spacing; only the artist was misheard
+
+COMMAND: turn on the radio on this channel
+HEARD:   anywhere on the radio
+{"lost": ["turn on", "this channel"], "misheard_as": "", "unintelligible": false}
+   -- two unrelated losses, so two entries
 
 COMMAND: how do you make steel
 HEARD:   or do you make a sale
 {"lost": ["how do you make steel"], "misheard_as": "or do you make a sale", \
 "unintelligible": false}
-   -- multiple words changed together as one coherent near-miss of the whole \
-phrase, so it's one bundled entry, and it's still a close call worth guessing at
+   -- one coherent near-miss of the whole phrase: one bundled entry, still \
+close enough to guess at
 
 COMMAND: skip to next episode
 HEARD:   get to make copies
 {"lost": ["skip to next episode"], "misheard_as": "", "unintelligible": true}
    -- one phrase versus one phrase again, but it reads as a different, \
-unrelated sentence, so there is nothing specific enough to guess at
-
-COMMAND: turn on the radio on this channel
-HEARD:   anywhere on the radio
-{"lost": ["turn on", "this channel"], "misheard_as": "", "unintelligible": false}
-
-COMMAND: please tell me a joke that i'll think is funny
-HEARD:   he said me a job that i think is like
-{"lost": ["tell me a joke", "i'll think is funny"], "misheard_as": "", \
-"unintelligible": false}
+unrelated sentence, so there is nothing to guess at
 
 COMMAND: please turn on the radio
 HEARD:   yes
@@ -832,62 +793,32 @@ assistant.
 
 You get the user's real spoken COMMAND, and REPLY -- what the assistant said \
 after hearing that same command over loud background chatter. The assistant \
-never saw the command in text; REPLY is your only evidence of what reached it.
+never saw the command in text; REPLY is your only evidence of what reached \
+it. Read REPLY as EVIDENCE, not as work to grade: a rambling, unhelpful, \
+evasive or plain wrong reply can still prove the command was heard perfectly, \
+and that is all you are here to establish. Judge REPLY and nothing else; \
+another labeler reads the recognizer's transcript separately.
 
-You are reading REPLY as EVIDENCE, not grading it. A rambling, unhelpful, \
-evasive or plain wrong reply can still prove the assistant heard the command \
-perfectly, and that is all you are here to establish. Never downgrade a reply \
-for being a bad reply; ask only which pieces of the command its wording shows \
-got through.
+First set "form":
+- "repair": asks a targeted question about ONE specific piece the command did \
+state, leaving the rest standing as heard.
+- "repeat": asks for the whole command again, or says it could not catch it, \
+committing to no specific content.
+- "bad": empty, or pure noise with no interpretable content.
+- "answer": EVERYTHING ELSE, whatever its quality.
 
-Judge REPLY and nothing else. A separate labeler reads the speech \
-recognizer's transcript; you must not speculate about it.
+Then list in "lost" the key pieces -- entities, names, places, times, dates, \
+quantities, titles, the requested action -- that REPLY does not show it \
+heard. A piece counts as heard when the reply uses it correctly, judged by \
+meaning rather than wording; a paraphrase, a decline, a hand-off, or an \
+admission of not knowing the ANSWER all still name what was asked. A piece \
+asserted with a WRONG value is lost, with that value in "misheard_as". For \
+"repeat" and "bad", "lost" is always empty: the table downstream treats those \
+as carrying no evidence either way.
 
-First set "form", the shape of the reply:
-- "repair": it asks a targeted question about ONE specific piece the command \
-did state, signalling "I may not have caught this right" while treating the \
-rest as heard. The rest of the command must actually be treated as heard for \
-this to apply.
-- "repeat": it asks for the whole command again, or says it could not catch \
-it, committing to no specific content at all. This INCLUDES the very common \
-"i'm not sure what you mean by <garbled phrase>, could you clarify?" -- \
-quoting mangled audio back and asking what it meant is a request to say the \
-whole thing again, not a targeted question, however specific the quoted \
-phrase looks. It is only "repair" if the question names a piece the command \
-really did contain and leaves the rest standing.
-- "bad": REPLY is empty, or is pure noise with no interpretable content.
-- "answer": EVERYTHING ELSE, whatever its quality. Carrying out the task, \
-answering directly, saying it is looking it up, declining for a capability \
-reason, handing the job back to the user ("you could open your calendar \
-app"), wandering off around the topic, or confidently asserting something \
-wrong -- all of these are "answer". Usefulness, correctness and good \
-behaviour are somebody else's problem.
-
-Then list in "lost" the key pieces of the command the reply does NOT show it \
-heard. Key pieces are entities, names, places, times, dates, quantities, \
-titles, and the requested action. Filler words, the wake word, the \
-assistant's name, and words the rest of the command already implies are never \
-key pieces.
-- A piece counts as heard when the reply uses it correctly, judged by meaning \
-rather than wording. A natural paraphrase counts, and so does a decline or a \
-hand-off that refers to the piece correctly.
-- A reply that wanders off the point still proves it heard whatever pieces it \
-did name along the way. Credit those; list only the rest.
-- A reply that asserts a WRONG value for a piece has lost that piece -- put \
-the wrong value in "misheard_as".
-- A reply that addresses only part of a multi-part command has lost the part \
-it dropped.
-- A reply that names nothing from the command at all -- a boilerplate refusal \
-like "i'm sorry, i can't help with that request", or an answer to some \
-entirely different question -- has lost EVERY key piece. List them all; do \
-not shorten the list because the reply was short.
-For "repeat" and "bad", "lost" is always an empty list: the table downstream \
-already treats those as carrying no evidence either way.
-
-"misheard_as" is the wrong word the reply used in place of a lost piece, or \
-"". "asked_about" is filled in only when "form" is "repair": name the piece \
-the question targets, quoted in the words of the real COMMAND, or "" if the \
-question targets nothing the command actually said.
+"asked_about" is filled in only for "repair": the piece the question targets, \
+quoted in the words of the real COMMAND, or "" if it targets nothing the \
+command said.
 
 Return ONLY JSON: {"form": "...", "lost": [...], "misheard_as": "...", \
 "asked_about": "..."}
@@ -898,46 +829,45 @@ COMMAND: set an alarm for seven am tomorrow
 REPLY:   i'm setting your alarm for 7 am tomorrow.
 {"form": "answer", "lost": [], "misheard_as": "", "asked_about": ""}
 
-COMMAND: what was the score of the mariners game last night
-REPLY:   i can't check last night's game score for you.
-{"form": "answer", "lost": [], "misheard_as": "", "asked_about": ""}
-   -- a capability decline, but it names the game score and last night, so \
-those pieces got through
-
 COMMAND: play my most recent playlist
 REPLY:   i'm not sure how to play your playlist. you might need to open the \
 music app on your device and find the playlist there.
 {"form": "answer", "lost": [], "misheard_as": "", "asked_about": ""}
-   -- it hands the job back to the user, which is a poor reply and \
-irrelevant here: it names playing the playlist, so every piece got through
+   -- handing the job back to the user is a poor reply and irrelevant here: \
+it names playing the playlist, so every piece got through
+
+COMMAND: remind me of how many lists i have
+REPLY:   i'm not sure how many lists you have. you could check your phone's \
+settings or the app where you keep your lists.
+{"form": "answer", "lost": [], "misheard_as": "", "asked_about": ""}
+   -- not knowing the ANSWER is not the same as not hearing the QUESTION; it \
+names the lists and the count being asked for
 
 COMMAND: does artificial intelligence have consciousness
 REPLY:   well, you know, artificial intelligence can be really good at making \
 us feel more in control. for example, it can help us manage our schedules.
 {"form": "answer", "lost": ["have consciousness"], "misheard_as": "", \
 "asked_about": ""}
-   -- it wanders off the question, but it plainly heard "artificial \
-intelligence"; credit that piece and list only the one it never engages with
+   -- it wanders off, but it plainly heard "artificial intelligence"; credit \
+that and list only what it never engages with
 
 COMMAND: add milk to my shopping list and remind me at six
 REPLY:   i'm adding milk to your shopping list.
 {"form": "answer", "lost": ["remind me at six"], "misheard_as": "", \
 "asked_about": ""}
-   -- only half the command is addressed, so the other half was not heard
+   -- only half the command is addressed
 
 COMMAND: play mocking bird by eminem
 REPLY:   playing mockingbird by edna meyer now.
 {"form": "answer", "lost": ["eminem"], "misheard_as": "edna meyer", \
 "asked_about": ""}
-   -- asserting a wrong artist is still an attempt at the task; it heard the \
-song, so only the artist is lost
 
 COMMAND: how many oceans are there in the world
 REPLY:   i'm sorry, i can't help with that request.
 {"form": "answer", "lost": ["how many", "oceans", "in the world"], \
 "misheard_as": "", "asked_about": ""}
-   -- boilerplate that would decline any request equally, so it evidences \
-nothing: every key piece goes in the list
+   -- boilerplate that would decline any request equally evidences nothing: \
+every key piece goes in the list
 
 COMMAND: remind me about the dentist at four thirty
 REPLY:   i've got the dentist reminder -- what time did you say?
@@ -952,16 +882,15 @@ COMMAND: event reminder mona tuesday
 REPLY:   i'm not sure what you mean by "event to mind up money." could you \
 please clarify? are you asking about a way to save money for an event?
 {"form": "repeat", "lost": [], "misheard_as": "", "asked_about": ""}
-   -- it quotes mangled audio back and asks what the whole thing meant. \
-Nothing from the real command is treated as heard, so this is a repeat \
-request, not a targeted question
+   -- quoting mangled audio back and asking what the whole thing meant is a \
+request to say it all again, however specific the quoted phrase looks
 
 COMMAND: brighten the lights a little bit
 REPLY:   i'm not sure what you mean by "write in the lights a little bit." \
 could you be referring to a specific task?
 {"form": "repair", "lost": ["brighten"], "misheard_as": "write in", \
 "asked_about": "brighten"}
-   -- contrast with the previous example: here "the lights a little bit" is \
+   -- contrast with the previous example: "the lights a little bit" is \
 carried over correctly, so only one piece is in doubt"""
 
 
