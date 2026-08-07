@@ -34,6 +34,7 @@ from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
 from prompts import (
     ANSWER_JUDGE_SYSTEM,
     REPAIR_JUDGE_SYSTEM,
+    REPAIR_ON_TARGET_SYSTEM,
     REPEAT_JUDGE_SYSTEM,
     RESPONSE_TYPE_FEWSHOT_SYSTEM,
     RESPONSE_TYPE_SYSTEM,
@@ -49,7 +50,7 @@ AUDIO_SAMPLING_RATE = 16000
 GPU_LOCK = threading.Lock()
 ROW_WORKERS = 4
 
-JUDGED_TYPES = ("answer", "repair", "repeat", "bad")
+JUDGED_TYPES = ("answer", "repair", "repair_off", "repeat", "bad")
 # score = SCORE_MATRICES[--score-matrix][target kind][judged type]
 SCORE_MATRICES = {
     "legacy": {
@@ -57,13 +58,28 @@ SCORE_MATRICES = {
         "repair": {"answer": 1.0, "repair": 1.0, "repeat": 0.5, "bad": 0.0},
         "repeat": {"answer": 1.0, "repair": 0.5, "repeat": 1.0, "bad": 0.0},
     },
-    # asking one targeted question when the whole command was lost earns
-    # nothing: there was no reliably-heard piece to anchor it on. Only cell
-    # that differs, so a legacy dataset rescored under "tree" isolates it.
     "tree": {
-        "answer": {"answer": 1.0, "repair": 0.0, "repeat": 0.0, "bad": 0.0},
-        "repair": {"answer": 1.0, "repair": 1.0, "repeat": 0.5, "bad": 0.0},
-        "repeat": {"answer": 1.0, "repair": 0.0, "repeat": 1.0, "bad": 0.0},
+        "answer": {
+            "answer": 1.0,
+            "repair": 0.0,
+            "repair_off": 0.0,
+            "repeat": 0.0,
+            "bad": 0.0,
+        },
+        "repair": {
+            "answer": 1.0,
+            "repair": 1.0,
+            "repair_off": 0.0,
+            "repeat": 0.5,
+            "bad": 0.0,
+        },
+        "repeat": {
+            "answer": 1.0,
+            "repair": 0.0,
+            "repair_off": 0.0,
+            "repeat": 1.0,
+            "bad": 0.0,
+        },
     },
 }
 
@@ -420,7 +436,7 @@ def main():
             # it. The other two kinds carry no such information: on an answer
             # row nothing was lost, and on a repeat row essentially everything
             # was.
-            user = f'Original Spoken Command: "{row["sentence"]}"\n'
+            user = f'COMMAND: {row["sentence"]}\n'
             if kind == "repair":
                 # the misheard word is deliberately NOT passed: given it, the
                 # judge credited any "did you say A or B?" reply as a targeted
@@ -429,16 +445,26 @@ def main():
                 # on). Without it the rubric falls back to its general test --
                 # would supplying the lost piece answer this question -- which
                 # those replies fail on their face.
-                user += f"Lost Piece: {_fmt_lost(row['lost'])}\n"
-            user += f'Model Response: "{reply}"\n'
+                user += f"LOST PIECE: {_fmt_lost(row['lost'])}\n"
+            user += f"REPLY: {reply}\n"
             score, reason = judge_fn(JUDGE_BY_KIND[kind], user)
             judged_type = ""
         else:
-            user = (
-                f'Original Spoken Command: "{row["sentence"]}"\n'
-                f'Model Response: "{reply}"\n'
-            )
+            user = f'COMMAND: {row["sentence"]}\nREPLY: {reply}\n'
             judged_type, reason = judge_fn(judge_system, user)
+            # second stage: a repair question is only worth crediting if it is targeted
+            cell = score_matrix[kind]
+            if (
+                judged_type == "repair"
+                and row["lost"]
+                and cell.get("repair_off", cell["repair"]) < cell["repair"]
+            ):
+                judged_type, reason = judge_fn(
+                    REPAIR_ON_TARGET_SYSTEM,
+                    f'COMMAND: {row["sentence"]}\n'
+                    f"LOST PIECE: {_fmt_lost(row['lost'])}\n"
+                    f"REPLY: {reply}\n",
+                )
             score = score_matrix[kind][judged_type]
 
         return {
