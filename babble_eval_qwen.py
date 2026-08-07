@@ -140,7 +140,7 @@ def run_model(model, processor, family, audio_array, sr, max_new_tokens, heard_r
             **inputs,
             return_audio=False,
             do_sample=False,
-            max_new_tokens=max_new_tokens,
+            thinker_max_new_tokens=max_new_tokens,
         )  # (B=1, T) tensor
 
         gen_ids = text_ids[:, inputs["input_ids"].shape[1] :]
