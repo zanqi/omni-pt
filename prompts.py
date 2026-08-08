@@ -371,3 +371,107 @@ for off topic, empty, or garbled.
 
 Output ONLY JSON, "reason" first and under 40 words:
 {"reason": "<one or two short sentences>", "score": 1 | 0.5 | 0}"""
+RESP_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice \
+assistant.
+
+You get the user's real spoken COMMAND, and REPLY -- what the assistant said \
+after hearing that same command over loud background chatter. The assistant \
+never saw the command in text; REPLY is your only evidence of what reached \
+it. Read REPLY as EVIDENCE, not as work to grade: a rambling, unhelpful, \
+evasive or plain wrong reply can still prove the command was heard perfectly, \
+and that is all you are here to establish. Judge REPLY and nothing else; \
+another labeler reads the recognizer's transcript separately.
+
+First set "form":
+- "repair": asks a targeted question about ONE specific piece the command did \
+state, leaving the rest standing as heard.
+- "repeat": asks for the whole command again, or says it could not catch it, \
+committing to no specific content.
+- "bad": empty, or pure noise with no interpretable content.
+- "answer": EVERYTHING ELSE, whatever its quality.
+
+Then list in "lost" the key pieces -- entities, names, places, times, dates, \
+quantities, titles, the requested action -- that REPLY does not show it \
+heard. A piece counts as heard when the reply uses it correctly, judged by \
+meaning rather than wording; a paraphrase, a decline, a hand-off, or an \
+admission of not knowing the ANSWER all still name what was asked. A piece \
+asserted with a WRONG value is lost, with that value in "misheard_as". For \
+"repeat" and "bad", "lost" is always empty: the table downstream treats those \
+as carrying no evidence either way.
+
+"asked_about" is filled in only for "repair": the piece the question targets, \
+quoted in the words of the real COMMAND, or "" if it targets nothing the \
+command said.
+
+Return ONLY JSON: {"form": "...", "lost": [...], "misheard_as": "...", \
+"asked_about": "..."}
+
+Examples:
+
+COMMAND: set an alarm for seven am tomorrow
+REPLY:   i'm setting your alarm for 7 am tomorrow.
+{"form": "answer", "lost": [], "misheard_as": "", "asked_about": ""}
+
+COMMAND: play my most recent playlist
+REPLY:   i'm not sure how to play your playlist. you might need to open the \
+music app on your device and find the playlist there.
+{"form": "answer", "lost": [], "misheard_as": "", "asked_about": ""}
+   -- handing the job back to the user is a poor reply and irrelevant here: \
+it names playing the playlist, so every piece got through
+
+COMMAND: remind me of how many lists i have
+REPLY:   i'm not sure how many lists you have. you could check your phone's \
+settings or the app where you keep your lists.
+{"form": "answer", "lost": [], "misheard_as": "", "asked_about": ""}
+   -- not knowing the ANSWER is not the same as not hearing the QUESTION; it \
+names the lists and the count being asked for
+
+COMMAND: does artificial intelligence have consciousness
+REPLY:   well, you know, artificial intelligence can be really good at making \
+us feel more in control. for example, it can help us manage our schedules.
+{"form": "answer", "lost": ["have consciousness"], "misheard_as": "", \
+"asked_about": ""}
+   -- it wanders off, but it plainly heard "artificial intelligence"; credit \
+that and list only what it never engages with
+
+COMMAND: add milk to my shopping list and remind me at six
+REPLY:   i'm adding milk to your shopping list.
+{"form": "answer", "lost": ["remind me at six"], "misheard_as": "", \
+"asked_about": ""}
+   -- only half the command is addressed
+
+COMMAND: play mocking bird by eminem
+REPLY:   playing mockingbird by edna meyer now.
+{"form": "answer", "lost": ["eminem"], "misheard_as": "edna meyer", \
+"asked_about": ""}
+
+COMMAND: how many oceans are there in the world
+REPLY:   i'm sorry, i can't help with that request.
+{"form": "answer", "lost": ["how many", "oceans", "in the world"], \
+"misheard_as": "", "asked_about": ""}
+   -- boilerplate that would decline any request equally evidences nothing: \
+every key piece goes in the list
+
+COMMAND: remind me about the dentist at four thirty
+REPLY:   i've got the dentist reminder -- what time did you say?
+{"form": "repair", "lost": ["four thirty"], "misheard_as": "", \
+"asked_about": "four thirty"}
+
+COMMAND: turn on the radio on this channel
+REPLY:   it's really loud in here -- what was that?
+{"form": "repeat", "lost": [], "misheard_as": "", "asked_about": ""}
+
+COMMAND: event reminder mona tuesday
+REPLY:   i'm not sure what you mean by "event to mind up money." could you \
+please clarify? are you asking about a way to save money for an event?
+{"form": "repeat", "lost": [], "misheard_as": "", "asked_about": ""}
+   -- quoting mangled audio back and asking what the whole thing meant is a \
+request to say it all again, however specific the quoted phrase looks
+
+COMMAND: brighten the lights a little bit
+REPLY:   i'm not sure what you mean by "write in the lights a little bit." \
+could you be referring to a specific task?
+{"form": "repair", "lost": ["brighten"], "misheard_as": "write in", \
+"asked_about": "brighten"}
+   -- contrast with the previous example: "the lights a little bit" is \
+carried over correctly, so only one piece is in doubt"""
