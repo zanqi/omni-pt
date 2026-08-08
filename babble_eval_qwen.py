@@ -422,13 +422,12 @@ def main():
                 model, processor, family, arr, sr, args.max_new_tokens, args.heard_reply
             )
 
-        # The judge sees the reply alone -- never the Heard line, which would
-        # leak evidence into the type decision. A model that ignores the
-        # two-line contract is scored on its raw output rather than penalized
-        # twice; the summary counts how often that happened.
         heard, reply = ("", "")
         if args.heard_reply:
             heard, reply = split_heard_reply(resp)
+        # On the plain track, judge the whole resp
+        # On the heard-reply track, judge the reply line
+        judged_reply = reply if args.heard_reply else resp
 
         if per_kind:
             # the row's label is the ground truth, so the repair rubric gets
@@ -438,19 +437,17 @@ def main():
             # was.
             user = f'COMMAND: {row["sentence"]}\n'
             if kind == "repair":
-                # the misheard word is deliberately NOT passed: given it, the
-                # judge credited any "did you say A or B?" reply as a targeted
-                # question, even when neither A nor B was the lost piece or the
-                # misheard word (4 of the 5 rows the beam-v1 adapter scored 1.0
-                # on). Without it the rubric falls back to its general test --
-                # would supplying the lost piece answer this question -- which
-                # those replies fail on their face.
+                # per-kind judge on repair need the lost
+                # piece to decide if the repair question is
+                # targeted
                 user += f"LOST PIECE: {_fmt_lost(row['lost'])}\n"
-            user += f"REPLY: {reply}\n"
+            user += f"REPLY: {judged_reply}\n"
             score, reason = judge_fn(JUDGE_BY_KIND[kind], user)
             judged_type = ""
         else:
-            user = f'COMMAND: {row["sentence"]}\nREPLY: {reply}\n'
+            # non-per-kind judge, judge see the command and
+            # resp and classify the resp
+            user = f'COMMAND: {row["sentence"]}\nREPLY: {judged_reply}\n'
             judged_type, reason = judge_fn(judge_system, user)
             # second stage: a repair question is only worth crediting if it is targeted
             cell = score_matrix[kind]
@@ -463,7 +460,7 @@ def main():
                     REPAIR_ON_TARGET_SYSTEM,
                     f'COMMAND: {row["sentence"]}\n'
                     f"LOST PIECE: {_fmt_lost(row['lost'])}\n"
-                    f"REPLY: {reply}\n",
+                    f"REPLY: {judged_reply}\n",
                 )
             score = score_matrix[kind][judged_type]
 
