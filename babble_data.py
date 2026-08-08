@@ -1873,14 +1873,12 @@ def collect_babble_pool(split):
 
 
 def make_row(kind, target, path, probe, slurp_id, sentence):
-    reply = target
     if TRACK == "heard-reply":
-        target = f"Heard: {probe['transcript']}\nReply: {reply}"
+        target = f"Heard: {probe['transcript']}\nReply: {target}"
     return {
         "id": next(ROW_ID),
         "kind": kind,
         "target": target,
-        "target_reply": reply,
         "audio": path,
         "snr_db": probe["snr_db"],
         "asr_transcript": probe["transcript"],

@@ -371,6 +371,8 @@ for off topic, empty, or garbled.
 
 Output ONLY JSON, "reason" first and under 40 words:
 {"reason": "<one or two short sentences>", "score": 1 | 0.5 | 0}"""
+
+
 RESP_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice \
 assistant.
 
