@@ -19,7 +19,7 @@
 #
 # Tracks (each writes its own TAG so nothing overwrites a prior run's file):
 #   HR=1   ./eval.sh   hr-v1 data, TASK_PROMPT_HR, few-shot judge, hr adapters
-#   TREE=1 ./eval.sh   tree-v1 data, plain prompt, rules judge, tree adapters,
+#   TREE=1 ./eval.sh   tree-v1 data, restate prompt, rules judge, tree adapters,
 #                      and the tree score matrix (repeat-row repair = 0)
 #   BEAM=1 ./eval.sh   beam-v1 data, plain prompt, beam adapters, and the three
 #                      per-kind judges instead of the type judge + matrix. The
@@ -74,8 +74,8 @@ case "${ABL:-${HR:+hr}${TREE:+tree}${BEAM:+beam}${CR:+cr}}" in
         DEFAULT_QWEN25="$HR_DS_QWEN25"; DEFAULT_QWEN3="$HR_DS_QWEN3"
         ADAPTER_KIND="bab-hr-adapter"; DEFAULT_TAG="hr" ;;
     tree)
-        TRACK_DESC="decision-table"
-        EVAL_FLAGS="--score-matrix tree"
+        TRACK_DESC="two-pass intersection"
+        EVAL_FLAGS="--score-matrix tree --restate-prompt"
         DEFAULT_QWEN25="$TREE_DS_QWEN25"; DEFAULT_QWEN3="$TREE_DS_QWEN3"
         ADAPTER_KIND="bab-tree-adapter"; DEFAULT_TAG="tree" ;;
     beam)

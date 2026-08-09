@@ -24,8 +24,22 @@ TASK_PROMPT_HR = (
 )
 
 
-def task_prompt(heard_reply):
-    return TASK_PROMPT_HR if heard_reply else TASK_PROMPT
+# --tree-label track. Same single-reply format as TASK_PROMPT, but the reply re-state key pieces
+TASK_PROMPT_TREE = (
+    "You are a smart voice device with full access to the user's apps, "
+    "accounts, devices, information, and the internet. Listen to the user's spoken "
+    "request and respond naturally and concisely, addressing everything it asks. "
+    "As you reply, restate every piece of the request you caught -- the action "
+    "and each entity, name, place, time and quantity -- so it is clear what you "
+    "heard. If background noise drowned out part of the request, do not guess at "
+    "the words you missed."
+)
+
+
+def task_prompt(heard_reply, restate=False):
+    if heard_reply:
+        return TASK_PROMPT_HR
+    return TASK_PROMPT_TREE if restate else TASK_PROMPT
 
 
 # Literal text to force onto the assistant turn before generation, so the base
@@ -373,6 +387,10 @@ Output ONLY JSON, "reason" first and under 40 words:
 {"reason": "<one or two short sentences>", "score": 1 | 0.5 | 0}"""
 
 
+# ---
+# --tree-label: two independent per-pass labelers, intersected in code
+# ---
+
 RESP_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice \
 assistant.
 
@@ -384,96 +402,159 @@ evasive or plain wrong reply can still prove the command was heard perfectly, \
 and that is all you are here to establish. Judge REPLY and nothing else; \
 another labeler reads the recognizer's transcript separately.
 
-First set "form":
-- "repair": asks a targeted question about ONE specific piece the command did \
-state, leaving the rest standing as heard.
-- "repeat": asks for the whole command again, or says it could not catch it, \
-committing to no specific content.
-- "bad": empty, or pure noise with no interpretable content.
-- "answer": EVERYTHING ELSE, whatever its quality.
+List in "lost" the key pieces of the command -- entities, names, places, \
+times, dates, quantities, titles, the requested action -- that REPLY does not \
+show it heard. A piece counts as heard when the reply uses it correctly, \
+judged by meaning rather than wording; a paraphrase, a decline, a hand-off, or \
+an admission of not knowing the ANSWER all still name what was asked. A piece \
+the reply asserts with a WRONG value is lost.
 
-Then list in "lost" the key pieces -- entities, names, places, times, dates, \
-quantities, titles, the requested action -- that REPLY does not show it \
-heard. A piece counts as heard when the reply uses it correctly, judged by \
-meaning rather than wording; a paraphrase, a decline, a hand-off, or an \
-admission of not knowing the ANSWER all still name what was asked. A piece \
-asserted with a WRONG value is lost, with that value in "misheard_as". For \
-"repeat" and "bad", "lost" is always empty: the table downstream treats those \
-as carrying no evidence either way.
+Naming a piece correctly settles it as heard, even when the reply goes on to \
+ask a follow-up about it: a command that referred to something only \
+generically ("that podcast", "this event", "the vacuum cleaner") gave no \
+specific value, so asking WHICH one is the assistant gathering information it \
+never had, not evidence that the noise took anything.
 
-"asked_about" is filled in only for "repair": the piece the question targets, \
-quoted in the words of the real COMMAND, or "" if it targets nothing the \
-command said.
+Not key pieces, ever: filler words, the wake word or assistant's name, and the \
+verbs that merely frame a request ("do", "does", "give me", "tell me"). \
+Question words are key pieces -- "how many", "how long", "where", "when" carry \
+what is actually being asked.
 
-Return ONLY JSON: {"form": "...", "lost": [...], "misheard_as": "...", \
-"asked_about": "..."}
+Bundle several words into ONE entry when they are a single point of confusion; \
+keep entries separate when the losses are unrelated. When REPLY asks for the \
+whole command again, or engages with nothing in it at all, it shows no piece \
+was heard: list every key piece.
+
+Return ONLY JSON, "reason" first and under 25 words, quoting "lost" in the \
+words of the real COMMAND:
+{"reason": "...", "lost": [...]}
 
 Examples:
 
 COMMAND: set an alarm for seven am tomorrow
 REPLY:   i'm setting your alarm for 7 am tomorrow.
-{"form": "answer", "lost": [], "misheard_as": "", "asked_about": ""}
+{"reason": "Names the alarm, the time and the day.", "lost": []}
 
 COMMAND: play my most recent playlist
 REPLY:   i'm not sure how to play your playlist. you might need to open the \
 music app on your device and find the playlist there.
-{"form": "answer", "lost": [], "misheard_as": "", "asked_about": ""}
-   -- handing the job back to the user is a poor reply and irrelevant here: \
-it names playing the playlist, so every piece got through
+{"reason": "Handing the job back is a poor reply but names playing the playlist, so every piece got through.", "lost": []}
 
 COMMAND: remind me of how many lists i have
 REPLY:   i'm not sure how many lists you have. you could check your phone's \
 settings or the app where you keep your lists.
-{"form": "answer", "lost": [], "misheard_as": "", "asked_about": ""}
-   -- not knowing the ANSWER is not the same as not hearing the QUESTION; it \
-names the lists and the count being asked for
+{"reason": "Not knowing the ANSWER is not failing to hear the QUESTION; it names the lists and the count.", "lost": []}
+
+COMMAND: play that podcast please
+REPLY:   i'm not sure which "that podcast" you're referring to. can you be \
+more specific? maybe tell me the name of the podcast?
+{"reason": "Quotes the podcast back, so it got through; the command never said which one, so asking is information gathering.", "lost": []}
 
 COMMAND: does artificial intelligence have consciousness
 REPLY:   well, you know, artificial intelligence can be really good at making \
 us feel more in control. for example, it can help us manage our schedules.
-{"form": "answer", "lost": ["have consciousness"], "misheard_as": "", \
-"asked_about": ""}
-   -- it wanders off, but it plainly heard "artificial intelligence"; credit \
-that and list only what it never engages with
+{"reason": "It wanders off, but plainly heard the subject; only the property asked about goes unengaged.", "lost": ["have consciousness"]}
 
 COMMAND: add milk to my shopping list and remind me at six
 REPLY:   i'm adding milk to your shopping list.
-{"form": "answer", "lost": ["remind me at six"], "misheard_as": "", \
-"asked_about": ""}
-   -- only half the command is addressed
+{"reason": "Only half the command is addressed.", "lost": ["remind me at six"]}
 
 COMMAND: play mocking bird by eminem
 REPLY:   playing mockingbird by edna meyer now.
-{"form": "answer", "lost": ["eminem"], "misheard_as": "edna meyer", \
-"asked_about": ""}
+{"reason": "The artist comes back as a different name; spacing of the title is not a loss.", "lost": ["eminem"]}
 
 COMMAND: how many oceans are there in the world
 REPLY:   i'm sorry, i can't help with that request.
-{"form": "answer", "lost": ["how many", "oceans", "in the world"], \
-"misheard_as": "", "asked_about": ""}
-   -- boilerplate that would decline any request equally evidences nothing: \
-every key piece goes in the list
+{"reason": "Boilerplate that would decline any request equally evidences nothing.", "lost": ["how many", "oceans", "in the world"]}
 
 COMMAND: remind me about the dentist at four thirty
 REPLY:   i've got the dentist reminder -- what time did you say?
-{"form": "repair", "lost": ["four thirty"], "misheard_as": "", \
-"asked_about": "four thirty"}
+{"reason": "Confirms the dentist reminder and asks about the time, so the time is the piece in doubt.", "lost": ["four thirty"]}
 
 COMMAND: turn on the radio on this channel
 REPLY:   it's really loud in here -- what was that?
-{"form": "repeat", "lost": [], "misheard_as": "", "asked_about": ""}
+{"reason": "Asks for the whole thing again, engaging with nothing, so no piece is shown heard.", "lost": ["turn on", "the radio", "this channel"]}
 
 COMMAND: event reminder mona tuesday
 REPLY:   i'm not sure what you mean by "event to mind up money." could you \
 please clarify? are you asking about a way to save money for an event?
-{"form": "repeat", "lost": [], "misheard_as": "", "asked_about": ""}
-   -- quoting mangled audio back and asking what the whole thing meant is a \
-request to say it all again, however specific the quoted phrase looks
+{"reason": "Quotes mangled audio back and asks what the whole thing meant; nothing survives.", "lost": ["event reminder", "mona", "tuesday"]}
 
 COMMAND: brighten the lights a little bit
 REPLY:   i'm not sure what you mean by "write in the lights a little bit." \
 could you be referring to a specific task?
-{"form": "repair", "lost": ["brighten"], "misheard_as": "write in", \
-"asked_about": "brighten"}
-   -- contrast with the previous example: "the lights a little bit" is \
-carried over correctly, so only one piece is in doubt"""
+{"reason": "Contrast the previous case: the lights a little bit is carried over correctly, so only the verb is in doubt.", "lost": ["brighten"]}"""
+
+ASR_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice \
+assistant.
+
+You get the user's real spoken COMMAND, and HEARD -- what a speech recognizer \
+caught after loud background chatter. List the key pieces of the command that \
+did not survive: entities, names, places, times, dates, quantities, titles, \
+and the requested action. Judge HEARD and nothing else; another labeler reads \
+the assistant's reply separately.
+
+Not key pieces, ever: filler words, the wake word or assistant's name, the \
+verbs that merely frame a request ("do", "does", "give me", "tell me"), and \
+wording that leaves the same thing being asked (spelling, spacing, number, \
+grammar). Question words are key pieces -- "how many", "how long", "where", \
+"when" carry what is actually being asked.
+
+Bundle several words into ONE "lost" entry when they are a single point of \
+confusion -- a phrase misheard as one specific, similar-sounding phrase. Keep \
+entries separate when the losses are unrelated. When HEARD is destroyed past \
+telling pieces apart, every key piece is lost: list them all.
+
+Return ONLY JSON, "reason" first and under 25 words, quoting "lost" in the \
+words of the real COMMAND:
+{"reason": "...", "lost": [...]}
+
+Examples:
+
+COMMAND: find some classical music by beethoven and play it
+HEARD:   find some classical music by beethoven and play it
+{"reason": "Word-for-word.", "lost": []}
+
+COMMAND: hey olly play playlist tactics from music
+HEARD:   a r i play playlist tactics for music
+{"reason": "Only the wake word is mangled, and the assistant is already listening, so nothing key was lost.", "lost": []}
+
+COMMAND: give me a current traffic report
+HEARD:   me a current traffic report come in and
+{"reason": "Give only frames the request; what is being asked for survived intact.", "lost": []}
+
+COMMAND: does artificial intelligence have consciousness
+HEARD:   thus artificial intelligence have consciousness
+{"reason": "A wrong word in place of the framing verb changes nothing.", "lost": []}
+
+COMMAND: tell me why relationships are so hard
+HEARD:   why relationship is so hard
+{"reason": "Framing verb plus a singular/plural difference.", "lost": []}
+
+COMMAND: how many oceans are there in the world
+HEARD:   how many children are there in the world
+{"reason": "The thing being counted comes back as a different noun.", "lost": ["oceans"]}
+
+COMMAND: i have a meeting by two pm today please remind me
+HEARD:   i have a meeting at two p m today
+{"reason": "The requested action is gone; the time survives.", "lost": ["remind me"]}
+
+COMMAND: play mocking bird by eminem
+HEARD:   play mockingbird by edna meyer
+{"reason": "Spacing of the title is not a loss; only the artist was misheard.", "lost": ["eminem"]}
+
+COMMAND: turn on the radio on this channel
+HEARD:   anywhere on the radio
+{"reason": "Two unrelated losses, so two entries.", "lost": ["turn on", "this channel"]}
+
+COMMAND: how do you make steel
+HEARD:   or do you make a sale
+{"reason": "One coherent near-miss of the whole phrase: one bundled entry.", "lost": ["how do you make steel"]}
+
+COMMAND: skip to next episode
+HEARD:   get to make copies
+{"reason": "It reads as a different, unrelated sentence; no piece survived.", "lost": ["skip to", "next episode"]}
+
+COMMAND: please turn on the radio
+HEARD:   yes
+{"reason": "Nothing distinguishable survived.", "lost": ["turn on", "the radio"]}"""

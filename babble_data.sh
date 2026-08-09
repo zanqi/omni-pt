@@ -14,8 +14,9 @@ source ~/.bashrc
 #
 #   HR=1 ./babble_data.sh    # the Heard:/Reply: track (one probe pass, few-shot
 #                            # labeler, disjoint SNR bands) -> ...-hr-v1 ids
-#   TREE=1 ./babble_data.sh  # the decision-table track (same two probe passes,
-#                            # labeled independently) -> ...-tree-v1 ids
+#   TREE=1 ./babble_data.sh  # the intersection track (same two probe passes,
+#                            # each labeled independently for what it lost, the
+#                            # two loss lists intersected) -> ...-tree-v1 ids
 #   BEAM=1 ./babble_data.sh  # the beam-consensus track (one N-best ASR pass, no
 #                            # task-response pass) -> ...-beam-v1 ids
 set -eo pipefail

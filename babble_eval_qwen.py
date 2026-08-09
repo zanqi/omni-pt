@@ -109,7 +109,9 @@ def get_audio(field):
 
 
 @torch.inference_mode()
-def run_model(model, processor, family, audio_array, sr, max_new_tokens, heard_reply):
+def run_model(
+    model, processor, family, audio_array, sr, max_new_tokens, heard_reply, restate
+):
     """input: audio + task prompt => return: model's text reply"""
     from qwen_omni_utils import process_mm_info
 
@@ -134,7 +136,7 @@ def run_model(model, processor, family, audio_array, sr, max_new_tokens, heard_r
                     # must match the prompt the adapter was trained under --
                     # evaluating an hr adapter under the plain prompt is a
                     # train/test mismatch that reads as a regression
-                    {"type": "text", "text": task_prompt(heard_reply)},
+                    {"type": "text", "text": task_prompt(heard_reply, restate)},
                 ],
             }
         )
@@ -300,6 +302,13 @@ def main():
         "half. Required for adapters trained with sft_qwen.py --heard-reply.",
     )
     ap.add_argument(
+        "--restate-prompt",
+        action="store_true",
+        help="Prompt with TASK_PROMPT_TREE, which asks the model to restate "
+        "every piece of the request it caught. Required for adapters trained "
+        "with sft_qwen.py --restate-prompt.",
+    )
+    ap.add_argument(
         "--score-matrix",
         default="legacy",
         choices=list(SCORE_MATRICES),
@@ -356,7 +365,7 @@ def main():
     )
     score_matrix = SCORE_MATRICES[args.score_matrix]
     print(
-        f"prompt: {'heard-reply' if args.heard_reply else 'plain'} | "
+        f"prompt: {'heard-reply' if args.heard_reply else 'restate' if args.restate_prompt else 'plain'} | "
         f"judge: {'per-kind' if per_kind else 'few-shot' if args.fewshot_judge else 'rules'} | "
         f"scores: {'direct' if per_kind else args.score_matrix} | "
         f"kinds: {','.join(kinds)}"
@@ -419,7 +428,14 @@ def main():
         arr, sr = get_audio(row["audio"])
         with GPU_LOCK:
             resp = run_model(
-                model, processor, family, arr, sr, args.max_new_tokens, args.heard_reply
+                model,
+                processor,
+                family,
+                arr,
+                sr,
+                args.max_new_tokens,
+                args.heard_reply,
+                args.restate_prompt,
             )
 
         heard, reply = ("", "")
@@ -556,6 +572,7 @@ def main():
                     "model_family": family,
                     "judge_model": args.judge_model,
                     "heard_reply": args.heard_reply,
+                    "restate_prompt": args.restate_prompt,
                     "fewshot_judge": args.fewshot_judge,
                     "judge_mode": args.judge_mode,
                     "score_matrix": args.score_matrix,

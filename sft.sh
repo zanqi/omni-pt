@@ -21,8 +21,9 @@
 #                         # its composition -> adapter <model>-bab[-<track>]-sft
 #   HR=1 ./sft.sh         # Heard:/Reply: track — hr-v1 datasets, TASK_PROMPT_HR,
 #                         # adapters named <model>-bab-hr-adapter-<n>x
-#   TREE=1 ./sft.sh       # decision-table track — tree-v1 datasets, plain
-#                         # TASK_PROMPT, adapters <model>-bab-tree-adapter-<n>x
+#   TREE=1 ./sft.sh       # intersect-the-two-passes track — tree-v1 datasets,
+#                         # TASK_PROMPT_TREE (the restate prompt the data was
+#                         # probed under), <model>-bab-tree-adapter-<n>x
 #   BEAM=1 ./sft.sh       # beam-consensus track — beam-v1 datasets, plain
 #                         # TASK_PROMPT, adapters <model>-bab-beam-adapter-<n>x
 #   CR=1 ./sft.sh         # C/R-only track — beam-v3 datasets with the repeat
@@ -46,24 +47,25 @@ EPOCHS="${EPOCHS:-3}"
 # renamed run can keep a prior adapter of the same track intact (mirrors eval.sh)
 ADAPTER_KIND_ENV="${ADAPTER_KIND:-}"
 
-# the tree track trains under the plain prompt, so only HR passes a flag
-HR_FLAG=""
+# which task prompt the adapter trains under -- it must match the one the
+# dataset's probes and targets were built under
+PROMPT_FLAG=""
 # extra per-track flags (currently only CR's kind filter) and the sweep's
 # non-answer caps, which CR shrinks to 'repair' alone
 EXTRA_FLAGS=""
 FIXED_CAPS="repair=1000,repeat=1000"
 if [[ -n "${HR:-}" ]]; then
-    HR_FLAG="--heard-reply"
+    PROMPT_FLAG="--heard-reply"
     ADAPTER_KIND="bab-hr-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-hr-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-hr-v1"
 elif [[ -n "${TREE:-}" ]]; then
+    PROMPT_FLAG="--restate-prompt"
     ADAPTER_KIND="bab-tree-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-tree-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-tree-v1"
 elif [[ -n "${BEAM:-}" ]]; then
-    # beam rows carry the same audio + target columns, so training is identical
-    # to the tree track's: plain prompt, no extra flag
+    # beam rows were probed under the plain TASK_PROMPT, so no prompt flag
     ADAPTER_KIND="bab-beam-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-beam-v1"
@@ -104,7 +106,7 @@ run_sweep() {
         # one, so the dataset's own answer:repair:repeat mix is what the model sees
         run_name="${model_name}-${ADAPTER_KIND%-adapter}-sft"
         echo "=== ${run_name}: train split ${SINGLE_CAPS:-as built}, ${EPOCHS} epochs <- ${ds_id} ==="
-        python -u sft_qwen.py $HR_FLAG $EXTRA_FLAGS \
+        python -u sft_qwen.py $PROMPT_FLAG $EXTRA_FLAGS \
             --omni-path "$omni_path" \
             --ds-id "$ds_id" \
             ${SINGLE_CAPS:+--train-caps "$SINGLE_CAPS"} \
@@ -117,7 +119,7 @@ run_sweep() {
     for n in $MULTS; do
         run_name="${model_name}-${ADAPTER_KIND}-${n}x"
         echo "=== ${run_name}: answer=$((n * 1000)) ${FIXED_CAPS}, ${EPOCHS} epochs <- ${ds_id} ==="
-        python -u sft_qwen.py $HR_FLAG $EXTRA_FLAGS \
+        python -u sft_qwen.py $PROMPT_FLAG $EXTRA_FLAGS \
             --omni-path "$omni_path" \
             --ds-id "$ds_id" \
             --train-caps "answer=$((n * 1000)),${FIXED_CAPS}" \

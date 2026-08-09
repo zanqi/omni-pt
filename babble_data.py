@@ -13,11 +13,13 @@ transcript, response) and labels the probe:
 - "repeat":     more than one key piece lost in both passes
 
 --tree-label: the same two probe passes, but neither labeler sees the other's
-pass. label_asr diffs the transcript against the command; label_resp reads
-what the reply demonstrates it heard. decide_kind() then resolves the pair of
-labels with a fixed table, which also names the one piece a repair question
-should anchor on. A clean result from EITHER pass alone means "answer";
-"repeat" needs both passes to have failed badly.
+pass, and neither judges the kind. Each returns only a list of the command's
+key pieces its own witness lost -- one diffing the transcript, one reading what
+the reply demonstrates it heard (under TASK_PROMPT_TREE, which asks the model
+to restate what it caught, so the reply is readable as evidence). decide_kind()
+intersects the two lists in code: no agreed piece means "answer", exactly one
+means "repair" and is the piece the question asks about, two or more means
+"repeat" -- as does both lists on their own spanning most of the command.
 
 --beam-label: ONE probe pass, an ASR decode with beam search returning the
 ASR_N_BEST best hypotheses for the same noisy audio. There is no task-response
@@ -62,9 +64,11 @@ from tqdm import tqdm
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
 from prompts import (
+    ASR_LOSS_SYSTEM,
     HEARD_PREFILL,
     RESP_LOSS_SYSTEM,
     TASK_PROMPT,
+    TASK_PROMPT_TREE,
     split_heard_reply,
     task_prompt,
 )
@@ -692,113 +696,10 @@ covering the full request requires."""
 ANSWER_TARGET_USER = 'COMMAND:\n"{sentence}"'
 
 
-# ---
-# --tree-label: two independent per-pass labelers + a decision table
-# ---
-
-# The default track hands both passes to ONE classifier call and asks it to
-# reconcile them, which needs a long rubric of tie-breaks ("a correct reply
-# always overrides a bad transcript") and still lets a good pass launder a bad
-# one. Here each pass is labeled against the command alone, by a labeler that
-# never sees the other pass, and decide_kind() resolves the pair in code.
-
-ASR_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice \
-assistant.
-
-You get the user's real spoken COMMAND, and HEARD -- what a speech recognizer \
-caught after loud background chatter. List the key pieces of the command that \
-did not survive: entities, names, places, times, dates, quantities, titles, \
-and the requested action. Judge HEARD and nothing else; another labeler reads \
-the assistant's reply separately.
-
-Not key pieces, ever: filler words, the wake word or assistant's name, the \
-verbs that merely frame a request ("do", "does", "give me", "tell me"), and \
-wording that leaves the same thing being asked (spelling, spacing, number, \
-grammar). Question words are key pieces -- "how many", "how long", "where", \
-"when" carry what is actually being asked.
-
-Bundle several words into ONE "lost" entry when they are a single point of \
-confusion -- a phrase misheard as one specific, similar-sounding phrase. Keep \
-entries separate when the losses are unrelated.
-
-Set "unintelligible" when HEARD is destroyed past telling pieces apart, so \
-there is nothing specific enough to guess at; give one entry naming what is \
-unclear. The flag, not the length of the list, marks this case.
-
-Return ONLY JSON, quoting "lost" in the words of the real COMMAND, with the \
-wrong word HEARD in "misheard_as" (or "" if the piece was simply dropped):
-{"lost": [...], "misheard_as": "...", "unintelligible": true|false}
-
-Examples:
-
-COMMAND: find some classical music by beethoven and play it
-HEARD:   find some classical music by beethoven and play it
-{"lost": [], "misheard_as": "", "unintelligible": false}
-
-COMMAND: hey olly play playlist tactics from music
-HEARD:   a r i play playlist tactics for music
-{"lost": [], "misheard_as": "", "unintelligible": false}
-   -- the wake word is mangled beyond recognition and still is not a lost \
-piece: the assistant is already listening
-
-COMMAND: give me a current traffic report
-HEARD:   me a current traffic report come in and
-{"lost": [], "misheard_as": "", "unintelligible": false}
-   -- "give" only frames the request; what is being asked for survived intact
-
-COMMAND: does artificial intelligence have consciousness
-HEARD:   thus artificial intelligence have consciousness
-{"lost": [], "misheard_as": "", "unintelligible": false}
-   -- a wrong word in place of the framing verb changes nothing
-
-COMMAND: tell me why relationships are so hard
-HEARD:   why relationship is so hard
-{"lost": [], "misheard_as": "", "unintelligible": false}
-   -- framing verb plus a singular/plural difference
-
-COMMAND: how many oceans are there in the world
-HEARD:   how many children are there in the world
-{"lost": ["oceans"], "misheard_as": "children", "unintelligible": false}
-
-COMMAND: i have a meeting by two pm today please remind me
-HEARD:   i have a meeting at two p m today
-{"lost": ["remind me"], "misheard_as": "", "unintelligible": false}
-
-COMMAND: play mocking bird by eminem
-HEARD:   play mockingbird by edna meyer
-{"lost": ["eminem"], "misheard_as": "edna meyer", "unintelligible": false}
-   -- "mocking bird" vs "mockingbird" is spacing; only the artist was misheard
-
-COMMAND: turn on the radio on this channel
-HEARD:   anywhere on the radio
-{"lost": ["turn on", "this channel"], "misheard_as": "", "unintelligible": false}
-   -- two unrelated losses, so two entries
-
-COMMAND: how do you make steel
-HEARD:   or do you make a sale
-{"lost": ["how do you make steel"], "misheard_as": "or do you make a sale", \
-"unintelligible": false}
-   -- one coherent near-miss of the whole phrase: one bundled entry, still \
-close enough to guess at
-
-COMMAND: skip to next episode
-HEARD:   get to make copies
-{"lost": ["skip to next episode"], "misheard_as": "", "unintelligible": true}
-   -- one phrase versus one phrase again, but it reads as a different, \
-unrelated sentence, so there is nothing to guess at
-
-COMMAND: please turn on the radio
-HEARD:   yes
-{"lost": ["turn on the radio"], "misheard_as": "", "unintelligible": true}
-   -- nothing distinguishable survived"""
-
-
 ASR_LOSS_USER = "COMMAND: {sentence}\nHEARD:   {transcript}"
 
 
 RESP_LOSS_USER = "COMMAND: {sentence}\nREPLY:   {response}"
-
-RESP_FORMS = ("answer", "repair", "repeat", "bad")
 
 # SLURP's assistant is "olly" (~150 sentences open with it). Both labeler
 # prompts say the wake word is never a key piece, and both still occasionally
@@ -865,174 +766,110 @@ PIECE_STOPWORDS = {
 }
 
 
-def label_asr(sentence, transcript):
-    """(command, ASR transcript) -> {lost, misheard_as, unintelligible} | None."""
-    if not transcript:
-        return None
+def label_loss(system, witness_user):
+    """(rubric, rendered USER block) -> list of lost pieces | None.
+
+    The two tree labelers differ only in their rubric and in which witness
+    their USER block quotes, so one call site serves both.
+    """
     obj = gpt_json(
-        ASR_LOSS_SYSTEM,
-        ASR_LOSS_USER.format(
-            sentence=_normalize_text(sentence), transcript=_normalize_text(transcript)
-        ),
+        system,
+        witness_user,
         temperature=CLASSIFY_TEMPERATURE,
         max_tokens=CLASSIFY_MAX_TOKENS,
     )
     if obj is None:
         return None
-    return {
-        "lost": drop_wake_only(
-            [str(s).strip() for s in obj.get("lost", []) if str(s).strip()]
-        ),
-        "misheard_as": str(obj.get("misheard_as", "")).strip(),
-        "unintelligible": bool(obj.get("unintelligible", False)),
-    }
-
-
-def label_resp(sentence, response):
-    """(command, task reply) -> {form, lost, misheard_as, asked_about} | None."""
-    if not response:
-        return None
-    obj = gpt_json(
-        RESP_LOSS_SYSTEM,
-        RESP_LOSS_USER.format(
-            sentence=_normalize_text(sentence), response=_normalize_text(response)
-        ),
-        temperature=CLASSIFY_TEMPERATURE,
-        max_tokens=CLASSIFY_MAX_TOKENS,
+    return drop_wake_only(
+        [str(s).strip() for s in obj.get("lost", []) if str(s).strip()]
     )
-    if obj is None:
-        return None
-    form = str(obj.get("form", "")).strip().lower()
-    if form not in RESP_FORMS:
-        return None
-    return {
-        "form": form,
-        "lost": drop_wake_only(
-            [str(s).strip() for s in obj.get("lost", []) if str(s).strip()]
-        ),
-        "misheard_as": str(obj.get("misheard_as", "")).strip(),
-        "asked_about": str(obj.get("asked_about", "")).strip(),
-    }
 
 
-def decide_kind(sentence, asr, resp):
-    """Independent per-pass labels -> {kind, anchor, misheard_as, buckets}.
+def decide_kind(sentence, asr_lost, resp_lost):
+    """Two independent loss lists -> {kind, lost_piece, missing, buckets}.
 
-    The decision table. `resp=None` falls back to the ASR pass alone, which is
-    both what happens when the reply labeler errors out and the entry point
-    for an ASR-only classifier variant -- pass resp=None and skip label_resp.
+    The passes never see each other, so a piece only counts as really lost
+    when BOTH of them report it -- the intersection is the label:
 
-    Returns None when the table lands on "repair" with no piece to anchor the
-    question on; such a row is unusable, so the caller drops the probe.
+        0 pieces  -> "answer"   (the passes disagree about every loss)
+        1 piece   -> "repair"   (one agreed piece to ask about)
+        >=2       -> "repeat"   (too many holes to build one question on)
+
+    Plus one override: when each pass on its own says most of the command went
+    missing, the audio is a "repeat" whatever the two lists happen to share --
+    an intersection of one there is a coincidence between two wrecks, not a
+    single clean hole.
     """
 
-    def overlap(a, b):
-        # `lost` entries are free-text quotes, so "the 7 am alarm" and "7 am"
-        # have to intersect. One shared content token is enough -- this only
-        # ever adjudicates a1's single entry against the reply's list.
-        ta = set(_normalize_text(a).split()) - PIECE_STOPWORDS
-        tb = set(_normalize_text(b).split()) - PIECE_STOPWORDS
-        return bool(ta & tb)
+    def tokens(pieces):
+        toks = set()
+        for p in pieces:
+            toks |= set(_normalize_text(p).split())
+        return toks - PIECE_STOPWORDS
 
-    lost = asr["lost"]
-    if asr["unintelligible"]:
-        # nothing nameable survived, however few entries that took to say
-        a = "aN"
-    else:
-        a = "a0" if not lost else "a1" if len(lost) == 1 else "aN"
+    cmd = tokens([sentence])
+    # `lost` entries are free-text quotes of the same command, so "the 7 am
+    # alarm" and "7 am" have to intersect: one shared content token is enough
+    # for two entries to be the same piece.
+    r_toks = tokens(resp_lost)
+    agreed = [p for p in asr_lost if tokens([p]) & r_toks]
+    # ASR wording for the surviving piece: both rubrics quote the real
+    # command, and the transcript pass is the more literal of the two
+    # witnesses, so its quote tends to sit closer to the spoken words.
+    lost_piece = agreed[0] if len(agreed) == 1 else ""
+    kind = "answer" if not agreed else "repair" if len(agreed) == 1 else "repeat"
 
-    if resp is None:
-        kind = {"a0": "answer", "a1": "repair", "aN": "repeat"}[a]
-        r = ""
-        anchor = lost[0] if kind == "repair" else ""
-        misheard = asr["misheard_as"] if kind == "repair" else ""
-    else:
-        form, r_lost = resp["form"], resp["lost"]
-        if form == "repair":
-            r = "rREPAIR"
-        elif form == "repeat":
-            r = "rREPEAT"
-        elif form == "bad":
-            r = "rBAD"
-        else:
-            r = "r0" if not r_lost else "r1" if len(r_lost) == 1 else "rN"
-
-        # An empty or uninterpretable reply demonstrates exactly as much as a
-        # repeat request does: nothing. Routing it that way makes the row fall
-        # back to the ASR pass alone -- identical to what resp=None does
-        # above. Kept as its own bucket rather than rewriting `form`, so a
-        # built dataset still shows how often the reply pass abstained.
-        route = "rREPEAT" if r == "rBAD" else r
-
-        if a == "a0" or route == "r0":
-            # either pass coming through clean clears the audio, whatever the
-            # other one did
-            kind, anchor, misheard = "answer", "", ""
-        elif route == "rREPAIR":
-            kind, anchor, misheard = "repair", resp["asked_about"], resp["misheard_as"]
-        elif route == "r1":
-            kind, anchor, misheard = "repair", r_lost[0], resp["misheard_as"]
-        elif route == "rREPEAT":
-            # the reply says nothing, so only the ASR pass is speaking
-            if a == "a1":
-                kind, anchor, misheard = "repair", lost[0], asr["misheard_as"]
-            else:
-                kind, anchor, misheard = "repeat", "", ""
-        elif a == "a1" and any(overlap(p, lost[0]) for p in r_lost):
-            # rN, and both passes agree on one piece
-            kind = "repair"
-            anchor = lost[0]
-            misheard = asr["misheard_as"] or resp["misheard_as"]
-        elif a == "a1":
-            # rN, disjoint: the passes disagree about what was lost, so treat
-            # neither loss as real
-            kind, anchor, misheard = "answer", "", ""
-        else:
-            kind, anchor, misheard = "repeat", "", ""
-
-    if kind == "repair" and lost_too_much(anchor, sentence):
-        kind, anchor, misheard = "repeat", "", ""
-
-    if kind == "repair" and not anchor:
-        return None
-
-    # "missing" rather than "lost", to match what the other two labelers return
-    if kind == "repair":
-        pieces = [anchor]
-    elif kind == "repeat":
-        pieces = list(dict.fromkeys(lost + (resp["lost"] if resp else [])))
-    else:
-        pieces = []
+    wrecked = bool(cmd) and all(
+        len(tokens(side) & cmd) / len(cmd) >= LOST_MAX_PCT
+        for side in (asr_lost, resp_lost)
+    )
+    if wrecked or (kind == "repair" and lost_too_much(lost_piece, sentence)):
+        kind, lost_piece = "repeat", ""
 
     return {
         "kind": kind,
-        "anchor": anchor,
-        "misheard_as": misheard,
-        "missing": pieces,
-        "asr_bucket": a,
-        "resp_bucket": r,
+        "lost_piece": lost_piece,
+        # no witness of a similar-sounding substitute on this track, so a
+        # repair question here always asks openly
+        "misheard_as": "",
+        # "missing" rather than "lost", to match what the other labelers return
+        "missing": (
+            [lost_piece]
+            if kind == "repair"
+            else list(dict.fromkeys(asr_lost + resp_lost)) if kind == "repeat" else []
+        ),
+        "asr_bucket": f"a{len(asr_lost)}",
+        "resp_bucket": f"r{len(resp_lost)}",
         "reason": (
-            f"{a}x{r or '-'} | asr lost: {'; '.join(lost) or 'none'}"
-            f"{' (unintelligible)' if asr['unintelligible'] else ''}"
-            + (
-                f" | reply {resp['form']}, lost: {'; '.join(resp['lost']) or 'none'}"
-                if resp
-                else ""
-            )
+            f"a{len(asr_lost)}xr{len(resp_lost)} -> {len(agreed)} agreed"
+            f"{' (both wrecked)' if wrecked else ''}"
+            f" | asr lost: {'; '.join(asr_lost) or 'none'}"
+            f" | reply lost: {'; '.join(resp_lost) or 'none'}"
         ),
     }
 
 
 def label_tree(sentence, transcript, response):
-    """Label both passes independently, then resolve them with the table.
+    """Label both passes independently, then intersect their loss lists.
 
-    A reply labeler that errors out leaves resp=None, which decide_kind reads
-    as the ASR-only rule rather than failing the probe.
+    Either labeler failing -- an empty witness, or a call that never returned
+    valid JSON -- leaves nothing to intersect, so the probe is dropped and
+    probe_by_kinds redraws.
     """
-    asr = label_asr(sentence, transcript)
-    if asr is None:
+    if not transcript or not response:
         return None
-    return decide_kind(sentence, asr, label_resp(sentence, response))
+    cmd = _normalize_text(sentence)
+    asr_lost = label_loss(
+        ASR_LOSS_SYSTEM,
+        ASR_LOSS_USER.format(sentence=cmd, transcript=_normalize_text(transcript)),
+    )
+    resp_lost = label_loss(
+        RESP_LOSS_SYSTEM,
+        RESP_LOSS_USER.format(sentence=cmd, response=_normalize_text(response)),
+    )
+    if asr_lost is None or resp_lost is None:
+        return None
+    return decide_kind(sentence, asr_lost, resp_lost)
 
 
 # ---
@@ -1340,22 +1177,24 @@ def label_beam(sentence, hyps):
         kind = "repeat"
     else:
         kind = {0: "answer", 1: "repair"}.get(len(lost), "repeat")
-    anchor = lost[0] if kind == "repair" else ""
+    lost_piece = lost[0] if kind == "repair" else ""
     misheard = str(obj.get("misheard_as", "")).strip() if kind == "repair" else ""
-    if kind == "repair" and lost_too_much(anchor, sentence):
+    if kind == "repair" and lost_too_much(lost_piece, sentence):
         # one bundled entry spanning most of the command: a repeat request
         # wearing a repair's clothes
-        kind, anchor, misheard = "repeat", "", ""
-    if kind == "repair" and not anchor:
-        # unusable: a repair with no piece to anchor the question on
+        kind, lost_piece, misheard = "repeat", "", ""
+    if kind == "repair" and not lost_piece:
+        # unusable: a repair with no piece to build the question around
         return None
 
     per_hyp = obj.get("per_hypothesis", [])
     return {
         # "missing" rather than "lost", to match the other labelers
-        "missing": [anchor] if kind == "repair" else (lost if kind == "repeat" else []),
+        "missing": (
+            [lost_piece] if kind == "repair" else (lost if kind == "repeat" else [])
+        ),
         "kind": kind,
-        "anchor": anchor,
+        "lost_piece": lost_piece,
         "misheard_as": misheard,
         "unintelligible": unintelligible,
         # kept on the row so a mislabeled probe can be diagnosed without
@@ -1373,12 +1212,6 @@ def label_beam(sentence, hyps):
 # --tree-label: one target per probe
 # ---
 
-# The table anchors the repair question on the individual probe's losses, so
-# targets are written per probe rather than once per utterance triplet.
-# Answers reuse ANSWER_TARGET_SYSTEM above: the base model's own reply to a
-# fully-intelligible probe is a correct answer but a bad target, since it
-# habitually offloads the task back onto the user ("you could open your music
-# app and search for it"), which is the opposite of what we want trained in.
 
 REPAIR_TARGET_SYSTEM = """You are writing the reply a smart voice assistant \
 should give when background chatter cost it exactly one piece of a spoken \
@@ -1423,8 +1256,56 @@ Return ONLY JSON: {"repair": "..."}"""
 # block on --beam-label; the writer is told in the system prompt how to read
 # either shape.
 REPAIR_TARGET_USER = (
-    'COMMAND:\n"{sentence}"\n\n' "HEARD:\n{heard}\n" 'LOST-PIECE: "{anchor}"{swap_note}'
+    'COMMAND:\n"{sentence}"\n\n'
+    "HEARD:\n{heard}\n"
+    'LOST-PIECE: "{lost_piece}"{swap_note}'
 )
+
+
+# --tree-label's own pair. The tree label is the intersection of two loss
+# lists, so by construction every part of the command outside LOST-PIECE came
+# through on both witnesses -- saying that in the prompt is both more accurate
+# and shorter than handing over a noisy transcript and asking the writer to
+# work out which words it can trust. No MISHEARD-AS either: neither tree
+# labeler reports a substitute word any more, so the question always asks
+# openly.
+REPAIR_TARGET_TREE_SYSTEM = """You are writing the reply a smart voice \
+assistant should give when background chatter cost it exactly one piece of a \
+spoken command.
+
+You get the user's real COMMAND and the LOST-PIECE of it that did not reach \
+the device. Every other part of the command was heard correctly, so those are \
+the words to build your question around.
+
+Write ONE short natural question (under 20 words) recovering ONLY the lost \
+piece. Test: if the user replied with just the missing words, the command \
+would be complete.
+- NEVER ask about the parts that were heard correctly -- asking again would \
+sound like the assistant wasn't listening. Quote or paraphrase them instead, \
+to show what did get through.
+- NEVER say the LOST-PIECE, or any word of it, back to the user. This is the \
+one way to fail this task outright. The device did not hear that word -- it is \
+in this prompt only so you know which slot to ask about -- so a reply that \
+speaks it is a reply the device could not have produced.
+- Ask openly for the KIND of thing that went missing, never the thing itself. \
+LOST-PIECE "mona" -> "Who is the reminder for?"; LOST-PIECE "grubhub" -> \
+"Which app should I order from?".
+- Some lost pieces are small grammar words ("new", "made", "give") with no \
+category to ask about, so every question you can think of ends up saying the \
+word. Ask about its POSITION instead: quote the run of words you did hear and \
+ask what sat next to them. LOST-PIECE "new" in "create a new event" -> "I got \
+create the event -- what was the word before event?"; LOST-PIECE "made" in \
+"how is iron made" -> "I got how iron -- what were you asking about it?". Never \
+give up and name the word.
+- Sound like natural speech, not a form. Vary the structure freely: \
+"Which...?", "How long before...?", "Who should...?", "What time...?", \
+"Where...?", or a statement plus a question ("I lost one part -- where to?"). \
+Do NOT default to starting with "Sorry".
+
+Return ONLY JSON: {"repair": "..."}"""
+
+
+REPAIR_TARGET_TREE_USER = 'COMMAND:\n"{sentence}"\nLOST-PIECE: "{lost_piece}"'
 
 
 # A repeat reply references nothing from the probe -- it cannot, since the
@@ -1569,6 +1450,11 @@ def write_target(sentence, kind, probe):
     if kind == "answer":
         system = ANSWER_TARGET_SYSTEM
         user = ANSWER_TARGET_USER.format(sentence=sentence)
+    elif kind == "repair" and TRACK == "tree":
+        system = REPAIR_TARGET_TREE_SYSTEM
+        user = REPAIR_TARGET_TREE_USER.format(
+            sentence=sentence, lost_piece=probe["lost_piece"]
+        )
     elif kind == "repair":
         hyps = probe.get("hypotheses") or []
         system = REPAIR_TARGET_SYSTEM
@@ -1579,14 +1465,14 @@ def write_target(sentence, kind, probe):
                 if len(hyps) > 1
                 else f'"{probe["transcript"]}"'
             ),
-            anchor=probe["anchor"],
+            lost_piece=probe["lost_piece"],
             swap_note=(
                 f'\nMISHEARD-AS: "{probe["swapped"][0]}"' if probe["swapped"] else ""
             ),
         )
 
     leakable = (
-        set(_normalize_text(probe["anchor"]).split()) - NON_PIECE_WORDS
+        set(_normalize_text(probe["lost_piece"]).split()) - NON_PIECE_WORDS
         if kind == "repair"
         else set()
     )
@@ -1765,7 +1651,8 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                 transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
 
                 # get batch omni assistant respond
-                convs = [_conv(p, sysp, TASK_PROMPT) for p in paths]
+                task = TASK_PROMPT_TREE if TRACK == "tree" else TASK_PROMPT
+                convs = [_conv(p, sysp, task) for p in paths]
                 responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)
 
             # same two witnesses either way; only how they're labeled differs
@@ -1801,10 +1688,10 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                     # other two tracks fill this in later, once the probe is
                     # actually kept
                     "target": label.get("reply", ""),
-                    # tree track only: the table cell and the piece it picked
+                    # tree track only: the two per-pass loss counts
                     "asr_bucket": label.get("asr_bucket", ""),
                     "resp_bucket": label.get("resp_bucket", ""),
-                    "anchor": label.get("anchor", ""),
+                    "lost_piece": label.get("lost_piece", ""),
                     # beam track only: all K hypotheses (the repair target
                     # writer grounds its question in these), the per-hypothesis
                     # loss lists behind the consensus, and whether the
@@ -1886,11 +1773,11 @@ def make_row(kind, target, path, probe, slurp_id, sentence):
         "lost": probe["lost"],
         "swapped": probe["swapped"],
         "classifier_reason": probe["reason"],
-        # tree track: which table cell produced this row, and the piece the
-        # repair question was anchored on. "" on the other two tracks.
+        # tree track: how many pieces each pass reported lost, and (tree and
+        # beam) the one agreed piece the repair question asks about.
         "asr_bucket": probe["asr_bucket"],
         "resp_bucket": probe["resp_bucket"],
-        "anchor": probe["anchor"],
+        "lost_piece": probe["lost_piece"],
         # beam track: the K hypotheses this row's label was intersected from,
         # and the per-hypothesis loss lists as JSON so a mislabeled row can be
         # diagnosed without re-running the GPU pass. Empty on the other tracks.
@@ -2159,8 +2046,8 @@ if __name__ == "__main__":
         "--tree-label",
         action="store_true",
         help="Two probe passes as usual, but each labeled independently "
-        "against the command and resolved by decide_kind()'s table, which "
-        "also names the piece a repair question anchors on.",
+        "against the command for what it lost; decide_kind() intersects the "
+        "two loss lists to pick the kind and the piece to ask about.",
     )
     track.add_argument(
         "--beam-label",

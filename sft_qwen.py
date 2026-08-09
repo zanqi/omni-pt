@@ -75,14 +75,16 @@ def load_ds_split(ds_id, split, limit=None, kinds=None):
 
 
 class OmniSFTCollator:
-    def __init__(self, processor, system_prompt=None, heard_reply=False) -> None:
+    def __init__(
+        self, processor, system_prompt=None, heard_reply=False, restate=False
+    ) -> None:
         self.processor = processor
         # Qwen3-Omni's HF page says NO system prompt should be set; only
         # qwen2.5 gets QWEN25_SYSTEM_PROMPT (see main()).
         self.system_prompt = system_prompt
         # must match the prompt the dataset's targets were built under, and
         # the one babble_eval_qwen.py evaluates with
-        self.task_prompt = task_prompt(heard_reply)
+        self.task_prompt = task_prompt(heard_reply, restate)
 
     def _conv(self, audio, answer=None):
         conv = []
@@ -261,10 +263,15 @@ def load_model(omni_path, family, use_qlora):
     return model
 
 
-def run_smoke(model, processor, dataset, batch_size, system_prompt, heard_reply):
+def run_smoke(
+    model, processor, dataset, batch_size, system_prompt, heard_reply, restate
+):
     print("\n=== SMOKE TEST ===")
     coll = OmniSFTCollator(
-        processor, system_prompt=system_prompt, heard_reply=heard_reply
+        processor,
+        system_prompt=system_prompt,
+        heard_reply=heard_reply,
+        restate=restate,
     )
     n = min(batch_size, len(dataset))
     exs = [dataset[i] for i in range(n)]
@@ -317,6 +324,13 @@ def main():
         help="Train under TASK_PROMPT_HR. Required for datasets built with "
         "babble_data.py --heard-reply, whose targets are two-line "
         "'Heard: ... / Reply: ...' strings.",
+    )
+    ap.add_argument(
+        "--restate-prompt",
+        action="store_true",
+        help="Train under TASK_PROMPT_TREE, which asks the model to restate "
+        "every piece of the request it caught. Match this to the dataset: "
+        "babble_data.py --tree-label probes under that prompt.",
     )
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument(
@@ -401,7 +415,13 @@ def main():
 
     if args.smoke:
         run_smoke(
-            model, processor, train_ds, args.batch_size, system_prompt, args.heard_reply
+            model,
+            processor,
+            train_ds,
+            args.batch_size,
+            system_prompt,
+            args.heard_reply,
+            args.restate_prompt,
         )
         return
 
@@ -434,7 +454,10 @@ def main():
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         data_collator=OmniSFTCollator(
-            processor, system_prompt=system_prompt, heard_reply=args.heard_reply
+            processor,
+            system_prompt=system_prompt,
+            heard_reply=args.heard_reply,
+            restate=args.restate_prompt,
         ),
     )
 
