@@ -36,7 +36,6 @@ from prompts import (
     REPAIR_JUDGE_SYSTEM,
     REPAIR_ON_TARGET_SYSTEM,
     REPEAT_JUDGE_SYSTEM,
-    RESPONSE_TYPE_FEWSHOT_SYSTEM,
     RESPONSE_TYPE_SYSTEM,
     split_heard_reply,
     task_prompt,
@@ -198,7 +197,9 @@ def make_judge(
                     # whole max_tokens budget on <think> before ever reaching
                     # the JSON payload; the rubric already asks for "reason"
                     # before "score" inside that JSON, so extra thinking is redundant.
-                    kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+                    kwargs["extra_body"] = {
+                        "chat_template_kwargs": {"enable_thinking": False}
+                    }
                 resp = client.chat.completions.create(
                     model=judge_model,
                     max_tokens=max_tokens,
@@ -242,6 +243,7 @@ def make_judge(
 # Judge rubrics
 # ---
 
+
 def _fmt_lost(lost):
     if not lost:
         return "(none)"
@@ -272,12 +274,12 @@ def main():
     ap.add_argument(
         "--judge-model",
         default="Qwen/Qwen3.5-122B-A10B-FP8",
-        help="from vllm --served-model-name; from openai, gpt-4o"
-        )
+        help="from vllm --served-model-name; from openai, gpt-4o",
+    )
     ap.add_argument(
         "--judge-base-url",
         default="http://g3085:8000/v1",
-        help="'http://g3085:8000/v1' for vllm, 'openai' to use openai"
+        help="'http://g3085:8000/v1' for vllm, 'openai' to use openai",
     )
     ap.add_argument(
         "--judge-max-tokens",
@@ -328,13 +330,6 @@ def main():
         "instead of 1.0, so numbers are NOT comparable with 'type' runs. "
         "Independent of the data track, so it can be ablated on any dataset.",
     )
-    ap.add_argument(
-        "--fewshot-judge",
-        action="store_true",
-        help="Judge with RESPONSE_TYPE_FEWSHOT_SYSTEM instead of the rule "
-        "rubric. Independent of --heard-reply so the judge swap can be "
-        "ablated on its own.",
-    )
     args = ap.parse_args()
 
     # if not os.environ.get("OPENAI_API_KEY"):
@@ -360,13 +355,11 @@ def main():
     if kinds != ["answer", "repair", "repeat"]:
         tag = "-".join(kinds)
     out_path = args.out or f"results/bab_results_{model_name}_{tag}.jsonl"
-    judge_system = (
-        RESPONSE_TYPE_FEWSHOT_SYSTEM if args.fewshot_judge else RESPONSE_TYPE_SYSTEM
-    )
+    judge_system = RESPONSE_TYPE_SYSTEM
     score_matrix = SCORE_MATRICES[args.score_matrix]
     print(
         f"prompt: {'heard-reply' if args.heard_reply else 'restate' if args.restate_prompt else 'plain'} | "
-        f"judge: {'per-kind' if per_kind else 'few-shot' if args.fewshot_judge else 'rules'} | "
+        f"judge: {'per-kind' if per_kind else 'rules'} | "
         f"scores: {'direct' if per_kind else args.score_matrix} | "
         f"kinds: {','.join(kinds)}"
     )
@@ -573,7 +566,6 @@ def main():
                     "judge_model": args.judge_model,
                     "heard_reply": args.heard_reply,
                     "restate_prompt": args.restate_prompt,
-                    "fewshot_judge": args.fewshot_judge,
                     "judge_mode": args.judge_mode,
                     "score_matrix": args.score_matrix,
                     "kinds": kinds,
@@ -617,7 +609,9 @@ def main():
             "(judged on raw output)"
         )
     if judge_failures:
-        print(f"judge parse failures: {judge_failures}/{sum(counts.values())} (scored 0)")
+        print(
+            f"judge parse failures: {judge_failures}/{sum(counts.values())} (scored 0)"
+        )
     if per_kind:
         print("\nscores per kind:")
         for k in kinds:
