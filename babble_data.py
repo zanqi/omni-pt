@@ -799,6 +799,14 @@ def decide_kind(sentence, asr_lost, resp_lost):
     missing, the audio is a "repeat" whatever the two lists happen to share --
     an intersection of one there is a coincidence between two wrecks, not a
     single clean hole.
+
+    Two passes that each lost something but agree on none of it are "answer" by
+    the first rule, deliberately: disagreement is read as labeler noise rather
+    than as evidence. It is not free -- on a 21-triplet build 3 of 21 answer
+    rows came out that way, all three real losses (e.g. asr lost "score" while
+    the reply lost "the game"), so they carry a confident target on audio that
+    dropped a piece. Kept anyway: the alternative rules cost either probe
+    throughput or repair rows.
     """
 
     def tokens(pieces):

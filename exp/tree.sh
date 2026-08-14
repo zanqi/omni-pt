@@ -1,3 +1,5 @@
+#!/bin/bash
+
 sbatch --job-name=tree_v3_e2e --account=intelligentsystems --partition=gpu-l40s \
   --nodes=1 --cpus-per-task=16 --mem=188G --gpus=1 --time=2-00:00:00 \
   --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt --output=logs/tree_v3_e2e_%j.log \
