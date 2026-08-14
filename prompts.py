@@ -467,3 +467,595 @@ HEARD:   get to make copies
 COMMAND: please turn on the radio
 HEARD:   yes
 {"reason": "Nothing distinguishable survived.", "lost": ["turn on", "the radio"]}"""
+TARGET_SYSTEM = """You are writing training targets for a smart voice \
+assistant that has full access to the user's apps, accounts, information, and the internet.
+
+You will be given, in the next message, the user's spoken COMMAND and two \
+speech-recognition transcripts of it under increasing background chatter: a \
+REPAIR-TRANSCRIPT that lost exactly one piece (with the LOST-PIECE named, and \
+a MISHEARD-AS value if that piece was swapped for a wrong word), and a \
+REPEAT-TRANSCRIPT that lost too much. Produce three targets for that COMMAND.
+
+Return ONLY valid JSON in exactly this shape:
+{"answer": "<a short natural response, covering every part of the request>", \
+"repair": "<one short question>", \
+"repeat": "<one short request>"}
+
+Rules for "answer": despite background chatter, the full command was heard correctly.
+    - If the command asks for more than one distinct thing (e.g. two \
+questions joined by "and", asked back-to-back, or a request plus a \
+follow-up question), your response must address EVERY part — never answer \
+only the first part and drop the rest.
+    - If the request asks for information (time, weather, facts) \
+and you know the answer, answer DIRECTLY with the correct fact(s), using as \
+few natural sentences as it takes to cover every part asked (often one, \
+sometimes two). Otherwise, say you are looking it up, but ground the \
+response in what was heard: refer to each part of the request so it is \
+clear the assistant followed everything.
+    - "Knowing the answer" means stable general knowledge -- capital cities, \
+who wrote a book, how many oceans there are. It NEVER covers anything \
+private to this user (their emails, calendar, alarms, reminders, messages, \
+files, playlists) or anything that changes by the minute (the time, today's \
+weather, exchange rates, scores, traffic). Having access to those is not the \
+same as knowing them: say you are checking or fetching, and name what you \
+are looking for. "There are no alarms set", "I found two recent emails from \
+Anna this morning" and "the rate is 0.79 pounds" are fabrications however \
+plausible they sound -- "Checking your alarms now" and "Looking up the \
+dollar to pound rate" are the correct shape.
+    - If the request is a task request, confirm the assistant is carrying \
+out the request in one or two natural sentences. Use present or future \
+tense ("I'm setting...", "I'll remind you...")
+    - never claim the action is already done.
+    - Stay natural and concise — don't pad with extra sentences beyond what \
+covering the full request requires.
+
+Rules for "repair": the device heard the command over loud background \
+chatter, and its speech recognition produced the REPAIR-TRANSCRIPT. The one \
+piece it lost from the real command is the LOST-PIECE; everything else can be \
+treated as heard. If a MISHEARD-AS value is given, the recognizer heard that \
+similar-sounding wrong word in place of the lost piece. \
+Write ONE short natural question (under 20 words) that recovers ONLY that \
+piece. Test: if the user replied with just the missing words, the command \
+would be complete.
+  - NEVER ask about parts that were heard correctly — asking about them again \
+would sound like the assistant wasn't listening.
+  - Ground the question in the parts heard correctly (words matching \
+the original), so it is clear the assistant followed everything except this one piece.
+  - Do not reveal the missing words. ONE exception: if a word was swapped \
+for a similar-sounding wrong word (the MISHEARD-AS value), you may ask a \
+confirmation question that offers the true word AND the misheard word as \
+alternatives ("did you say saved or shared?") — never the true word alone.
+  - Sound like natural speech, not a form. Vary structure freely: \
+"Which...?", "How long before...?", "Who should...?", "What time...?", \
+"Where...?", or a statement+question like "I lost one part — where to?". \
+Do NOT default to starting with "Sorry".
+
+Rules for "repeat": at even louder chatter, speech recognition produced the \
+REPEAT-TRANSCRIPT. Too many pieces were lost for a targeted question. Write \
+ONE short natural request (under 15 words) asking the user to repeat the \
+whole command.
+  - Do NOT reference, guess, or hint at ANY content details from either the \
+real command or the garbled transcription — the assistant cannot trust any of it.
+  - Mentioning the noise/chatter is fine and helps explain why.
+  - Sound like natural speech and vary phrasing ("It's really loud here — \
+what was that?", "I couldn't catch that over the noise, could you say it \
+again?"). Do NOT default to starting with "Sorry".
+"""
+ANSWER_TARGET_SYSTEM = """You are writing training targets for a smart voice \
+assistant that has full access to the user's apps, accounts, information, and the internet.
+
+You will be given, in the next message, the user's spoken COMMAND. It was \
+recorded under background chatter, but every piece needed to perform the task \
+survived the noise, so treat the whole command as heard correctly.
+
+Return ONLY valid JSON in exactly this shape:
+{"answer": "<a short natural response, covering every part of the request>"}
+
+Rules for "answer": despite background chatter, the full command was heard correctly.
+    - If the command asks for more than one distinct thing (e.g. two \
+questions joined by "and", asked back-to-back, or a request plus a \
+follow-up question), your response must address EVERY part — never answer \
+only the first part and drop the rest.
+    - If the request asks for information (time, weather, facts) \
+and you know the answer, answer DIRECTLY with the correct fact(s), using as \
+few natural sentences as it takes to cover every part asked (often one, \
+sometimes two). Otherwise, say you are looking it up, but ground the \
+response in what was heard: refer to each part of the request so it is \
+clear the assistant followed everything.
+    - "Knowing the answer" means stable general knowledge -- capital cities, \
+who wrote a book, how many oceans there are. It NEVER covers anything \
+private to this user (their emails, calendar, alarms, reminders, messages, \
+files, playlists) or anything that changes by the minute (the time, today's \
+weather, exchange rates, scores, traffic). Having access to those is not the \
+same as knowing them: say you are checking or fetching, and name what you \
+are looking for. "There are no alarms set", "I found two recent emails from \
+Anna this morning" and "the rate is 0.79 pounds" are fabrications however \
+plausible they sound -- "Checking your alarms now" and "Looking up the \
+dollar to pound rate" are the correct shape.
+    - If the request is a task request, confirm the assistant is carrying \
+out the request in one or two natural sentences. Use present or future \
+tense ("I'm setting...", "I'll remind you...")
+    - never claim the action is already done.
+    - Stay natural and concise — don't pad with extra sentences beyond what \
+covering the full request requires."""
+CLASSIFY_SYSTEM = """You are labeling noisy-audio for training a smart \
+voice assistant. You will be given three texts:
+- COMMAND: the user's real spoken command.
+- TRANSCRIPT: a speech recognizer's transcription of the SAME command after \
+it was mixed with loud background chatter.
+- REPLY: a voice assistant's reply to that same noisy audio.
+COMMAND is the ground-truth command. TRANSCRIPT, and REPLY are the two \
+independent passes over the same noisy audio.
+
+"Key info" means any piece the assistant must know to correctly perform the \
+task: entities, names, places, times, dates, quantities, titles, the \
+requested action or topic. A piece is key info ONLY if the task cannot be \
+correctly performed without it. Carrier/filler words ("please", "could you", \
+"hey", "tell me", "what") are NOT key info. Wake words and the assistant's \
+name or vocative ("hey olly", "ok google", "assistant") are NOT key info \
+either — they are not needed to perform the task, so a misheard wake word \
+("olly" heard as "ollie") never counts as a loss or triggers a repair. \
+Neither is a word whose \
+meaning is already implied by the rest of the command (e.g. "set" in "are \
+there any alarms set" — the command means the same thing without it).
+
+First decide, for EACH key piece of the real command, whether it SURVIVED \
+the noise. Survival is about whether the piece was HEARD, judged \
+semantically, not about exact wording:
+- A piece SURVIVED if the transcript contains it correctly (minor wording or \
+spelling differences are fine), OR the assistant's reply demonstrates it \
+heard and understood that piece. Judge the reply by whether it shows the \
+piece got through, NOT by whether it repeats the piece word-for-word: a \
+natural paraphrase counts, and so does a capability-decline or a hand-off \
+to the user that correctly refers to the piece (e.g. "i cant check the game \
+score for you", "you can see your alarms in the clock app") — both \
+demonstrate the piece was heard even though the task is refused or offloaded. \
+What matters is that the reply uses the piece correctly, whether or not the \
+reply agrees to, is able to, or actually does perform the task.
+- The COMMAND, TRANSCRIPT, and REPLY are all shown lowercase with punctuation \
+stripped, so compare on the words alone — case and punctuation are never \
+evidence of loss or of the action/intent changing.
+- A piece was LOST only if BOTH passes missed it: it is absent, garbled, or \
+replaced by a wrong word in the transcript, AND the reply neither contains \
+it nor otherwise demonstrates it was heard.
+- The assistant asserting a wrong detail does NOT mark a piece lost when the \
+transcript has that piece correctly — the transcript alone is sufficient \
+proof of survival.
+- Losing only filler words never counts as a loss.
+- Singular/plural, spelling, and other minor wording differences in the \
+transcript count as survived, even if the reply heard something else.
+- SPECIAL CARE with substituted words. A DIFFERENT word in the transcript is \
+a mishearing. HOWEVER, if the REPLY contains the correct original word or \
+clearly demonstrates it understood the intent anyway, the piece still SURVIVED. \
+A correct reply always overrides a bad transcript. Do NOT rationalize \
+meaning-changing swaps (e.g., "controls" for "choose") as a spelling variant.
+- The action/intent changing counts as that action piece being lost — but \
+only when the WORDS actually change (e.g. "set an alarm" heard as "cancel \
+an alarm"), never merely because the transcript is rendered with standard \
+capitalization/punctuation.
+
+Evaluate the transcript and the reply SEPARATELY before making a final verdict. \
+Keep evaluations short and under 60 words total.
+
+Then classify as exactly one of:
+- "answer": every key piece survived.
+- "repair": exactly ONE key piece was lost and the rest of the command's \
+key information survived. Before choosing "repair", apply this test: if the \
+user answered a question recovering only the lost piece, would their reply \
+tell the assistant anything it actually needs? If the command is already \
+complete and unambiguous without the piece, classify "answer" instead. If \
+the lost piece was replaced by a similar-sounding wrong word (in the \
+transcript or the reply), report that wrong word in "misheard_as".
+- "repeat": more than one key piece was lost, OR the lost piece(s) make up \
+half or more of the command's key information — including when the command \
+has only ONE key piece and it was lost — OR the audio was so garbled that \
+neither pass caught the key pieces. A targeted question is impossible when \
+there is not enough reliably-heard command left to anchor it on.
+
+Return ONLY valid JSON in exactly this shape (evaluations first):
+{"transcript_evaluation": "<one short verdict per key piece checking ONLY the transcript, e.g. '7 am: lost; alarm: survived'>", \
+"reply_evaluation": "<one short verdict per key piece checking ONLY the reply, e.g. '7 am: missing; alarm: survived because reply says alarms'>", \
+"missing": ["<lost key piece 1>", ...], \
+"misheard_as": "<wrong word heard instead, or empty string>", \
+"kind": "answer" | "repair" | "repeat"}
+
+Rules for "missing": quote the lost pieces using the words of the REAL \
+command. For "answer" it must be an empty list. For "repair" it must contain \
+exactly one key piece. For "repeat" it must contain more than one key piece. \
+Rules for "misheard_as": when "kind" is "repair", and the lost key piece is \
+being misheard as wrong word(s), not deletion. Quote the misheard word(s). \
+Otherwise, it will be empty."""
+BEAM_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice \
+assistant.
+
+You get the user's real spoken COMMAND, and HYPOTHESES -- the speech \
+recognizer's top guesses for the SAME noisy recording of that command, best \
+first. They are alternative readings of ONE audio, not separate recordings, so \
+between them they show you everything the recognizer was able to hear.
+
+Key pieces of a command are entities, names, places, times, dates, quantities, \
+titles, and the requested action. Filler words ("please", "could you", "hey"), \
+the wake word or the assistant's name, and words whose meaning the rest of the \
+command already implies are never key pieces. Neither are spelling, spacing, or \
+other minor wording differences (e.g. "mockingbird" heard as "mocking bird", \
+"ten am" as "ten a m"), a synonym that asks for the same thing ("increase" \
+heard as "raise"), or a question rephrased in different grammar that still \
+asks for the same thing ("what does X mean" heard as "what is X", or "do you \
+think" heard as "you think").
+
+An auxiliary or light verb that only frames the request is not a key piece on \
+its own -- "does", "do", "is", "can you", "give me", "tell me", "get me", \
+"put". The key piece is what is being asked FOR, not the words wrapping the \
+asking. Words that change WHAT is asked do count -- "how many", "how long", \
+"where", "when" carry the actual question.
+
+A name rendered as a close phonetic match is NOT a lost piece: "pawel" heard \
+as "powell", "divya" as "deevya". The recognizer heard the name and spelled it \
+its own way, so the slot is filled and the user has nothing to clarify. It IS \
+a lost piece when the substitute is a different word rather than a spelling of \
+the same sounds -- "mona" heard as "monday" (a weekday, not that name), \
+"eminem" as "edna meyer".
+
+Work in this order.
+
+STEP 1. Take each hypothesis on its own and list the key pieces of the COMMAND \
+that did not survive in THAT hypothesis, with what it put in their place. \
+Judge each hypothesis independently; do not let a later one change what you \
+said about an earlier one.
+
+STEP 2. Intersect. A piece is LOST only if it is missing or wrong in EVERY \
+hypothesis. If even ONE hypothesis has it right, the piece was audible and it \
+SURVIVED -- however badly every other hypothesis mangled it, and even if that \
+one hypothesis is the last and worst-ranked. This is not a majority vote.
+
+STEP 3. For each lost piece, look at what the hypotheses put in its place.
+- If they all agree on the same wrong word, or on trivial variants of one \
+wrong word, that word goes in "misheard_as": there is one specific, plausible \
+mishearing the device can offer back to the user.
+- If they disagree about what the wrong word was, or some simply drop the \
+piece, "misheard_as" stays "" -- there is no stable guess, so the piece was \
+just not heard.
+
+STEP 4. Set "unintelligible" to true when the hypotheses collectively share \
+barely any words or sounds with the COMMAND -- they read as some other \
+sentence entirely -- so nothing survived that a question could be built on. \
+Judge this against the COMMAND. The hypotheses differing from EACH OTHER is \
+normal at every noise level, including clean audio, and is never by itself \
+evidence of a loss.
+
+STEP 5. Set "kind" from the consensus list:
+  0 lost -> "answer"    1 lost -> "repair"    2 or more lost -> "repeat"
+"unintelligible" being true forces "repeat" whatever the count.
+
+Return ONLY JSON:
+{"per_hypothesis": [{"n": 1, "lost": [...], "heard_instead": "..."}, ...], \
+"lost": [...], "misheard_as": "...", "unintelligible": true|false, \
+"kind": "answer" | "repair" | "repeat"}
+
+"per_hypothesis" must have exactly one entry per hypothesis, in order. Quote \
+"lost" using the words of the real COMMAND.
+
+"lost" does not need one entry per missing word -- bundle several words into \
+ONE entry when they are a single point of confusion: a whole phrase misheard \
+as one SPECIFIC, similar-sounding phrase is one entry for the true phrase, \
+with the misheard phrase in "misheard_as". Only bundle that way when the \
+hypotheses agree on a genuine close call -- most of the words or their sounds \
+carry over, so the misheard phrase is a plausible thing to guess and offer \
+back. Keep entries separate when the losses are unrelated to each other (a \
+mishearing in one spot, a different piece dropped elsewhere). When \
+"unintelligible" is true, give one bundled entry naming everything unclear.
+
+Examples:
+
+COMMAND: turn up the brightness
+HYP 1: turn up the brightness
+HYP 2: turn up the brigtness
+HYP 3: turn up the brigthness
+HYP 4: turn up the bright ness
+{"per_hypothesis": [{"n": 1, "lost": [], "heard_instead": ""}, \
+{"n": 2, "lost": [], "heard_instead": ""}, \
+{"n": 3, "lost": [], "heard_instead": ""}, \
+{"n": 4, "lost": [], "heard_instead": ""}], \
+"lost": [], "misheard_as": "", "unintelligible": false, "kind": "answer"}
+   -- four different strings and not one disagreement about content: \
+misspellings and spacing are never losses. Never let the hypotheses merely \
+BEING different stand in for a lost piece
+
+COMMAND: put meeting with pawel for tomorrow ten am
+HYP 1: meeting with powell for tomorrow at 10 a m
+HYP 2: meeting with powell for tomorrow at ten a m
+HYP 3: meeting with powell for tomorrow at 10 a m
+HYP 4: meeting with powell for tomorrow at ten a m
+{"per_hypothesis": [{"n": 1, "lost": [], "heard_instead": ""}, \
+{"n": 2, "lost": [], "heard_instead": ""}, \
+{"n": 3, "lost": [], "heard_instead": ""}, \
+{"n": 4, "lost": [], "heard_instead": ""}], \
+"lost": [], "misheard_as": "", "unintelligible": false, "kind": "answer"}
+   -- "powell" is how the recognizer spells the name it heard, phonetically \
+the same, so there is nothing for the user to clarify; "put" only frames the \
+request; "ten a m" and "10 a m" are renderings of the same time
+
+COMMAND: hey olly play playlist tactics from music
+HYP 1: a r i play playlist tactics for music
+HYP 2: hey ali play playlist tactics for music
+HYP 3: are we play playlist tactics from music
+HYP 4: a really play playlist tactics for music
+{"per_hypothesis": [{"n": 1, "lost": [], "heard_instead": ""}, \
+{"n": 2, "lost": [], "heard_instead": ""}, \
+{"n": 3, "lost": [], "heard_instead": ""}, \
+{"n": 4, "lost": [], "heard_instead": ""}], \
+"lost": [], "misheard_as": "", "unintelligible": false, "kind": "answer"}
+   -- the wake word is mangled beyond recognition in three hypotheses and it \
+STILL is not a lost piece. Never list it, however garbled or absent: the \
+assistant is already listening, so nothing about the task depends on hearing \
+its own name
+
+COMMAND: what is the exchange rate of us dollar to pound sterling
+HYP 1: what is the exchange rate of us to pound
+HYP 2: what is the exchange rate of us to pound
+HYP 3: what is the exchange rate of us to pounds
+HYP 4: what is the exchange rate of us dollar to pound sterling
+{"per_hypothesis": [{"n": 1, "lost": ["dollar", "sterling"], "heard_instead": ""}, \
+{"n": 2, "lost": ["dollar", "sterling"], "heard_instead": ""}, \
+{"n": 3, "lost": ["dollar", "sterling"], "heard_instead": ""}, \
+{"n": 4, "lost": [], "heard_instead": ""}], \
+"lost": [], "misheard_as": "", "unintelligible": false, "kind": "answer"}
+   -- three hypotheses out of four dropped both currencies, and it does not \
+matter: the last one has them, so they were audible. Intersection, not a vote
+
+COMMAND: increase the brightness of the lights
+HYP 1: increase the brightness of the lights
+HYP 2: raise the brightness of the lights
+HYP 3: reduce the brightness of the lights
+HYP 4: with the brightness of the lights
+{"per_hypothesis": [{"n": 1, "lost": [], "heard_instead": ""}, \
+{"n": 2, "lost": [], "heard_instead": ""}, \
+{"n": 3, "lost": ["increase"], "heard_instead": "reduce"}, \
+{"n": 4, "lost": ["increase"], "heard_instead": "with"}], \
+"lost": [], "misheard_as": "", "unintelligible": false, "kind": "answer"}
+   -- hypothesis 3 reverses the action, which would be the worst kind of loss \
+if it were the only witness; hypothesis 1 has it, so the action was heard. \
+"raise" in hypothesis 2 is a synonym asking for the same thing, not a loss
+
+COMMAND: event reminder mona tuesday
+HYP 1: event reminder monday tuesday
+HYP 2: event reminder monday tuesday
+HYP 3: event reminder monday to sunday
+HYP 4: event reminder monday to thursday
+{"per_hypothesis": [{"n": 1, "lost": ["mona"], "heard_instead": "monday"}, \
+{"n": 2, "lost": ["mona"], "heard_instead": "monday"}, \
+{"n": 3, "lost": ["mona", "tuesday"], "heard_instead": "monday, to sunday"}, \
+{"n": 4, "lost": ["mona", "tuesday"], "heard_instead": "monday, to thursday"}], \
+"lost": ["mona"], "misheard_as": "monday", "unintelligible": false, \
+"kind": "repair"}
+   -- "tuesday" survived in the first two hypotheses, so only the name is \
+lost. Unlike "pawel" heard as "powell", "monday" is a different word -- a \
+weekday, not a spelling of that name -- and all four hypotheses agree on it, \
+so it is a specific thing worth offering back to the user
+
+COMMAND: put meeting with pawel for tomorrow ten am
+HYP 1: her meeting will be available tomorrow at ten a m
+HYP 2: her meeting will be available for tomorrow at ten a m
+HYP 3: her meeting with a well for two more at ten a m
+HYP 4: her meeting will be over for two more at ten a m
+{"per_hypothesis": [{"n": 1, "lost": ["pawel"], "heard_instead": ""}, \
+{"n": 2, "lost": ["pawel"], "heard_instead": ""}, \
+{"n": 3, "lost": ["pawel", "for tomorrow"], "heard_instead": "a well, two more"}, \
+{"n": 4, "lost": ["pawel", "for tomorrow"], "heard_instead": "two more"}], \
+"lost": ["pawel"], "misheard_as": "", "unintelligible": false, \
+"kind": "repair"}
+   -- "for tomorrow" and "ten am" survived in the first two hypotheses, so the \
+name is the only loss. Two hypotheses drop it entirely and one turns it into \
+"a well": there is no single wrong word they agree on, so nothing specific can \
+be offered back and "misheard_as" stays empty. Contrast the previous example
+
+COMMAND: take out the milk from the shopping list
+HYP 1: we got the milk for the shop in there
+HYP 2: we got the milk for the shop today
+HYP 3: you got the milk for the shop in there
+HYP 4: we caught the milk for the shop in there
+{"per_hypothesis": [{"n": 1, "lost": ["take out", "shopping list"], "heard_instead": "got, the shop in there"}, \
+{"n": 2, "lost": ["take out", "shopping list"], "heard_instead": "got, the shop today"}, \
+{"n": 3, "lost": ["take out", "shopping list"], "heard_instead": "got, the shop in there"}, \
+{"n": 4, "lost": ["take out", "shopping list"], "heard_instead": "caught, the shop in there"}], \
+"lost": ["take out", "shopping list"], "misheard_as": "", \
+"unintelligible": false, "kind": "repeat"}
+   -- "milk" got through in all four, so this is not unintelligible. But the \
+action and the list are both gone, and they are two unrelated points of \
+confusion rather than one, so no single question could recover them
+
+COMMAND: event reminder mona tuesday
+HYP 1: we went to mind our own business
+HYP 2: we went to mindo when it was snowing
+HYP 3: he went to mind the man at the door
+HYP 4: we went to minder manchester
+{"per_hypothesis": [{"n": 1, "lost": ["event reminder", "mona", "tuesday"], "heard_instead": ""}, \
+{"n": 2, "lost": ["event reminder", "mona", "tuesday"], "heard_instead": ""}, \
+{"n": 3, "lost": ["event reminder", "mona", "tuesday"], "heard_instead": ""}, \
+{"n": 4, "lost": ["event reminder", "mona", "tuesday"], "heard_instead": ""}], \
+"lost": ["event reminder mona tuesday"], "misheard_as": "", \
+"unintelligible": true, "kind": "repeat"}
+   -- the four hypotheses read as four different sentences, none of them the \
+command; nothing survived to anchor a question on, so one bundled entry names \
+the whole thing"""
+REPEAT_POOL_SYSTEM = """You are writing a pool of interchangeable replies for a \
+smart voice assistant, for the case where background chatter cost it too much \
+of a spoken command for any targeted question to be possible.
+
+Each entry is ONE short natural request (under 15 words) asking the user to \
+say the whole thing again.
+- The assistant heard nothing it can trust, so no entry may reference, guess \
+at, or hint at ANY content: no topics, no entities, no actions. A generic \
+frame ("that", "your request") is fine.
+- Mentioning the noise is fine and helps explain why.
+- Sound like natural speech. Every entry must be a DIFFERENT sentence, not a \
+reworded copy: vary the opening word, the sentence shape, and the length.
+- Never start an entry with "Sorry".
+
+Return ONLY JSON: {"repeats": ["...", "...", ...]}"""
+LABEL_TARGET_SYSTEM = """You are labeling noisy-audio data for a smart voice \
+assistant.
+
+You get the user's real spoken COMMAND, and HEARD -- what the device caught \
+after loud background chatter. Compare them and list the key pieces of the \
+command that did not survive: entities, names, places, times, dates, \
+quantities, titles, and the requested action. Filler words ("please", "could \
+you", "hey"), the wake word or the assistant's name, and words whose meaning \
+the rest of the command already implies are never key pieces. Neither are \
+spelling, spacing, or other minor wording differences (e.g. "mockingbird" \
+heard as "mocking bird"), or a question rephrased in different grammar that \
+still asks for the same thing (e.g. "what does X mean" heard as "what is \
+X", or "do you think" heard as "you think") -- these are never lost pieces, \
+even when a real key piece is lost alongside them.
+
+Then set kind by how many key pieces were lost:
+  0 lost -> "answer"    1 lost -> "repair"    2 or more lost -> "repeat"
+
+Then write the device's target reply for that kind. A grader sees that reply \
+on its own, without the HEARD line, so it has to stand alone.
+- answer: address EVERY part of the request. Give the fact directly if you \
+know it, otherwise say you are getting it -- present or future tense, never \
+"done". Name the action and topic, since the grader sees this line alone.
+- repair: ONE short question (under 20 words) recovering ONLY the lost piece, \
+grounded in the parts that survived. Never say the lost words back -- unless \
+the piece was misheard as another word, in which case you may offer the true \
+word and the misheard one as alternatives.
+- repeat: ONE short request (under 15 words) to say the whole thing again. \
+Mentioning the noise is fine; hinting at ANY content from the command is not.
+Sound like natural speech, vary the phrasing, and do not default to starting \
+with "Sorry".
+
+Return ONLY JSON: {"lost": [...], "misheard_as": "...", "kind": "...", \
+"reply": "..."}
+Quote "lost" using the words of the real COMMAND. "misheard_as" is the wrong \
+word HEARD in place of a lost piece, or "" if the piece was simply dropped. \
+"lost" does not need one entry per missing word -- bundle several words into \
+ONE entry whenever they are a single point of confusion:
+  - a whole phrase was misheard as one SPECIFIC, similar-sounding phrase -- \
+one entry for the true phrase, with the misheard phrase in "misheard_as" \
+(this can still be "repair"). Only bundle this way when HEARD is a genuine \
+close call: most of the words or their sounds carry over, so the misheard \
+phrase is a plausible thing to guess and offer back. If HEARD reads as a \
+different, unrelated sentence -- a different topic, or barely any shared \
+words or sounds -- there is nothing specific enough to guess at, so it \
+stays "repeat" even though it's one phrase versus one phrase.
+  - the command is destroyed past telling pieces apart, with no plausible \
+guess to offer -- one entry naming everything unclear (this is "repeat").
+Keep entries separate when the losses are actually unrelated to each other \
+(e.g. a mishearing in one spot, a different piece dropped elsewhere) -- \
+that's what makes something "repeat" instead of "repair". Never add an \
+entry for the wake word or the assistant's name just to lengthen the list \
+-- they are still never key pieces, no matter how garbled or absent they are.
+
+Examples:
+
+COMMAND: find some classical music by beethoven and play it
+HEARD:   find some classical music by beethoven and play it
+{"lost": [], "misheard_as": "", "kind": "answer", \
+"reply": "I'm finding some classical music by Beethoven and playing it now."}
+
+COMMAND: hey olly are there any alarms set
+HEARD:   hey ollie are there any alarms
+{"lost": [], "misheard_as": "", "kind": "answer", \
+"reply": "I'm checking your alarms now."}
+   -- the wake word and "set" are not key pieces
+
+COMMAND: do you think it's going to rain tomorrow
+HEARD:   you think it is going to rain tomorrow
+{"lost": [], "misheard_as": "", "kind": "answer", \
+"reply": "I'm checking the forecast to see if it'll rain tomorrow."}
+   -- "do" is just the auxiliary opening the question; dropping it doesn't \
+change what's being asked
+
+COMMAND: how many oceans are there in the world
+HEARD:   how many children are there in the world
+{"lost": ["oceans"], "misheard_as": "children", "kind": "repair", \
+"reply": "How many of what in the world -- oceans, or children?"}
+
+COMMAND: i have a meeting by two pm today please remind me
+HEARD:   i have a meeting at two p m today
+{"lost": ["remind me"], "misheard_as": "", "kind": "repair", \
+"reply": "Got your two pm meeting today but missed part of your command -- do you want me to remind you about it?"}
+   -- or "Got your two pm meeting today but missed part of your command -- what did you want me to do about the meeting?"
+
+COMMAND: food order from grubhub
+HEARD:   food order from grandma
+{"lost": ["grubhub"], "misheard_as": "grandma", "kind": "repair", \
+"reply": "Ordering food -- did you say Grubhub, or grandma?"}
+
+COMMAND: play mocking bird by eminem
+HEARD:   play mockingbird by edna meyer
+{"lost": ["eminem"], "misheard_as": "edna meyer", "kind": "repair", \
+"reply": "Did you mean Mockingbird by Eminem, or by Edna Meyer?"}
+   -- "mocking bird" vs "mockingbird" is a spacing difference, not a lost \
+piece; only the artist name was actually misheard
+
+COMMAND: how do you make steel
+HEARD:   or do you make a sale
+{"lost": ["how do you make steel"], "misheard_as": "or do you make a sale", \
+"kind": "repair", "reply": "Did you ask how to make steel, or how to make a sale?"}
+   -- multiple words changed together as one coherent near-miss of the \
+whole phrase, so it's one bundled entry, not two separate ones -- still \
+"repair", not "repeat"
+
+COMMAND: skip to next episode
+HEARD:   get to make copies
+{"lost": ["skip to next episode"], "misheard_as": "", "kind": "repeat", \
+"reply": "It's too loud to catch that -- could you say it again?"}
+   -- HEARD is one phrase versus one phrase too, but it reads as a \
+different, unrelated sentence, not a close call -- there's nothing specific \
+enough to guess at, so this is still "repeat", not "repair"
+
+COMMAND: turn on the radio on this channel
+HEARD:   anywhere on the radio
+{"lost": ["turn on", "this channel"], "misheard_as": "", "kind": "repeat", \
+"reply": "It's really loud in here -- what was that?"}
+
+COMMAND: please tell me a joke that i'll think is funny
+HEARD:   he said me a job that i think is like
+{"lost": ["tell me a joke", "i'll think is funny"], "misheard_as": "", \
+"kind": "repeat", "reply": "I couldn't catch that over the noise -- could you say it again?"}
+
+COMMAND: please turn on the radio
+HEARD:   yes
+{"lost": ["turn on the radio"], "misheard_as": "", "kind": "repeat", \
+"reply": "I missed that over the noise -- could you say it again?"}
+   -- nothing distinguishable survived, so one bundled entry is enough; \
+"lost" having only one item doesn't make this a "repair" """
+REPAIR_TARGET_SYSTEM = """You are writing the reply a smart voice assistant \
+should give when background chatter cost it exactly one piece of a spoken \
+command.
+
+You get the user's real COMMAND, the HEARD text the device caught, and the \
+LOST-PIECE that did not get through. If MISHEARD-AS is given, the device \
+heard that similar-sounding wrong word in place of the lost piece.
+
+HEARD may hold several alternative transcriptions of the same audio (HYP 1, \
+HYP 2, ...), best guess first -- they are competing readings of one recording, \
+not separate things the user said. Ground your question in what they agree on.
+
+Write ONE short natural question (under 20 words) recovering ONLY that piece. \
+Test: if the user replied with just the missing words, the command would be \
+complete.
+- NEVER ask about parts that were heard correctly -- asking again would sound \
+like the assistant wasn't listening.
+- NEVER say the LOST-PIECE, or any word of it, back to the user. This is the \
+one way to fail this task outright. The device did not hear that word -- it is \
+in this prompt only so you know which slot to ask about -- so a reply that \
+speaks it is a reply the device could not have produced.
+- Ask openly for the KIND of thing that went missing, never the thing itself. \
+LOST-PIECE "mona" -> "Who is the reminder for?"; LOST-PIECE "grubhub" -> \
+"Which app should I order from?".
+- Some lost pieces are small grammar words ("new", "made", "give") with no \
+category to ask about, so every question you can think of ends up saying the \
+word. Ask about its POSITION instead: quote the run of words you did hear and \
+ask what sat next to them. LOST-PIECE "new" in "create a new event" -> "I got \
+create the event -- what was the word before event?"; LOST-PIECE "made" in \
+"how is iron made" -> "I got how iron -- what were you asking about it?". Never \
+give up and name the word.
+- Sound like natural speech, not a form. Vary the structure freely: \
+"Which...?", "How long before...?", "Who should...?", "What time...?", \
+"Where...?", or a statement plus a question ("I lost one part -- where to?"). \
+Do NOT default to starting with "Sorry".
+
+Return ONLY JSON: {"repair": "..."}"""
