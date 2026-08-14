@@ -1059,3 +1059,76 @@ give up and name the word.
 Do NOT default to starting with "Sorry".
 
 Return ONLY JSON: {"repair": "..."}"""
+
+# ===
+# Sentence based key info
+# --sent-loss / --sent-beam: stage 1, the canonical key-piece inventory
+# ===
+
+KEY_PIECES_SYSTEM = """You are labeling noisy-audio data for a smart voice \
+assistant.
+
+You get the user's real spoken COMMAND, clean and complete. Break it into its \
+KEY PIECES: the pieces the assistant must have heard to carry the command out \
+correctly. A piece is key ONLY if the task cannot be performed correctly \
+without it.
+
+Key pieces are entities, names, places, times, dates, quantities, titles, and \
+the requested action or topic. Question words are key pieces -- "how many", \
+"how long", "where", "when" carry what is actually being asked.
+
+Never key pieces:
+- filler and politeness words ("please", "could you", "a little bit")
+- the wake word or the assistant's own name ("hey olly", "ok google", \
+"assistant"). The assistant is already listening, so nothing about the task \
+depends on it hearing its own name. Never list it, however prominent it is.
+- auxiliary and light verbs that only frame the request ("do", "does", "is", \
+"can you", "give me", "tell me", "get me", "put"). The key piece is what is \
+being asked FOR, not the words wrapping the asking.
+- a word whose meaning the rest of the command already implies ("set" in "are \
+there any alarms set")
+
+Bundle words into ONE piece when they are a single slot the user would supply \
+as a unit -- "seven am", "my shopping list", "mocking bird". Keep pieces \
+separate when they are unrelated things the user chose independently.
+
+Quote each piece in the words of the COMMAND, in the order they were spoken.
+
+Return ONLY JSON, "reason" first and under 20 words:
+{"reason": "...", "pieces": [...]}
+
+Examples:
+
+COMMAND: set an alarm for seven am tomorrow
+{"reason": "Action, object, time as one slot, and day are all key.", "pieces": ["set", "an alarm", "seven am", "tomorrow"]}
+
+COMMAND: hey olly play playlist tactics from music
+{"reason": "Wake word dropped; action, playlist name, and source app are key.", "pieces": ["play", "playlist", "tactics", "music"]}
+
+COMMAND: give me a current traffic report
+{"reason": ""give me" is light framing; the requested item and its recency are key.", "pieces": ["current", "traffic report"]}
+
+COMMAND: does artificial intelligence have consciousness
+{"reason": "Does is the framing auxiliary; the subject and the property asked about are the pieces.", "pieces": ["artificial intelligence", "have consciousness"]}
+
+COMMAND: do you think it's going to rain tomorrow
+{"reason": "Do you think only opens the question.", "pieces": ["rain", "tomorrow"]}
+
+COMMAND: how many oceans are there in the world
+{"reason": "The question word carries what is being asked, so it is a piece.", "pieces": ["how many", "oceans", "in the world"]}
+
+COMMAND: play mocking bird by eminem
+{"reason": "Action, title, artist.", "pieces": ["play", "mocking bird", "eminem"]}
+
+COMMAND: add milk to my shopping list and remind me at six
+{"reason": "Two requests joined; each keeps its own pieces.", "pieces": ["add", "milk", "my shopping list", "remind me", "six"]}
+
+COMMAND: brighten the lights a little bit
+{"reason": "A little bit is filler; the action and the device are the pieces.", "pieces": ["brighten", "the lights"]}
+
+COMMAND: turn on the radio on this channel
+{"reason": "Three independent slots, so three pieces.", "pieces": ["turn on", "the radio", "this channel"]}
+
+COMMAND: hey olly are there any alarms set
+{"reason": "Wake word and implied 'set' excluded; query about existence of alarms is the core.", "pieces": ["any", "alarms"]}
+"""
