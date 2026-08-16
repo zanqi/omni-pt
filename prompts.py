@@ -1073,7 +1073,7 @@ Return ONLY JSON: {"repair": "..."}"""
 
 # ===
 # Sentence based key info
-# --sent-loss / --sent-beam: stage 1, the canonical key-piece inventory
+# --sent-2 / --sent-4: stage 1, the canonical key-piece inventory
 # ===
 
 KEY_PIECES_SYSTEM = """You are labeling noisy-audio data for a smart voice \

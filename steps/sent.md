@@ -1,4 +1,4 @@
-# sent-loss track — implementation guide
+# sent-loss tracks (`--sent-2` / `--sent-4`) — implementation guide
 
 ## What changes
 
@@ -20,14 +20,15 @@ lists (stage 1 already excluded wake words from the inventory).
 
 Two new tracks, per the decisions:
 
-| flag | witnesses | stage-2 calls per probe |
-| --- | --- | --- |
-| `--sent-loss` | ASR transcript + base-model task reply | 2 |
-| `--sent-beam` | 4 ASR beam hypotheses | 4 (parallel) |
+| flag | `TRACK` | witnesses | stage-2 calls per probe |
+| --- | --- | --- | --- |
+| `--sent-2` | `"sent-2"` | ASR transcript + base-model task reply | 2 |
+| `--sent-4` | `"sent-4"` | 4 ASR beam hypotheses | 4 (parallel) |
 
 A piece is lost only if **every** witness on that track reports it lost. `misheard_as` and
 `unintelligible` are dropped on both tracks — repair questions always ask openly
-(`REPAIR_TARGET_TREE_SYSTEM`), and the `LOST_MAX_PCT` override covers the wrecked case.
+(`REPAIR_TARGET_TREE_SYSTEM`), and a probe that lost too much of the inventory to anchor a question
+on is caught by `LOST_MAX_PCT` (step 5).
 
 ---
 
@@ -43,7 +44,7 @@ Add near the other labeler prompts:
 
 ```python
 # ---
-# --sent-loss / --sent-beam: stage 1, the canonical key-piece inventory
+# --sent-2 / --sent-4: stage 1, the canonical key-piece inventory
 # ---
 
 # The one place "key piece" is defined on these tracks. Every stage-2 call is
@@ -122,16 +123,16 @@ COMMAND: hey olly are there any alarms set
    -- a one-piece command is normal. Do not pad the list to make it longer"""
 ```
 
-The last example matters: with an exact-count `decide_kind`, a one-piece command that loses its piece
-becomes `repeat` (see step 5), which is the behavior `CLASSIFY_SYSTEM` already specifies. Padding the
-inventory would break it.
+The last example matters: a one-piece command that loses its piece is 100% of the inventory, so
+`LOST_MAX_PCT` files it as `repeat` (see step 5), which is the behavior `CLASSIFY_SYSTEM` already
+specifies. Padding the inventory would break it.
 
 ## Step 2 — `prompts.py`: the two stage-2 prompts
 
 Both take a numbered `KEY PIECES` block and one witness, and return ids only. They differ only in
 which witness they read and in how "survived" is evidenced.
 
-`SENT_ASR_LOSS_SYSTEM` also serves `--sent-beam`, one call per hypothesis — a hypothesis *is* a
+`SENT_ASR_LOSS_SYSTEM` also serves `--sent-4`, one call per hypothesis — a hypothesis *is* a
 `HEARD` line, so no third prompt is needed.
 
 ```python
@@ -403,16 +404,17 @@ One function serves both tracks; it differs only in rubric and witness, exactly 
 today. Keep `label_loss` for the tree track and add alongside it:
 
 ```python
-def sent_loss(system, pieces, witness_line):
-    """(rubric, inventory, rendered witness line) -> set of lost ids | None.
+def lost_pieces(system: str, pieces: list[str], witness_line: str):
+    """Ask LLM for lost within pieces.
+    Returns a set for intersection downstream
 
     Ids outside 1..len(pieces) are dropped rather than retried: they are rare,
     and a hallucinated id would silently push a repair to a repeat.
     """
-    listing = "\n".join(f"{i}. {p}" for i, p in enumerate(pieces, 1))
+    pieces_txt = "\n".join(f"{i}. {p}" for i, p in enumerate(pieces, 1))
     obj = gpt_json(
         system,
-        f"KEY PIECES:\n{listing}\n{witness_line}",
+        f"KEY PIECES:\n{pieces_txt}\n{witness_line}",
         temperature=CLASSIFY_TEMPERATURE,
         max_tokens=CLASSIFY_MAX_TOKENS,
     )
@@ -480,7 +482,7 @@ def decide_kind_ids(pieces, sides: list[set[int]]):
 ```
 
 `drop_wake_only`, `lost_too_much`, and `PIECE_STOPWORDS` are untouched — the tree and beam tracks
-still use them; sent-loss simply never calls them on loss lists.
+still use them; the sent tracks simply never call them on loss lists.
 
 ## Step 6 — `babble_data.py`: the two labeler entry points
 
@@ -488,16 +490,16 @@ Next to `label_tree` / `label_beam`:
 
 ```python
 def label_sent(slurp_id, sentence, transcript, response):
-    """--sent-loss: inventory once, then one loss call per witness."""
+    """--sent-2: inventory once, then one loss call per witness."""
     if not transcript or not response:
         return None
     pieces = key_pieces(slurp_id, sentence)
     if pieces is None:
         return None
-    asr_ids = sent_loss(
+    asr_ids = lost_pieces(
         SENT_ASR_LOSS_SYSTEM, pieces, f"HEARD: {_normalize_text(transcript)}"
     )
-    resp_ids = sent_loss(
+    resp_ids = lost_pieces(
         SENT_RESP_LOSS_SYSTEM, pieces, f"REPLY: {_normalize_text(response)}"
     )
     if asr_ids is None or resp_ids is None:
@@ -506,7 +508,7 @@ def label_sent(slurp_id, sentence, transcript, response):
 
 
 def label_sent_beam(slurp_id, sentence, hyps):
-    """--sent-beam: inventory once, then ASR_N_BEST loss calls in parallel."""
+    """--sent-4: inventory once, then ASR_N_BEST loss calls in parallel."""
     hyps = [h for h in hyps if h and h.strip()]
     if not hyps:
         return None
@@ -516,7 +518,7 @@ def label_sent_beam(slurp_id, sentence, hyps):
     with ThreadPoolExecutor(max_workers=len(hyps)) as ex:
         sides = list(
             ex.map(
-                lambda h: sent_loss(
+                lambda h: lost_pieces(
                     SENT_ASR_LOSS_SYSTEM, pieces, f"HEARD: {_normalize_text(h)}"
                 ),
                 hyps,
@@ -535,93 +537,107 @@ vLLM box queues badly, drop `CLASSIFY_WORKERS` for this track rather than serial
 
 `prompts.py` needs nothing further; the rest is flag plumbing in `babble_data.py`.
 
-**Argparse** ([babble_data.py:1404-1425](../babble_data.py#L1404-L1425)) — two entries in the existing
+**Two flags, two `TRACK` strings.** `TRACK` ([babble_data.py:131](../babble_data.py#L131)) is the
+module-level track selector every branch below reads; the flag name and the string it resolves to
+are independent (`--tree-label` → `"tree"`, `--beam-label` → `"beam"`). The two sent tracks are:
+
+| flag | `TRACK` | witnesses |
+| --- | --- | --- |
+| `--sent-2` | `"sent-2"` | ASR transcript + base-model task reply, 2 stage-2 calls |
+| `--sent-4` | `"sent-4"` | the `ASR_N_BEST` beam hypotheses, 4 stage-2 calls in parallel |
+
+**Argparse** ([babble_data.py:1530-1557](../babble_data.py#L1530-L1557)) — two entries in the existing
 mutually-exclusive group:
 
 ```python
-track.add_argument(
-    "--sent-loss",
-    action="store_true",
-    help="Two probe passes as usual, but labeled in two stages: one call "
-    "lists the command's key pieces, then one call per witness says which "
-    "numbered pieces it lost. A piece counts lost only if both witnesses "
-    "report it.",
-)
-track.add_argument(
-    "--sent-beam",
-    action="store_true",
-    help="As --sent-loss, but the witnesses are the ASR_N_BEST beam "
-    "hypotheses, labeled in parallel against the same key-piece list. No "
-    "task-response pass.",
-)
+track.add_argument("--sent-2", action="store_true")
+
+track.add_argument("--sent-4", action="store_true")
 ```
 
-**TRACK resolution** ([babble_data.py:1428](../babble_data.py#L1428)) — extend the chain to
-`"sent"` / `"sent-beam"`.
+**TRACK resolution** ([babble_data.py:1561](../babble_data.py#L1561)) — extend the chain with
+`"sent-2" if args.sent_2 else "sent-4" if args.sent_4` before the `"two-pass"` fallback. Argparse
+turns the dashes into underscores, so the attributes are `args.sent_2` / `args.sent_4`.
 
 **Every `TRACK in (...)` / `TRACK ==` site.** Five places, all needing the sent tracks added:
 
 | site | change |
 | --- | --- |
-| [1434](../babble_data.py#L1434) `if TRACK == "beam"` (batch size) | `in ("beam", "sent-beam")` |
-| [1451](../babble_data.py#L1451) repeat-pool build | `in ("tree", "beam", "sent", "sent-beam")` |
-| [820](../babble_data.py#L820) `write_target` repair branch | `TRACK in ("tree", "sent", "sent-beam")` → `REPAIR_TARGET_TREE_SYSTEM` (open question, no `misheard_as`) |
-| [1214](../babble_data.py#L1214), [1325](../babble_data.py#L1325) build/answer-row target path | `in ("tree", "beam", "sent", "sent-beam")` |
-| [1021](../babble_data.py#L1021) `task = TASK_PROMPT_TREE if TRACK == "tree"` | `in ("tree", "sent")` — the restating reply is what `SENT_RESP_LOSS_SYSTEM` reads |
+| [1567](../babble_data.py#L1567) `if TRACK == "beam"` (batch size) | `in ("beam", "sent-4")` — only the beam-decoding track needs the smaller batch |
+| [1583](../babble_data.py#L1583) repeat-pool build | `in ("tree", "beam", "sent-2", "sent-4")` |
+| [946](../babble_data.py#L946) `write_target` repair branch | `TRACK in ("tree", "sent-2", "sent-4")` → `REPAIR_TARGET_TREE_SYSTEM` (open question, no `misheard_as`) |
+| [1340](../babble_data.py#L1340), [1451](../babble_data.py#L1451) build/answer-row target path | `in ("tree", "beam", "sent-2", "sent-4")` |
+| [1147](../babble_data.py#L1147) `task = TASK_PROMPT_TREE if TRACK == "tree"` | `in ("tree", "sent-2")` — the restating reply is what `SENT_RESP_LOSS_SYSTEM` reads, and `--sent-4` has no reply pass at all |
 
 `SLOT_SNR_DISJOINT` and `CLEAN_ANSWER_PROB` are already gated on `TRACK != "two-pass"`
-([872](../babble_data.py#L872), [880](../babble_data.py#L880)), so both sent tracks pick them up with
-no edit.
+([998](../babble_data.py#L998), [1005](../babble_data.py#L1005)), so both sent tracks pick them up
+with no edit.
 
-**`probe_by_kinds` signature** ([babble_data.py:877](../babble_data.py#L877)) — the sent tracks' cache
+**`probe_by_kinds` signature** ([babble_data.py:985](../babble_data.py#L985)) — the sent tracks' cache
 key has to reach `key_pieces`, so take it next to the sentence it identifies:
 
 ```python
 def probe_by_kinds(clean, pool, slurp_id, sentence, kinds_need, batch_size, rng):
 ```
 
-Both callers already have `slurp_id` bound one line above the call
-([1197](../babble_data.py#L1197)/[1202](../babble_data.py#L1202),
-[1316](../babble_data.py#L1316)/[1321](../babble_data.py#L1321)) — they use it for the
-self-exclusion filter on `babble_pool` and for the per-utterance `random.Random` seed — so each is a
-one-line insertion. The other tracks ignore the argument.
+Both callers already have `slurp_id` bound near the call — they use it for the self-exclusion filter
+on `babble_pool` and for the per-utterance `random.Random` seed — so each is a one-line insertion.
+The other tracks ignore the argument.
 
-**Probe dispatch in `probe_by_kinds`** ([babble_data.py:979-1037](../babble_data.py#L979-L1037)):
+**Probe dispatch in `probe_by_kinds`** ([babble_data.py:1105-1163](../babble_data.py#L1105-L1163)):
 
-- `--sent-beam` joins the existing beam branch (same GPU pass, same `hyp_lists`, no task-response
-  decode). Change the branch guard to `TRACK in ("beam", "sent-beam")` and pick the labeler:
-  `label_beam` vs `lambda h: label_sent_beam(slurp_id, sentence, h)`.
-- `--sent-loss` joins the final `else` branch alongside tree/two-pass. Extend the `label_one`
+- `--sent-4` joins the existing beam branch (same GPU pass, same `hyp_lists`, no task-response
+  decode). Change the branch guard to `TRACK in ("beam", "sent-4")` and hoist the labeler out of the
+  `ex.map` call:
+
+  ```python
+  label_hyps = (
+      (lambda h: label_sent_beam(slurp_id, sentence, h))
+      if TRACK == "sent-4"
+      else (lambda h: label_beam(sentence, h))
+  )
+  ```
+- `--sent-2` joins the final `else` branch alongside tree/two-pass. Extend the `label_one`
   selection to a three-way choice rather than a nested conditional expression — at three tracks the
   ternary chain stops reading:
 
   ```python
   if TRACK == "two-pass":
       label_one = classify
-  elif TRACK == "sent":
+  elif TRACK == "sent-2":
       label_one = lambda t, r: label_sent(slurp_id, sentence, t, r)
   else:
       label_one = lambda t, r: label_tree(sentence, t, r)
   ```
 
-**Probe result dict** ([1126-1149](../babble_data.py#L1126-L1149)) — three edits, because the sent
-label dict carries `lost` where the other labelers carry `missing` / `misheard_as` / `lost_piece`:
+**Probe result dict** ([1180-1216](../babble_data.py#L1180-L1216)) — the sent label dict carries
+`lost` where the other labelers carry `missing` / `misheard_as` / `lost_piece`, so resolve it into a
+local *above* the dict and read the fallbacks off that:
 
 ```python
-# tree/beam/two-pass say "missing"; the sent tracks say "lost", already
-# resolved to piece strings
-"lost": label.get("lost", label.get("missing", [])),
-"swapped": [label["misheard_as"]] if label.get("misheard_as") else [],
-...
-# the sent tracks don't return this: on repair their `lost` IS the one
-# piece, so write_target's prompt and leak filter read it off the list
-"lost_piece": label.get(
-    "lost_piece",
-    label["lost"][0] if label["kind"] == "repair" and label.get("lost") else "",
-),
-# the stage-1 inventory, so a mislabeled row can be re-read without stage 1
-"pieces": label.get("pieces", []),
+kind = label["kind"]
+# tree/beam/two-pass call it "missing" and quote it out of the command; the
+# sent tracks call it "lost" and it is already exact key-piece text
+lost = label.get("lost", label.get("missing", []))
+if kind in results and results[kind] is None:
+    results[kind] = {
+        ...
+        "lost": lost,
+        "swapped": [label["misheard_as"]] if label.get("misheard_as") else [],
+        ...
+        # the sent tracks don't return this: on repair their `lost` IS the one
+        # piece, so write_target's prompt and its leak filter read it off that
+        "lost_piece": label.get(
+            "lost_piece", lost[0] if kind == "repair" and lost else ""
+        ),
+        # sent tracks only: the stage-1 inventory the label's ids indexed into
+        "pieces": label.get("pieces", []),
+    }
 ```
+
+The local is not just tidiness: `dict.get`'s default argument is evaluated eagerly, so writing
+`label.get("lost_piece", label["lost"][0] ...)` inline raises `KeyError` on every tree/beam/two-pass
+probe, whose labels have no `lost` key at all.
 
 Nothing else needs to know which track it is: `write_target`'s repair branch, its `leakable` leak
 filter, and `make_row`'s `lost_piece` column all keep reading `probe["lost_piece"]`, and
@@ -630,7 +646,7 @@ only thing that can be rendered.
 
 ## Step 8 — row schema
 
-In `make_row` ([babble_data.py:1129](../babble_data.py#L1129)), add one column, keeping the additive
+In `make_row` ([babble_data.py:1263](../babble_data.py#L1263)), add one column, keeping the additive
 pattern the other tracks use (empty on tracks that don't fill it):
 
 ```python
@@ -648,15 +664,15 @@ pattern the other tracks use (empty on tracks that don't fill it):
 conda activate qwen25omni
 
 # two-witness variant, small
-python babble_data.py --ds-id keylazy/slurp-sent-v0 --sent-loss \
+python babble_data.py --ds-id keylazy/slurp-sent2-v0 --sent-2 \
     --n-test 5 --n-train 5 --n-extra-ans 0 --no-push
 
 # 4-hypothesis variant
-python babble_data.py --ds-id keylazy/slurp-sentbeam-v0 --sent-beam \
+python babble_data.py --ds-id keylazy/slurp-sent4-v0 --sent-4 \
     --n-test 5 --n-train 5 --n-extra-ans 0 --no-push
 ```
 
-Read `babble_audio/slurp-sent-v0/rows.json` and check, in this order:
+Read `babble_audio/slurp-sent2-v0/rows.json` and check, in this order:
 
 1. **`key_pieces`** — is the inventory right for the sentence? Wrong inventories poison everything
    downstream, and they are the one thing stage 2 cannot recover from. Watch for wake words surviving

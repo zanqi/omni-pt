@@ -602,7 +602,7 @@ def label_sent(slurp_id, sentence, transcript, resp):
         SENT_ASR_LOSS_SYSTEM, pieces, f"HEARD: {_normalize_text(transcript)}"
     )
     resp_ids = lost_pieces(
-        SENT_RESP_LOSS_SYSTEM, pieces, f"REPLY: {_normalize_text(transcript)}"
+        SENT_RESP_LOSS_SYSTEM, pieces, f"REPLY: {_normalize_text(resp)}"
     )
     if asr_ids is None or resp_ids is None:
         # bad json
@@ -943,7 +943,7 @@ def write_target(sentence, kind, probe):
     if kind == "answer":
         system = ANSWER_TARGET_SYSTEM
         user = ANSWER_TARGET_USER.format(sentence=sentence)
-    elif kind == "repair" and TRACK == "tree":
+    elif kind == "repair" and TRACK in ("tree", "sent-2", "sent-4"):
         system = REPAIR_TARGET_TREE_SYSTEM
         user = REPAIR_TARGET_TREE_USER.format(
             sentence=sentence, lost_piece=probe["lost_piece"]
@@ -990,7 +990,7 @@ def write_target(sentence, kind, probe):
 # ---
 
 
-def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
+def probe_by_kinds(clean, pool, slurp_id, sentence, kinds_need, batch_size, rng):
     def make_probe_batch(kinds_need):
         """return a list of wav paths and a list of snr vals"""
         length = len(clean)
@@ -1102,7 +1102,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
         sysp = QWEN25_SYSTEM_PROMPT if base_family == "qwen2.5" else None
         # only --beam-label fills this in; the others keep one transcript
         hyp_lists = [[] for _ in paths]
-        if TRACK == "beam":
+        if TRACK in ("beam", "sent-4"):
             with GPU_LOCK:
                 asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
                 convs = [_conv(p, asr_sysp, ASR_PROMPT) for p in paths]
@@ -1115,7 +1115,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             # decoding it would be dead GPU time
             responses = ["" for _ in hyp_lists]
             with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
-                labels = list(ex.map(lambda h: label_beam(sentence, h), hyp_lists))
+                labels = list(ex.map(lambda h: label_sent_beam(slurp_id, sentence, h), hyp_lists))
         elif TRACK == "heard-reply":
             with GPU_LOCK:
                 convs = [_conv(p, sysp, task_prompt(True)) for p in paths]
@@ -1144,16 +1144,16 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                 transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
 
                 # get batch omni assistant respond
-                task = TASK_PROMPT_TREE if TRACK == "tree" else TASK_PROMPT
+                task = TASK_PROMPT_TREE if TRACK in ("tree", "sent-2") else TASK_PROMPT
                 convs = [_conv(p, sysp, task) for p in paths]
                 responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)
 
-            # same two witnesses either way; only how they're labeled differs
-            label_one = (
-                classify
-                if TRACK == "two-pass"
-                else (lambda t, r: label_tree(sentence, t, r))
-            )
+            if TRACK == "two-pass":
+                label_one = classify
+            elif TRACK == "sent-2":
+                label_one = lambda t, r: label_sent(slurp_id, sentence, t, r)
+            else:
+                label_one = lambda t, r: label_tree(sentence, t, r)
             with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
                 labels = list(
                     ex.map(
@@ -1168,14 +1168,17 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             if label is None:
                 continue
             kind = label["kind"]
+            # tree/beam/two-pass call it "missing" and quote it out of the
+            # command; the sent tracks call it "lost" and it is already exact
+            # key-piece text
+            lost = label.get("lost", label.get("missing", []))
             if kind in results and results[kind] is None:
                 results[kind] = {
                     "snr_db": snr,
                     "audio": probe_path,
                     "transcript": transcript,
                     "response": response,
-                    "lost": label["missing"],
-                    "swapped": [label["misheard_as"]] if label["misheard_as"] else [],
+                    "lost": lost,
                     "reason": label["reason"],
                     # --heard-reply writes the target in the same call; the
                     # other two tracks fill this in later, once the probe is
@@ -1184,7 +1187,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                     # tree track only: the two per-pass loss counts
                     "asr_bucket": label.get("asr_bucket", ""),
                     "resp_bucket": label.get("resp_bucket", ""),
-                    "lost_piece": label.get("lost_piece", ""),
+                    "pieces": label.get("pieces", []),
                     # beam track only: all K hypotheses (the repair target
                     # writer grounds its question in these), the per-hypothesis
                     # loss lists behind the consensus, and whether the
@@ -1281,6 +1284,7 @@ def make_row(kind, target, path, probe, slurp_id, sentence):
             else ""
         ),
         "unintelligible": probe["unintelligible"],
+        "key_pieces": probe["pieces"],
         "slurp_id": slurp_id,
         "sentence": sentence,
         "source": "babble",
@@ -1319,6 +1323,7 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
             clean,
             # never mix an utterance with itself
             [arr for sid, arr in babble_pool if sid != slurp_id],
+            slurp_id,
             sentence,
             KINDS,
             PROBE_BATCH_SIZE,
@@ -1337,9 +1342,7 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
                 "targets": {k: triplet[k]["target"] for k in KINDS},
             }
 
-        if TRACK in ("tree", "beam"):
-            # one call per probe: the label anchored the repair question on
-            # that probe's own losses, not the utterance's
+        if TRACK in ("tree", "beam", "sent-2", "sent-4"):
             targets = {k: write_target(sentence, k, triplet[k]) for k in KINDS}
             if not all(targets.values()):
                 return {"skip": "targets"}
@@ -1437,6 +1440,7 @@ def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
         probe = probe_by_kinds(
             clean,
             [arr for sid, arr in babble_pool if sid != slurp_id],
+            slurp_id,
             sentence,
             ["answer"],
             ANSWER_PROBE_BATCH_SIZE,
@@ -1448,7 +1452,7 @@ def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
         if TRACK == "heard-reply":
             return {"probe": probe, "target": probe["target"]}
 
-        if TRACK in ("tree", "beam"):
+        if TRACK in ("tree", "beam", "sent-2", "sent-4"):
             target = write_target(sentence, "answer", probe)
             return {"probe": probe, "target": target} if target else {"skip": "targets"}
 
@@ -1561,10 +1565,22 @@ if __name__ == "__main__":
     TRACK = (
         "heard-reply"
         if args.heard_reply
-        else "tree" if args.tree_label else "beam" if args.beam_label else "two-pass"
+        else (
+            "tree"
+            if args.tree_label
+            else (
+                "beam"
+                if args.beam_label
+                else (
+                    "sent-2"
+                    if args.sent_2
+                    else "sent-4" if args.sent_4 else "two-pass"
+                )
+            )
+        )
     )
     log(f"track: {TRACK}")
-    if TRACK == "beam":
+    if TRACK in ("beam", "sent-4"):
         PROBE_BATCH_SIZE = BEAM_PROBE_BATCH_SIZE
         log(f"probe batch size: {PROBE_BATCH_SIZE} (beams: {ASR_NUM_BEAMS})")
 
@@ -1580,8 +1596,7 @@ if __name__ == "__main__":
     os.makedirs(PROBE_DIR, exist_ok=True)
     log(f"audio dir: {AUDIO_DIR}")
 
-    # before the (slow) model load, so an unreachable vLLM box fails in seconds
-    if TRACK in ("tree", "beam"):
+    if TRACK in ("tree", "beam", "sent-2", "sent-4"):
         REPEAT_POOL = build_repeat_pool(REPEAT_POOL_SIZE)
 
     # init base omni model
