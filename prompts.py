@@ -116,6 +116,13 @@ is "repair" even when the piece it asks about was perfectly audible. Appended \
 small talk or offers of further help never change the type, unless they assert \
 details contradicting the command.
 
+Wording that reports what the device heard -- "I heard 'X'", "it sounded like \
+'X'", "did you say X" -- is a hedge, not an assertion, so a misheard or \
+invented word inside it never makes the reply "bad". Classify such a reply by \
+what it does around the hedge: the question it asks, and whether the elements \
+it treats as settled were spoken. A detail the reply acts on or states flatly, \
+outside a hedge, is still an assertion.
+
 Output ONLY JSON, "reason" first and under 30 words:
 {"reason": "...", "type": "answer" | "repair" | "repeat" | "bad"}
 
@@ -156,6 +163,10 @@ REPLY: I'll add that to your shopping list -- which item was it?
 COMMAND: play my saved songs
 REPLY: Did you say saved songs, or shared songs?
 {"reason": "Confirmation question offering the true word and a similar-sounding one.", "type": "repair"}
+
+COMMAND: i want the status on my screen brightness
+REPLY: I heard 'on my screen right now' -- what did you want to know about?
+{"reason": "The misheard quote is a hedge, not a claim; the question targets the one screen property left open.", "type": "repair"}
 
 COMMAND: remind me to call mom at six
 REPLY: It's really loud in here -- could you say that again?
@@ -1130,5 +1141,197 @@ COMMAND: turn on the radio on this channel
 {"reason": "Three independent slots, so three pieces.", "pieces": ["turn on", "the radio", "this channel"]}
 
 COMMAND: hey olly are there any alarms set
-{"reason": "Wake word and implied 'set' excluded; query about existence of alarms is the core.", "pieces": ["any", "alarms"]}
-"""
+{"reason": "Wake word and implied 'set' excluded; query about existence of alarms is the core.", "pieces": ["any", "alarms"]}"""
+
+
+SENT_ASR_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice \
+assistant.
+
+You get KEY PIECES -- a numbered list of the pieces of the user's real spoken \
+command that the assistant must have heard to carry it out -- and HEARD, what \
+a speech recognizer caught of that same command after loud background chatter. \
+Say which numbered pieces did not survive in HEARD.
+
+A piece SURVIVED when HEARD carries the same thing, judged by meaning rather \
+than wording:
+- spelling, spacing, number or grammar differences ("mockingbird" for "mocking \
+bird", "10 a m" for "ten am", "relationship" for "relationships")
+- a synonym asking for the same thing ("raise" for "increase")
+- a question rephrased in different grammar that still asks the same thing
+- a name rendered as a close phonetic match ("powell" for "pawel", "deevya" \
+for "divya"). The recognizer heard the name and spelled it its own way, so the \
+slot is filled and the user has nothing to clarify.
+
+A piece is LOST when HEARD drops it, garbles it, or puts a DIFFERENT word in \
+its place rather than a spelling of the same sounds -- "monday" for "mona" (a \
+weekday, not that name), "edna meyer" for "eminem", "children" for "oceans". \
+When HEARD reads as some other sentence entirely, every piece is lost.
+
+Words in HEARD that no key piece accounts for are not evidence of anything: \
+the recognizer inventing extra words is normal in noisy environment.
+
+Return ONLY JSON, "reason" first and under 25 words. "lost" holds the NUMBERS \
+of the lost pieces and nothing else:
+{"reason": "...", "lost": [2, 3]}
+
+Examples:
+
+KEY PIECES:
+1. find some classical music
+2. beethoven
+3. play it
+HEARD: find some classical music by beethoven and play it
+{"reason": "Word-for-word.", "lost": []}
+
+KEY PIECES:
+1. play
+2. playlist tactics
+3. music
+HEARD: a r i play playlist tactics for music
+{"reason": "Only the wake word is mangled, and it is not on the list.", "lost": []}
+
+KEY PIECES:
+1. current traffic report
+HEARD: me a current traffic report come in and
+{"reason": "What is asked for survived intact; the trailing junk accounts for nothing.", "lost": []}
+
+KEY PIECES:
+1. how many
+2. oceans
+3. in the world
+HEARD: how many children are there in the world
+{"reason": "The thing being counted comes back as a different noun.", "lost": [2]}
+
+KEY PIECES:
+1. a meeting
+2. two pm
+3. today
+4. remind me
+HEARD: i have a meeting at two p m today
+{"reason": "The requested action is gone; the time and day survive as spelled variants.", "lost": [4]}
+
+KEY PIECES:
+1. play
+2. mocking bird
+3. eminem
+HEARD: play mockingbird by edna meyer
+{"reason": "Spacing of the title is not a loss; only the artist was misheard.", "lost": [3]}
+
+KEY PIECES:
+1. turn on
+2. the radio
+3. this channel
+HEARD: anywhere on the radio
+{"reason": "The radio survives; the action and the channel do not.", "lost": [1, 3]}
+
+KEY PIECES:
+1. skip to
+2. next episode
+HEARD: get to make copies
+{"reason": "It reads as a different, unrelated sentence; no piece survived.", "lost": [1, 2]}
+
+KEY PIECES:
+1. turn on
+2. the radio
+HEARD: yes
+{"reason": "Nothing distinguishable survived.", "lost": [1, 2]}"""
+
+
+SENT_RESP_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice \
+assistant.
+
+You get KEY PIECES -- a numbered list of the pieces of the user's real spoken \
+command that the assistant must have heard to carry it out -- and REPLY, what \
+the assistant said after hearing that same command over loud background \
+chatter. The assistant never saw the command in text; REPLY is your only \
+evidence of what reached it.
+
+Read REPLY as EVIDENCE, not as work to grade. A rambling, unhelpful, evasive \
+or plain wrong reply can still prove the command was heard perfectly.
+
+A piece SURVIVED when the reply uses it correctly, judged by meaning rather \
+than wording. A paraphrase, a capability decline, a hand-off to the user, or \
+an admission of not knowing the answer can all still name what was asked. Naming a \
+piece correctly settles it as heard even when the reply then asks a follow-up \
+about it: a command that referred to something only generically ("that \
+podcast", "this event") gave no specific value, so asking "which podcast", "which event" is the \
+assistant gathering further information for the task.
+
+A piece is LOST when the reply neither uses it nor otherwise shows it got \
+through, or asserts a WRONG value for it. When the reply asks for the whole \
+command again, or engages with nothing in it at all, no piece is shown heard: \
+list them all.
+
+Return ONLY JSON, "reason" first and under 25 words. "lost" holds the NUMBERS \
+of the lost pieces and nothing else:
+{"reason": "...", "lost": [2, 3]}
+
+Examples:
+
+KEY PIECES:
+1. set an alarm
+2. seven am
+3. tomorrow
+REPLY: i'm setting your alarm for 7 am tomorrow.
+{"reason": "Names the alarm, the time and the day.", "lost": []}
+
+KEY PIECES:
+1. play
+2. my most recent playlist
+REPLY: i'm not sure how to play your playlist. you might need to open the music app on your device and find the playlist there.
+{"reason": "Reply acknowledges playing a playlist as the request; 'most recent' specifier not confirmed but not contradicted", "lost": []}
+
+KEY PIECES:
+1. how many
+2. lists
+3. remind me
+REPLY: i'm not sure how many lists you have. you could check your phone's settings.
+{"reason": "Not knowing the ANSWER is not failing to hear the QUESTION; only the requested action goes unengaged.", "lost": [3]}
+
+KEY PIECES:
+1. play
+2. that podcast
+REPLY: i'm not sure which "that podcast" you're referring to. can you be more specific?
+{"reason": "Quotes the podcast back; the command never said which one, so asking is information gathering.", "lost": []}
+
+KEY PIECES:
+1. artificial intelligence
+2. have consciousness
+REPLY: well, you know, artificial intelligence can be really good at making us feel more in control.
+{"reason": "It wanders off, but plainly heard the subject; only the property asked about goes unengaged.", "lost": [2]}
+
+KEY PIECES:
+1. add
+2. milk
+3. my shopping list
+4. remind me
+5. six
+REPLY: i'm adding milk to your shopping list.
+{"reason": "Adding milk to shopping list confirmed; no reminder or six mentioned at all", "lost": [4, 5]}
+
+KEY PIECES:
+1. play
+2. mocking bird
+3. eminem
+REPLY: playing mockingbird by edna meyer now.
+{"reason": "The artist comes back as a different name.", "lost": [3]}
+
+KEY PIECES:
+1. how many
+2. oceans
+3. in the world
+REPLY: i'm sorry, i can't help with that request.
+{"reason": "Boilerplate that would decline any request equally evidences nothing.", "lost": [1, 2, 3]}
+
+KEY PIECES:
+1. brighten
+2. the lights
+REPLY: i'm not sure what you mean by "write in the lights a little bit." could you be referring to a specific task?
+{"reason": "The lights is carried over correctly, so only the verb is in doubt.", "lost": [1]}
+
+KEY PIECES:
+1. turn on
+2. the radio
+3. this channel
+REPLY: it's really loud in here -- what was that?
+{"reason": "Asks for the whole thing again, engaging with nothing.", "lost": [1, 2, 3]}"""

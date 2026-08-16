@@ -36,6 +36,9 @@ from prompts import (
     TASK_PROMPT_TREE,
     split_heard_reply,
     task_prompt,
+    KEY_PIECES_SYSTEM,
+    SENT_ASR_LOSS_SYSTEM,
+    SENT_RESP_LOSS_SYSTEM,
 )
 from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
 
@@ -350,7 +353,7 @@ WAKE_WORDS = {
 }
 
 
-def drop_wake_only(pieces):
+def drop_wake_only(pieces: list[str]):
     return [p for p in pieces if set(_normalize_text(p).split()) - WAKE_WORDS]
 
 
@@ -397,11 +400,7 @@ PIECE_STOPWORDS = {
 
 
 def label_loss(system, witness_user):
-    """(rubric, rendered USER block) -> list of lost pieces | None.
-
-    The two tree labelers differ only in their rubric and in which witness
-    their USER block quotes, so one call site serves both.
-    """
+    """Ask LLM for lost"""
     obj = gpt_json(
         system,
         witness_user,
@@ -413,6 +412,88 @@ def label_loss(system, witness_user):
     return drop_wake_only(
         [str(s).strip() for s in obj.get("lost", []) if str(s).strip()]
     )
+
+
+def lost_pieces(system: str, pieces: list[str], witness_line: str):
+    """Ask LLM for lost within pieces.
+    Returns a set for intersection downstream
+    """
+    pieces_txt = "\n".join(f"{i}. {p}" for i, p in enumerate(pieces, 1))
+    obj = gpt_json(
+        system,
+        f"KEY PIECES:\n{pieces_txt}\n{witness_line}",
+        temperature=CLASSIFY_TEMPERATURE,
+        max_tokens=CLASSIFY_MAX_TOKENS,
+    )
+    if obj is None:
+        return None
+    ids = set()
+    for n in obj.get("lost", []):
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= len(pieces):
+            ids.add(n)
+    return ids
+
+
+_SLURP_ID_2_KEY_PIECES = {}
+_KEY_PIECES_LOCK = threading.Lock()
+
+
+def key_pieces(slurp_id, sentence: str):
+    """Return None if LLM returns a bad JSON, or every piece filtered.
+    Otherwise, returns a list of key pieces -> list[str]
+    """
+    with _KEY_PIECES_LOCK:
+        if slurp_id in _SLURP_ID_2_KEY_PIECES:
+            return _SLURP_ID_2_KEY_PIECES[slurp_id]
+
+    cmd = _normalize_text(sentence)
+
+    obj = gpt_json(
+        KEY_PIECES_SYSTEM,
+        f"COMMAND: {cmd}",
+        temperature=CLASSIFY_TEMPERATURE,
+        max_tokens=CLASSIFY_MAX_TOKENS,
+    )
+    pieces = None
+    if obj is not None:
+        pieces = drop_wake_only(
+            [str(s).strip() for s in obj.get("pieces", []) if str(s).strip()]
+        )
+        if not pieces:
+            pieces = None
+
+    with _KEY_PIECES_LOCK:
+        _SLURP_ID_2_KEY_PIECES[slurp_id] = pieces
+    return pieces
+
+
+def decide_kind_ids(pieces, sides: list[set[int]]):
+    """Used only for the 2-witness classifer.
+    sides: [asr_lost_ids, resp_lost_ids]
+    """
+    agreed = sorted(set.intersection(*sides)) if sides else []
+    kind = "answer" if not agreed else "repair" if len(agreed) == 1 else "repeat"
+    lost = [pieces[i - 1] for i in agreed]
+    total_wc = sum(len(p.split()) for p in pieces)
+    if kind == "repair" and len(lost[0].split()) / total_wc >= LOST_MAX_PCT:
+        kind = "repeat"
+
+    return {
+        "kind": kind,
+        "lost": lost,
+        "asr_bucket": f"a{len(sides[0])}",
+        "resp_bucket": f"r{len(sides[-1])}",
+        "reason": (
+            f"{len(pieces)} pieces | "
+            + " x ".join(str(sorted(s)) for s in sides)
+            + f" -> agreed {agreed}"
+        ),
+        "pieces": pieces,
+    }
 
 
 def decide_kind(sentence, asr_lost, resp_lost):
@@ -510,6 +591,26 @@ def label_tree(sentence, transcript, response):
     return decide_kind(sentence, asr_lost, resp_lost)
 
 
+def label_sent(slurp_id, sentence, transcript, resp):
+    if not transcript or not resp:
+        return None
+    pieces = key_pieces(slurp_id, sentence)
+
+    if not pieces:
+        return None
+    asr_ids = lost_pieces(
+        SENT_ASR_LOSS_SYSTEM, pieces, f"HEARD: {_normalize_text(transcript)}"
+    )
+    resp_ids = lost_pieces(
+        SENT_RESP_LOSS_SYSTEM, pieces, f"REPLY: {_normalize_text(transcript)}"
+    )
+    if asr_ids is None or resp_ids is None:
+        # bad json
+        return None
+
+    return decide_kind_ids(pieces, [asr_ids, resp_ids])
+
+
 # ---
 # --beam-label: one labeler over the N-best ASR hypotheses
 # ---
@@ -559,6 +660,28 @@ NON_PIECE_WORDS = (
         "would",
     }
 )
+
+
+def label_sent_beam(slurp_id, sentence, hyps):
+    hyps = [h for h in hyps if h and h.strip()]
+    if not hyps:
+        return None
+
+    pieces = key_pieces(slurp_id, sentence)
+    if pieces is None:
+        return None
+    with ThreadPoolExecutor(max_workers=len(hyps)) as ex:
+        sides = list(
+            ex.map(
+                lambda h: lost_pieces(
+                    SENT_ASR_LOSS_SYSTEM, pieces, f"HEARD: {_normalize_text(h)}"
+                ),
+                hyps,
+            )
+        )
+    if any(s is None for s in sides):
+        return None
+    return decide_kind_ids(pieces, sides)
 
 
 def label_beam(sentence, hyps):
@@ -753,6 +876,7 @@ def build_repeat_pool(size):
     Fails loudly rather than quietly building a dataset on a handful of
     phrasings, since that is the failure this exists to prevent.
     """
+
     def one_batch(style):
         return gpt_json(
             REPEAT_POOL_SYSTEM,
@@ -788,8 +912,10 @@ def build_repeat_pool(size):
                 ):
                     seen.add(key)
                     pool.append(s)
-        log(f"repeat pool: {len(pool)}/{size} after a round of "
-            f"{len(REPEAT_STYLES)} calls")
+        log(
+            f"repeat pool: {len(pool)}/{size} after a round of "
+            f"{len(REPEAT_STYLES)} calls"
+        )
 
     if len(pool) < REPEAT_POOL_MIN:
         raise RuntimeError(
@@ -1409,6 +1535,7 @@ if __name__ == "__main__":
         "Heard line alone with the few-shot labeler, disjoint SNR bands, and "
         "two-line SFT targets.",
     )
+
     track.add_argument(
         "--tree-label",
         action="store_true",
@@ -1416,6 +1543,7 @@ if __name__ == "__main__":
         "against the command for what it lost; decide_kind() intersects the "
         "two loss lists to pick the kind and the piece to ask about.",
     )
+
     track.add_argument(
         "--beam-label",
         action="store_true",
@@ -1423,6 +1551,11 @@ if __name__ == "__main__":
         "consensus alone, a piece counting as lost only if every hypothesis "
         "missed it. No task-response pass.",
     )
+
+    track.add_argument("--sent-2", action="store_true")
+
+    track.add_argument("--sent-4", action="store_true")
+
     args = ap.parse_args()
 
     TRACK = (

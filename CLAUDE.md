@@ -65,6 +65,16 @@ The repo has two independently-developed variants of the same idea; don't confla
      of each requested kind is found for an utterance; skips the utterance otherwise.
    - Excludes any `slurp_id` already used by the EAR dataset (`MASK_DS_ID = keylazy/slurp-ear-sft`) to avoid
      double-weighting the same sentence.
+
+   **`slurp_id` identifies a distinct *sentence*, not a distinct recording.** SLURP streams several
+   recordings (up to ~10) of the same prompt back to back, all carrying the same `slurp_id`. So
+   `seen_slurp_ids` in `build_triplets` / `build_answer_rows` is a sentence-level dedupe — each distinct
+   sentence is used at most once per build, and the id is claimed in the *producer* (`candidates`) rather
+   than after a successful build, so the back-to-back duplicates can't race through the check together.
+   Anything keyed on the sentence text is therefore equivalent *in coverage* to keying on `slurp_id`,
+   so never justify one over the other by "it dedupes more". Prefer `slurp_id`: it is unique as-is,
+   where sentence text is only a correct key after `_normalize_text` and stays one only as long as no
+   caller re-cases or re-punctuates it. Threading the id one extra level down is the cheaper cost.
    - Metric: `EAR = 3*C*R*F/(C*R + C*F + R*F)` (harmonic mean of three judged scores, one added dimension
      `F` = full-repair quality).
    - Dataset pushed to `--ds-id` (e.g. `keylazy/slurp-babble-Qwen2.5-Omni-3B-v1`).

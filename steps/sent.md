@@ -336,35 +336,42 @@ Then extend the import block at [babble_data.py:24-39](../babble_data.py#L24-L39
 
 ## Step 3 — `babble_data.py`: stage 1, cached
 
-Stage 1's only input is the sentence, so cache on the normalized sentence rather than on `slurp_id`:
-SLURP streams several recordings of the same prompt back to back, so a sentence key also dedupes
-across utterances, and no call site has to thread a `slurp_id` through.
+Stage 1's only input is the sentence, and `slurp_id` is exactly the id of a distinct sentence (SLURP
+streams several recordings of the same prompt back to back, all sharing one `slurp_id`) — so key the
+cache on `slurp_id`. It is a short, already-unique key that needs no text normalization to be a
+correct key, where the sentence string only becomes one after `_normalize_text` and only stays one as
+long as nothing upstream re-cases or re-punctuates it.
+
+This is not a cross-utterance dedupe either way: `build_triplets` / `build_answer_rows` claim each
+`slurp_id` in `seen_slurp_ids` on first sight, so a build never labels the same sentence twice. The
+cache earns its keep *within* one utterance — every kind and every `MAX_PROBES` redraw reuses one
+stage-1 call.
+
+Both call sites already hold `slurp_id` ([babble_data.py:1197](../babble_data.py#L1197),
+[1316](../babble_data.py#L1316)) but `probe_by_kinds` does not take it, so step 7 threads it through.
 
 Place it next to `label_loss` (around [babble_data.py:399](../babble_data.py#L399)):
 
 ```python
-# stage 1 depends only on the sentence, so it is computed once per distinct
-# sentence and reused across every probe batch, every kind, and every
-# MAX_PROBES redraw. SLURP repeats the same prompt across recordings, so the
-# key is the sentence, not the slurp_id.
-_PIECES_CACHE = {}
-_PIECES_LOCK = threading.Lock()
-
-# a command with more pieces than this is not a repair candidate under any
-# labeling, and a long inventory makes the id space noisy; clamp rather than
-# skip, since decide_kind's LOST_MAX_PCT will file it as repeat anyway
-PIECES_MAX = 12
+# stage 1 depends only on the sentence, so it is computed once and reused
+# across every probe batch, every kind, and every MAX_PROBES redraw of the
+# utterance. Keyed on slurp_id, which IS the id of a distinct sentence (the
+# several recordings slurp streams of one prompt all share it), so no text
+# normalization stands between the key and its identity.
+_SLURP_ID_2_KEY_PIECES = {}
+_KEY_PIECES_LOCK = threading.Lock()
 
 
-def key_pieces(sentence):
-    """sentence -> [piece text, ...] | None, one entry per key piece.
+def key_pieces(slurp_id, sentence):
+    """slurp_id, sentence -> [piece text, ...] | None, one per key piece.
 
     The list index + 1 is the id every stage-2 call speaks in.
     """
+    with _KEY_PIECES_LOCK:
+        if slurp_id in _SLURP_ID_2_KEY_PIECES:
+            return _SLURP_ID_2_KEY_PIECES[slurp_id]
+
     cmd = _normalize_text(sentence)
-    with _PIECES_LOCK:
-        if cmd in _PIECES_CACHE:
-            return _PIECES_CACHE[cmd]
 
     obj = gpt_json(
         KEY_PIECES_SYSTEM,
@@ -378,12 +385,12 @@ def key_pieces(sentence):
         # every labeler prompt in this repo occasionally does anyway
         pieces = drop_wake_only(
             [str(s).strip() for s in obj.get("pieces", []) if str(s).strip()]
-        )[:PIECES_MAX]
+        )
         if not pieces:
             pieces = None
 
-    with _PIECES_LOCK:
-        _PIECES_CACHE[cmd] = pieces
+    with _KEY_PIECES_LOCK:
+        _SLURP_ID_2_KEY_PIECES[slurp_id] = pieces
     return pieces
 ```
 
@@ -424,56 +431,50 @@ def sent_loss(system, pieces, witness_line):
 
 ## Step 5 — `babble_data.py`: `decide_kind_ids`
 
-Same rules as `decide_kind` — 0/1/≥2 agreed pieces map to answer/repair/repeat, plus the
-`LOST_MAX_PCT` wrecked override — but agreement is exact id intersection, and "how much was lost"
-is now a fraction of the inventory instead of a token-overlap ratio. Written to take N sides so the
-two-witness and 4-hypothesis tracks share it:
+Same 0/1/≥2 mapping as `decide_kind` — agreed pieces to answer/repair/repeat — but agreement is
+exact id intersection, and "how much was lost" is a fraction of the inventory instead of a
+token-overlap ratio against the sentence. Written to take N sides so the two-witness and
+4-hypothesis tracks share it.
+
+Three departures from `decide_kind`:
+
+- **One `lost` list, no `lost_piece` / `misheard_as`.** The pieces are already exact strings out of
+  the stage-1 inventory, so the free-text pair (`lost_piece` for the target writer, `missing` for
+  diagnostics) collapses to one list — on repair it is a 1-element list holding exactly what the
+  target writer needs. `misheard_as` was always `""` on this track anyway (the sent rubrics report
+  ids, never a substitute wording), and `REPAIR_TARGET_TREE_SYSTEM` never renders it. Step 7 adapts
+  the probe-dict site to both.
+- **`LOST_MAX_PCT` is measured in words of the inventory, not in pieces.** `1/len(pieces)` treats
+  every piece as equally big; what actually matters is whether the agreed piece *is* most of the
+  command. This is stricter on short inventories — a 2-piece command that lost the wordier piece
+  files as `repeat` where the count rule kept it as `repair` — so it is the first thing to check if
+  repair rows are starved (step 9).
+- **No all-sides-wrecked override.** `decide_kind`'s second rule (every witness on its own lost most
+  of the command ⇒ `repeat`, whatever they share) is deliberately not carried over. The exact-id
+  intersection makes the coincidental-agreement case it guards against much rarer than it is between
+  two free-text quotes, and the per-side counts are in `classifier_reason` if the built rows say
+  otherwise.
 
 ```python
-def decide_kind_ids(pieces, sides):
-    """(inventory, [set of lost ids per witness]) -> label dict.
-
-    `sides` is [asr_ids, resp_ids] on --sent-loss and the four per-hypothesis
-    id sets on --sent-beam. A piece counts lost only when EVERY side reports
-    it: one witness getting a piece right proves it was audible, however badly
-    the others mangled it. This is an intersection, not a vote -- the rule
-    BEAM_LOSS_SYSTEM states in prose, now enforced in code.
-
-    Two overrides file an otherwise-repair probe as repeat:
-      - every side on its own lost most of the inventory: an intersection of
-        one there is a coincidence between two wrecks, not a clean hole
-      - the agreed piece is >= LOST_MAX_PCT of the whole inventory, which is
-        how a one-piece command that lost its piece lands (nothing survives to
-        anchor a question on)
-    """
+def decide_kind_ids(pieces, sides: list[set[int]]):
     agreed = sorted(set.intersection(*sides)) if sides else []
     kind = "answer" if not agreed else "repair" if len(agreed) == 1 else "repeat"
-    lost_piece = pieces[agreed[0] - 1] if kind == "repair" else ""
-
-    wrecked = all(len(s) / len(pieces) >= LOST_MAX_PCT for s in sides)
-    if wrecked or (kind == "repair" and 1 / len(pieces) >= LOST_MAX_PCT):
-        kind, lost_piece = "repeat", ""
+    lost = [pieces[i - 1] for i in agreed]
+    total_wc = sum(len(p.split()) for p in pieces)
+    if kind == "repair" and len(lost[0].split()) / total_wc >= LOST_MAX_PCT:
+        kind = "repeat"
 
     return {
         "kind": kind,
-        "lost_piece": lost_piece,
-        # no witness of a similar-sounding substitute on these tracks, so a
-        # repair question always asks openly
-        "misheard_as": "",
-        "missing": (
-            [lost_piece]
-            if kind == "repair"
-            else [pieces[i - 1] for i in sorted(set().union(*sides))]
-            if kind == "repeat"
-            else []
-        ),
+        # on repeat this is the agreed pieces, not the union of the sides --
+        # a diagnostic column only, since repeat targets come from REPEAT_POOL
+        "lost": lost,
         "asr_bucket": f"a{len(sides[0])}",
         "resp_bucket": f"r{len(sides[-1])}",
         "reason": (
             f"{len(pieces)} pieces | "
             + " x ".join(str(sorted(s)) for s in sides)
             + f" -> agreed {agreed}"
-            + (" (all wrecked)" if wrecked else "")
         ),
     }
 ```
@@ -486,11 +487,11 @@ still use them; sent-loss simply never calls them on loss lists.
 Next to `label_tree` / `label_beam`:
 
 ```python
-def label_sent(sentence, transcript, response):
+def label_sent(slurp_id, sentence, transcript, response):
     """--sent-loss: inventory once, then one loss call per witness."""
     if not transcript or not response:
         return None
-    pieces = key_pieces(sentence)
+    pieces = key_pieces(slurp_id, sentence)
     if pieces is None:
         return None
     asr_ids = sent_loss(
@@ -504,12 +505,12 @@ def label_sent(sentence, transcript, response):
     return {**decide_kind_ids(pieces, [asr_ids, resp_ids]), "pieces": pieces}
 
 
-def label_sent_beam(sentence, hyps):
+def label_sent_beam(slurp_id, sentence, hyps):
     """--sent-beam: inventory once, then ASR_N_BEST loss calls in parallel."""
     hyps = [h for h in hyps if h and h.strip()]
     if not hyps:
         return None
-    pieces = key_pieces(sentence)
+    pieces = key_pieces(slurp_id, sentence)
     if pieces is None:
         return None
     with ThreadPoolExecutor(max_workers=len(hyps)) as ex:
@@ -572,11 +573,24 @@ track.add_argument(
 ([872](../babble_data.py#L872), [880](../babble_data.py#L880)), so both sent tracks pick them up with
 no edit.
 
+**`probe_by_kinds` signature** ([babble_data.py:877](../babble_data.py#L877)) — the sent tracks' cache
+key has to reach `key_pieces`, so take it next to the sentence it identifies:
+
+```python
+def probe_by_kinds(clean, pool, slurp_id, sentence, kinds_need, batch_size, rng):
+```
+
+Both callers already have `slurp_id` bound one line above the call
+([1197](../babble_data.py#L1197)/[1202](../babble_data.py#L1202),
+[1316](../babble_data.py#L1316)/[1321](../babble_data.py#L1321)) — they use it for the
+self-exclusion filter on `babble_pool` and for the per-utterance `random.Random` seed — so each is a
+one-line insertion. The other tracks ignore the argument.
+
 **Probe dispatch in `probe_by_kinds`** ([babble_data.py:979-1037](../babble_data.py#L979-L1037)):
 
 - `--sent-beam` joins the existing beam branch (same GPU pass, same `hyp_lists`, no task-response
   decode). Change the branch guard to `TRACK in ("beam", "sent-beam")` and pick the labeler:
-  `label_beam` vs `lambda h: label_sent_beam(sentence, h)`.
+  `label_beam` vs `lambda h: label_sent_beam(slurp_id, sentence, h)`.
 - `--sent-loss` joins the final `else` branch alongside tree/two-pass. Extend the `label_one`
   selection to a three-way choice rather than a nested conditional expression — at three tracks the
   ternary chain stops reading:
@@ -585,13 +599,34 @@ no edit.
   if TRACK == "two-pass":
       label_one = classify
   elif TRACK == "sent":
-      label_one = lambda t, r: label_sent(sentence, t, r)
+      label_one = lambda t, r: label_sent(slurp_id, sentence, t, r)
   else:
       label_one = lambda t, r: label_tree(sentence, t, r)
   ```
 
-**Probe result dict** ([1046-1069](../babble_data.py#L1046-L1069)) — add
-`"pieces": label.get("pieces", [])` so the inventory reaches the row.
+**Probe result dict** ([1126-1149](../babble_data.py#L1126-L1149)) — three edits, because the sent
+label dict carries `lost` where the other labelers carry `missing` / `misheard_as` / `lost_piece`:
+
+```python
+# tree/beam/two-pass say "missing"; the sent tracks say "lost", already
+# resolved to piece strings
+"lost": label.get("lost", label.get("missing", [])),
+"swapped": [label["misheard_as"]] if label.get("misheard_as") else [],
+...
+# the sent tracks don't return this: on repair their `lost` IS the one
+# piece, so write_target's prompt and leak filter read it off the list
+"lost_piece": label.get(
+    "lost_piece",
+    label["lost"][0] if label["kind"] == "repair" and label.get("lost") else "",
+),
+# the stage-1 inventory, so a mislabeled row can be re-read without stage 1
+"pieces": label.get("pieces", []),
+```
+
+Nothing else needs to know which track it is: `write_target`'s repair branch, its `leakable` leak
+filter, and `make_row`'s `lost_piece` column all keep reading `probe["lost_piece"]`, and
+`probe["swapped"]` stays empty on these tracks so `REPAIR_TARGET_TREE_SYSTEM`'s open question is the
+only thing that can be rendered.
 
 ## Step 8 — row schema
 
@@ -630,8 +665,9 @@ Read `babble_audio/slurp-sent-v0/rows.json` and check, in this order:
    the sides never intersect means the two rubrics disagree about what "survived" means, not that the
    audio was clean.
 3. **kind distribution** — the `Counter` the build logs. If `repair` is starved, `LOST_MAX_PCT`
-   against a short inventory is the first suspect: a 2-piece command losing 1 piece is `1/2 = 0.5`,
-   just under the 0.6 threshold, so the threshold is doing real work at that length.
+   against a short inventory is the first suspect: it is measured in words, so a 2-piece command
+   that lost the wordier of the two is already at or past the 0.6 threshold and files as `repeat`.
+   `classifier_reason` prints `<n> pieces | ...` so the inventory length is right there.
 4. **`lost_piece` vs `target`** — the repair question must not speak the lost piece; `skip` counts
    `target-leak` for the ones that did and retried.
 
