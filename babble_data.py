@@ -437,37 +437,23 @@ def lost_pieces(system: str, pieces: list[str], witness_line: str):
     return ids
 
 
-_SLURP_ID_2_KEY_PIECES = {}
-_KEY_PIECES_LOCK = threading.Lock()
-
-
-def key_pieces(slurp_id, sentence: str):
+def key_pieces(sentence: str):
     """Return None if LLM returns a bad JSON, or every piece filtered.
     Otherwise, returns a list of key pieces -> list[str]
+
     """
-    with _KEY_PIECES_LOCK:
-        if slurp_id in _SLURP_ID_2_KEY_PIECES:
-            return _SLURP_ID_2_KEY_PIECES[slurp_id]
-
-    cmd = _normalize_text(sentence)
-
     obj = gpt_json(
         KEY_PIECES_SYSTEM,
-        f"COMMAND: {cmd}",
+        f"COMMAND: {_normalize_text(sentence)}",
         temperature=CLASSIFY_TEMPERATURE,
         max_tokens=CLASSIFY_MAX_TOKENS,
     )
-    pieces = None
-    if obj is not None:
-        pieces = drop_wake_only(
-            [str(s).strip() for s in obj.get("pieces", []) if str(s).strip()]
-        )
-        if not pieces:
-            pieces = None
-
-    with _KEY_PIECES_LOCK:
-        _SLURP_ID_2_KEY_PIECES[slurp_id] = pieces
-    return pieces
+    if obj is None:
+        return None
+    pieces = drop_wake_only(
+        [str(s).strip() for s in obj.get("pieces", []) if str(s).strip()]
+    )
+    return pieces or None
 
 
 def decide_kind_ids(pieces, sides: list[set[int]]):
@@ -477,8 +463,7 @@ def decide_kind_ids(pieces, sides: list[set[int]]):
     agreed = sorted(set.intersection(*sides)) if sides else []
     kind = "answer" if not agreed else "repair" if len(agreed) == 1 else "repeat"
     lost = [pieces[i - 1] for i in agreed]
-    total_wc = sum(len(p.split()) for p in pieces)
-    if kind == "repair" and len(lost[0].split()) / total_wc >= LOST_MAX_PCT:
+    if kind == "repair" and len(pieces) == 1:
         kind = "repeat"
 
     return {
@@ -590,12 +575,8 @@ def label_tree(sentence, transcript, response):
     return decide_kind(sentence, asr_lost, resp_lost)
 
 
-def label_sent(slurp_id, sentence, transcript, resp):
+def label_sent(pieces, transcript, resp):
     if not transcript or not resp:
-        return None
-    pieces = key_pieces(slurp_id, sentence)
-
-    if not pieces:
         return None
     asr_ids = lost_pieces(
         SENT_ASR_LOSS_SYSTEM, pieces, f"HEARD: {_normalize_text(transcript)}"
@@ -661,14 +642,11 @@ NON_PIECE_WORDS = (
 )
 
 
-def label_sent_beam(slurp_id, sentence, hyps):
+def label_sent_beam(pieces, hyps):
     hyps = [h for h in hyps if h and h.strip()]
     if not hyps:
         return None
 
-    pieces = key_pieces(slurp_id, sentence)
-    if pieces is None:
-        return None
     with ThreadPoolExecutor(max_workers=len(hyps)) as ex:
         sides = list(
             ex.map(
@@ -971,7 +949,7 @@ def write_target(sentence, kind, probe):
 # ---
 
 
-def probe_by_kinds(clean, pool, slurp_id, sentence, kinds_need, batch_size, rng):
+def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
     def make_probe_batch(kinds_need):
         """return a list of wav paths and a list of snr vals"""
         length = len(clean)
@@ -1074,6 +1052,14 @@ def probe_by_kinds(clean, pool, slurp_id, sentence, kinds_need, batch_size, rng)
         return None
 
     results: dict[str, dict | None] = {k: None for k in kinds_need}
+
+    pieces = None
+    if TRACK in ("sent-2", "sent-4"):
+        pieces = key_pieces(sentence)
+        if pieces is None:
+            skip["pieces"] += 1
+            return results
+
     for _ in range(MAX_PROBES):
         missing_slots = [k for k, v in results.items() if v is None]
         if not missing_slots:
@@ -1097,7 +1083,7 @@ def probe_by_kinds(clean, pool, slurp_id, sentence, kinds_need, batch_size, rng)
             responses = ["" for _ in hyp_lists]
             with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
                 labels = list(
-                    ex.map(lambda h: label_sent_beam(slurp_id, sentence, h), hyp_lists)
+                    ex.map(lambda h: label_sent_beam(pieces, h), hyp_lists)
                 )
         elif TRACK == "heard-reply":
             with GPU_LOCK:
@@ -1134,7 +1120,7 @@ def probe_by_kinds(clean, pool, slurp_id, sentence, kinds_need, batch_size, rng)
             if TRACK == "two-pass":
                 label_one = classify
             elif TRACK == "sent-2":
-                label_one = lambda t, r: label_sent(slurp_id, sentence, t, r)
+                label_one = lambda t, r: label_sent(pieces, t, r)
             else:
                 label_one = lambda t, r: label_tree(sentence, t, r)
             with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
@@ -1302,7 +1288,6 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
             clean,
             # never mix an utterance with itself
             [arr for sid, arr in babble_pool if sid != slurp_id],
-            slurp_id,
             sentence,
             KINDS,
             PROBE_BATCH_SIZE,
@@ -1421,7 +1406,6 @@ def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
         probe = probe_by_kinds(
             clean,
             [arr for sid, arr in babble_pool if sid != slurp_id],
-            slurp_id,
             sentence,
             ["answer"],
             ANSWER_PROBE_BATCH_SIZE,

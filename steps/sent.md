@@ -335,68 +335,51 @@ REPLY: it's really loud in here -- what was that?
 Then extend the import block at [babble_data.py:24-39](../babble_data.py#L24-L39) with
 `KEY_PIECES_SYSTEM`, `SENT_ASR_LOSS_SYSTEM`, `SENT_RESP_LOSS_SYSTEM`.
 
-## Step 3 — `babble_data.py`: stage 1, cached
+## Step 3 — `babble_data.py`: stage 1, once per utterance
 
-Stage 1's only input is the sentence, and `slurp_id` is exactly the id of a distinct sentence (SLURP
-streams several recordings of the same prompt back to back, all sharing one `slurp_id`) — so key the
-cache on `slurp_id`. It is a short, already-unique key that needs no text normalization to be a
-correct key, where the sentence string only becomes one after `_normalize_text` and only stays one as
-long as nothing upstream re-cases or re-punctuates it.
+Stage 1's only input is the sentence, so it must run **once per utterance**, not once per probe: the
+ids in a triplet's three labels are only comparable if all three scored their witnesses against the
+same list. `probe_by_kinds` is already called exactly once per utterance, so that is where the call
+belongs (step 7) — `key_pieces` itself stays a pure function of the sentence, with no cache and no
+lock.
 
-This is not a cross-utterance dedupe either way: `build_triplets` / `build_answer_rows` claim each
-`slurp_id` in `seen_slurp_ids` on first sight, so a build never labels the same sentence twice. The
-cache earns its keep *within* one utterance — every kind and every `MAX_PROBES` redraw reuses one
-stage-1 call.
+A memo keyed on `slurp_id` is the tempting alternative and it is wrong here. The three kinds of one
+utterance are labeled concurrently in the `CLASSIFY_WORKERS` pool, so they all miss the cache, all
+call, and each keeps its own answer — the first build did exactly that, giving slurp 11461 both
+`['play','that','podcast']` and `['play','that podcast']` in the same run. Holding a lock across the
+LLM call would serialize every labeler in the process; a per-`slurp_id` lock would work but is more
+machinery than hoisting one call out of a loop.
 
-Both call sites already hold `slurp_id` ([babble_data.py:1197](../babble_data.py#L1197),
-[1316](../babble_data.py#L1316)) but `probe_by_kinds` does not take it, so step 7 threads it through.
-
-Place it next to `label_loss` (around [babble_data.py:399](../babble_data.py#L399)):
+Place it next to `label_loss` (around [babble_data.py:410](../babble_data.py#L410)):
 
 ```python
-# stage 1 depends only on the sentence, so it is computed once and reused
-# across every probe batch, every kind, and every MAX_PROBES redraw of the
-# utterance. Keyed on slurp_id, which IS the id of a distinct sentence (the
-# several recordings slurp streams of one prompt all share it), so no text
-# normalization stands between the key and its identity.
-_SLURP_ID_2_KEY_PIECES = {}
-_KEY_PIECES_LOCK = threading.Lock()
+def key_pieces(sentence: str):
+    """Return None if LLM returns a bad JSON, or every piece filtered.
+    Otherwise, returns a list of key pieces -> list[str]
 
-
-def key_pieces(slurp_id, sentence):
-    """slurp_id, sentence -> [piece text, ...] | None, one per key piece.
-
-    The list index + 1 is the id every stage-2 call speaks in.
+    Called once per utterance, by probe_by_kinds -- every kind and every
+    MAX_PROBES redraw scores its witnesses against that one inventory, so the
+    ids in a triplet's three labels all index into the same list.
     """
-    with _KEY_PIECES_LOCK:
-        if slurp_id in _SLURP_ID_2_KEY_PIECES:
-            return _SLURP_ID_2_KEY_PIECES[slurp_id]
-
-    cmd = _normalize_text(sentence)
-
     obj = gpt_json(
         KEY_PIECES_SYSTEM,
-        f"COMMAND: {cmd}",
+        f"COMMAND: {_normalize_text(sentence)}",
         temperature=CLASSIFY_TEMPERATURE,
         max_tokens=CLASSIFY_MAX_TOKENS,
     )
-    pieces = None
-    if obj is not None:
-        # the wake-word filter still runs: the prompt says never to list one and
-        # every labeler prompt in this repo occasionally does anyway
-        pieces = drop_wake_only(
-            [str(s).strip() for s in obj.get("pieces", []) if str(s).strip()]
-        )
-        if not pieces:
-            pieces = None
-
-    with _KEY_PIECES_LOCK:
-        _SLURP_ID_2_KEY_PIECES[slurp_id] = pieces
-    return pieces
+    if obj is None:
+        return None
+    # the wake-word filter still runs: the prompt says never to list one and
+    # every labeler prompt in this repo occasionally does anyway
+    pieces = drop_wake_only(
+        [str(s).strip() for s in obj.get("pieces", []) if str(s).strip()]
+    )
+    return pieces or None
 ```
 
-A `None` here (bad JSON, or every piece filtered away) means the utterance cannot be labeled at all —
-handle it as a skip in step 6, not as an empty inventory.
+A `None` here (bad JSON, or every piece filtered away) means the utterance cannot be labeled at all.
+Because the call is hoisted, that is caught before the first probe batch is even mixed — no GPU time
+is spent on an utterance that could never be labeled.
 
 ## Step 4 — `babble_data.py`: stage 2
 
@@ -488,13 +471,13 @@ still use them; the sent tracks simply never call them on loss lists.
 
 Next to `label_tree` / `label_beam`:
 
+Both take the utterance's inventory as an argument — `probe_by_kinds` built it once (step 3) and
+passes it down, so neither labeler owns a cache:
+
 ```python
-def label_sent(slurp_id, sentence, transcript, response):
-    """--sent-2: inventory once, then one loss call per witness."""
+def label_sent(pieces, transcript, response):
+    """--sent-2: one loss call per witness, against the given inventory."""
     if not transcript or not response:
-        return None
-    pieces = key_pieces(slurp_id, sentence)
-    if pieces is None:
         return None
     asr_ids = lost_pieces(
         SENT_ASR_LOSS_SYSTEM, pieces, f"HEARD: {_normalize_text(transcript)}"
@@ -507,13 +490,10 @@ def label_sent(slurp_id, sentence, transcript, response):
     return {**decide_kind_ids(pieces, [asr_ids, resp_ids]), "pieces": pieces}
 
 
-def label_sent_beam(slurp_id, sentence, hyps):
-    """--sent-4: inventory once, then ASR_N_BEST loss calls in parallel."""
+def label_sent_beam(pieces, hyps):
+    """--sent-4: ASR_N_BEST loss calls in parallel, against the same inventory."""
     hyps = [h for h in hyps if h and h.strip()]
     if not hyps:
-        return None
-    pieces = key_pieces(slurp_id, sentence)
-    if pieces is None:
         return None
     with ThreadPoolExecutor(max_workers=len(hyps)) as ex:
         sides = list(
@@ -573,18 +553,32 @@ turns the dashes into underscores, so the attributes are `args.sent_2` / `args.s
 ([998](../babble_data.py#L998), [1005](../babble_data.py#L1005)), so both sent tracks pick them up
 with no edit.
 
-**`probe_by_kinds` signature** ([babble_data.py:985](../babble_data.py#L985)) — the sent tracks' cache
-key has to reach `key_pieces`, so take it next to the sentence it identifies:
+**Stage 1, hoisted** ([babble_data.py:1057-1067](../babble_data.py#L1057-L1067)) — one call for the
+whole utterance, between the `results` dict and the `MAX_PROBES` loop, so every kind and every redraw
+shares one inventory:
 
 ```python
-def probe_by_kinds(clean, pool, slurp_id, sentence, kinds_need, batch_size, rng):
+results: dict[str, dict | None] = {k: None for k in kinds_need}
+
+# stage 1 sees only the sentence, so one call serves every kind and every
+# redraw below -- and an inventory the labeler cannot build is a skip
+# before any GPU time is spent on this utterance
+pieces = None
+if TRACK in ("sent-2", "sent-4"):
+    pieces = key_pieces(sentence)
+    if pieces is None:
+        skip["pieces"] += 1
+        return results
+
+for _ in range(MAX_PROBES):
+    ...
 ```
 
-Both callers already have `slurp_id` bound near the call — they use it for the self-exclusion filter
-on `babble_pool` and for the per-utterance `random.Random` seed — so each is a one-line insertion.
-The other tracks ignore the argument.
+`probe_by_kinds` needs no new parameter: `pieces` is a local the dispatch lambdas close over, and
+`sentence` was already there. (An earlier draft threaded `slurp_id` in as a cache key — see step 3
+for why the cache is gone.)
 
-**Probe dispatch in `probe_by_kinds`** ([babble_data.py:1105-1163](../babble_data.py#L1105-L1163)):
+**Probe dispatch in `probe_by_kinds`** ([babble_data.py:1080-1135](../babble_data.py#L1080-L1135)):
 
 - `--sent-4` joins the existing beam branch (same GPU pass, same `hyp_lists`, no task-response
   decode). Change the branch guard to `TRACK in ("beam", "sent-4")` and call `label_sent_beam` for
@@ -598,7 +592,7 @@ The other tracks ignore the argument.
   if TRACK == "two-pass":
       label_one = classify
   elif TRACK == "sent-2":
-      label_one = lambda t, r: label_sent(slurp_id, sentence, t, r)
+      label_one = lambda t, r: label_sent(pieces, t, r)
   else:
       label_one = lambda t, r: label_tree(sentence, t, r)
   ```
