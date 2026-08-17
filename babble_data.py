@@ -28,7 +28,6 @@ from prompts import (
     CLASSIFY_SYSTEM,
     HEARD_PREFILL,
     LABEL_TARGET_SYSTEM,
-    REPAIR_TARGET_SYSTEM,
     REPEAT_POOL_SYSTEM,
     RESP_LOSS_SYSTEM,
     TARGET_SYSTEM,
@@ -759,16 +758,6 @@ def label_beam(sentence, hyps):
 # ---
 
 
-# `heard` is one quoted transcript on the single-pass tracks, and a "HYP <i>:"
-# block on --beam-label; the writer is told in the system prompt how to read
-# either shape.
-REPAIR_TARGET_USER = (
-    'COMMAND:\n"{sentence}"\n\n'
-    "HEARD:\n{heard}\n"
-    'LOST-PIECE: "{lost_piece}"{swap_note}'
-)
-
-
 # --tree-label's own pair. The tree label is the intersection of two loss
 # lists, so by construction every part of the command outside LOST-PIECE came
 # through on both witnesses -- saying that in the prompt is both more accurate
@@ -927,7 +916,7 @@ def build_repeat_pool(size):
 
 
 def write_target(sentence, kind, probe):
-    """One SFT target for one already-labeled tree- or beam-track probe.
+    """One SFT target for one already-labeled probe (every track but heard-reply).
 
     Deliberately a second call, after the labeler: the label wants
     temperature 0 so a rerun reproduces the dataset while the reply wants 0.7
@@ -940,32 +929,24 @@ def write_target(sentence, kind, probe):
     if kind == "repeat":
         return random.choice(REPEAT_POOL)
 
+    # on repair the label's `lost` is the single agreed piece, and it is the
+    # only thing the question may not speak
+    lost_piece = probe["lost"][0] if kind == "repair" else ""
+
     if kind == "answer":
         system = ANSWER_TARGET_SYSTEM
         user = ANSWER_TARGET_USER.format(sentence=sentence)
-    elif kind == "repair" and TRACK in ("tree", "sent-2", "sent-4"):
+    else:
+        # every labeler that reaches here now reports losses as key-piece ids
+        # against one inventory, with no witness of a similar-sounding
+        # substitute -- so the question always asks openly
         system = REPAIR_TARGET_TREE_SYSTEM
         user = REPAIR_TARGET_TREE_USER.format(
-            sentence=sentence, lost_piece=probe["lost_piece"]
-        )
-    elif kind == "repair":
-        hyps = probe.get("hypotheses") or []
-        system = REPAIR_TARGET_SYSTEM
-        user = REPAIR_TARGET_USER.format(
-            sentence=sentence,
-            heard=(
-                "\n".join(f'HYP {i}: "{h}"' for i, h in enumerate(hyps, 1))
-                if len(hyps) > 1
-                else f'"{probe["transcript"]}"'
-            ),
-            lost_piece=probe["lost_piece"],
-            swap_note=(
-                f'\nMISHEARD-AS: "{probe["swapped"][0]}"' if probe["swapped"] else ""
-            ),
+            sentence=sentence, lost_piece=lost_piece
         )
 
     leakable = (
-        set(_normalize_text(probe["lost_piece"]).split()) - NON_PIECE_WORDS
+        set(_normalize_text(lost_piece).split()) - NON_PIECE_WORDS
         if kind == "repair"
         else set()
     )
@@ -1115,7 +1096,9 @@ def probe_by_kinds(clean, pool, slurp_id, sentence, kinds_need, batch_size, rng)
             # decoding it would be dead GPU time
             responses = ["" for _ in hyp_lists]
             with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
-                labels = list(ex.map(lambda h: label_sent_beam(slurp_id, sentence, h), hyp_lists))
+                labels = list(
+                    ex.map(lambda h: label_sent_beam(slurp_id, sentence, h), hyp_lists)
+                )
         elif TRACK == "heard-reply":
             with GPU_LOCK:
                 convs = [_conv(p, sysp, task_prompt(True)) for p in paths]
@@ -1267,13 +1250,9 @@ def make_row(kind, target, path, probe, slurp_id, sentence):
         "asr_transcript": probe["transcript"],
         "omni_response": probe["response"],
         "lost": probe["lost"],
-        "swapped": probe["swapped"],
         "classifier_reason": probe["reason"],
-        # tree track: how many pieces each pass reported lost, and (tree and
-        # beam) the one agreed piece the repair question asks about.
         "asr_bucket": probe["asr_bucket"],
         "resp_bucket": probe["resp_bucket"],
-        "lost_piece": probe["lost_piece"],
         # beam track: the K hypotheses this row's label was intersected from,
         # and the per-hypothesis loss lists as JSON so a mislabeled row can be
         # diagnosed without re-running the GPU pass. Empty on the other tracks.
@@ -1351,6 +1330,8 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
         # ---
         # one LLM call writes all 3 targets for the utterance
         # ---
+        # STALE: probe dicts no longer carry "swapped" -- see the note above the
+        # track flags in __main__
         repair_probe, repeat_probe = triplet["repair"], triplet["repeat"]
         swap_note = ""
         if repair_probe["swapped"]:
@@ -1531,6 +1512,17 @@ if __name__ == "__main__":
         help="Build and write rows.json + the wavs, but skip push_to_hub. For "
         "smoke runs, so a throwaway --ds-id doesn't create a Hub repo.",
     )
+    # STALE TRACKS. The sent tracks dropped the probe dict's "swapped" and
+    # "lost_piece" entries -- their labels report key-piece ids against one
+    # inventory, so the single agreed piece IS probe["lost"][0] and no witness
+    # of a similar-sounding substitute exists. Everything downstream now reads
+    # only "lost", which leaves two tracks needing work before they run again:
+    #   two-pass (the no-flag default): its utterance-level target call still
+    #     reads repair_probe["swapped"] and will KeyError there.
+    #   --beam-label: still decodes K hypotheses, but is labeled by
+    #     label_sent_beam now, so label_beam / BEAM_LOSS_SYSTEM are unused and
+    #     the beam_losses + unintelligible columns come out empty.
+    # --heard-reply and --tree-label are unaffected.
     track = ap.add_mutually_exclusive_group()
     track.add_argument(
         "--heard-reply",

@@ -565,7 +565,7 @@ turns the dashes into underscores, so the attributes are `args.sent_2` / `args.s
 | --- | --- |
 | [1567](../babble_data.py#L1567) `if TRACK == "beam"` (batch size) | `in ("beam", "sent-4")` — only the beam-decoding track needs the smaller batch |
 | [1583](../babble_data.py#L1583) repeat-pool build | `in ("tree", "beam", "sent-2", "sent-4")` |
-| [946](../babble_data.py#L946) `write_target` repair branch | `TRACK in ("tree", "sent-2", "sent-4")` → `REPAIR_TARGET_TREE_SYSTEM` (open question, no `misheard_as`) |
+| [929](../babble_data.py#L929) `write_target` repair branch | no `TRACK` check left: every repair renders `REPAIR_TARGET_TREE_SYSTEM`'s open question |
 | [1340](../babble_data.py#L1340), [1451](../babble_data.py#L1451) build/answer-row target path | `in ("tree", "beam", "sent-2", "sent-4")` |
 | [1147](../babble_data.py#L1147) `task = TASK_PROMPT_TREE if TRACK == "tree"` | `in ("tree", "sent-2")` — the restating reply is what `SENT_RESP_LOSS_SYSTEM` reads, and `--sent-4` has no reply pass at all |
 
@@ -587,16 +587,9 @@ The other tracks ignore the argument.
 **Probe dispatch in `probe_by_kinds`** ([babble_data.py:1105-1163](../babble_data.py#L1105-L1163)):
 
 - `--sent-4` joins the existing beam branch (same GPU pass, same `hyp_lists`, no task-response
-  decode). Change the branch guard to `TRACK in ("beam", "sent-4")` and hoist the labeler out of the
-  `ex.map` call:
-
-  ```python
-  label_hyps = (
-      (lambda h: label_sent_beam(slurp_id, sentence, h))
-      if TRACK == "sent-4"
-      else (lambda h: label_beam(sentence, h))
-  )
-  ```
+  decode). Change the branch guard to `TRACK in ("beam", "sent-4")` and call `label_sent_beam` for
+  both: id-loss against one inventory is the sounder read of K hypotheses than `label_beam`'s
+  free-text consensus, so `--beam-label` adopts it rather than keeping its own labeler.
 - `--sent-2` joins the final `else` branch alongside tree/two-pass. Extend the `label_one`
   selection to a three-way choice rather than a nested conditional expression — at three tracks the
   ternary chain stops reading:
@@ -610,39 +603,40 @@ The other tracks ignore the argument.
       label_one = lambda t, r: label_tree(sentence, t, r)
   ```
 
-**Probe result dict** ([1180-1216](../babble_data.py#L1180-L1216)) — the sent label dict carries
-`lost` where the other labelers carry `missing` / `misheard_as` / `lost_piece`, so resolve it into a
-local *above* the dict and read the fallbacks off that:
+**Probe result dict** ([1160-1190](../babble_data.py#L1160-L1190)) — `lost` replaces the old
+`missing` / `lost_piece` / `swapped` trio, and `pieces` is added:
 
 ```python
 kind = label["kind"]
-# tree/beam/two-pass call it "missing" and quote it out of the command; the
-# sent tracks call it "lost" and it is already exact key-piece text
+# tree/two-pass call it "missing" and quote it out of the command; the sent
+# tracks call it "lost" and it is already exact key-piece text
 lost = label.get("lost", label.get("missing", []))
 if kind in results and results[kind] is None:
     results[kind] = {
         ...
         "lost": lost,
-        "swapped": [label["misheard_as"]] if label.get("misheard_as") else [],
         ...
-        # the sent tracks don't return this: on repair their `lost` IS the one
-        # piece, so write_target's prompt and its leak filter read it off that
-        "lost_piece": label.get(
-            "lost_piece", lost[0] if kind == "repair" and lost else ""
-        ),
         # sent tracks only: the stage-1 inventory the label's ids indexed into
         "pieces": label.get("pieces", []),
     }
 ```
 
-The local is not just tidiness: `dict.get`'s default argument is evaluated eagerly, so writing
-`label.get("lost_piece", label["lost"][0] ...)` inline raises `KeyError` on every tree/beam/two-pass
-probe, whose labels have no `lost` key at all.
+Dropping `lost_piece` and `swapped` from the probe dict is the point, not a side effect: on repair
+`lost` is a 1-element list holding exactly what `lost_piece` used to, and no labeler that survives
+here witnesses a similar-sounding substitute. Consequences, all handled in the same pass:
 
-Nothing else needs to know which track it is: `write_target`'s repair branch, its `leakable` leak
-filter, and `make_row`'s `lost_piece` column all keep reading `probe["lost_piece"]`, and
-`probe["swapped"]` stays empty on these tracks so `REPAIR_TARGET_TREE_SYSTEM`'s open question is the
-only thing that can be rendered.
+- `write_target` derives `lost_piece = probe["lost"][0]` once at the top and uses it for both the
+  prompt and the `leakable` leak filter, and its repair path collapses to one branch —
+  `REPAIR_TARGET_TREE_SYSTEM`'s open question — for every track that reaches it. That retires
+  `REPAIR_TARGET_SYSTEM` / `REPAIR_TARGET_USER` (the `MISHEARD-AS:` / `HYP <i>:` shape), which are
+  deleted from `babble_data.py` but still defined in `prompts.py` if the beam-consensus labeler ever
+  comes back.
+- `make_row` loses its `lost_piece` and `swapped` columns; `lost` carries the repair anchor.
+- `--beam-label` is labeled by `label_sent_beam` too, so `label_beam` / `BEAM_LOSS_SYSTEM` and the
+  `beam_losses` / `unintelligible` columns are now unreached.
+- The no-flag `two-pass` default still reads `repair_probe["swapped"]` in its utterance-level target
+  call and will `KeyError` there. Left stale deliberately, with a note above the track flags in
+  `__main__`.
 
 ## Step 8 — row schema
 
