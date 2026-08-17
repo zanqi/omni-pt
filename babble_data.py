@@ -28,6 +28,7 @@ from prompts import (
     CLASSIFY_SYSTEM,
     HEARD_PREFILL,
     LABEL_TARGET_SYSTEM,
+    REPAIR_TARGET_TREE_SYSTEM,
     REPEAT_POOL_SYSTEM,
     RESP_LOSS_SYSTEM,
     TARGET_SYSTEM,
@@ -732,53 +733,17 @@ def label_beam(sentence, hyps):
 
 
 # ---
-# --tree-label: one target per probe
+# one target per probe -- every track but --heard-reply
 # ---
 
 
-# --tree-label's own pair. The tree label is the intersection of two loss
-# lists, so by construction every part of the command outside LOST-PIECE came
-# through on both witnesses -- saying that in the prompt is both more accurate
-# and shorter than handing over a noisy transcript and asking the writer to
-# work out which words it can trust. No MISHEARD-AS either: neither tree
-# labeler reports a substitute word any more, so the question always asks
-# openly.
-REPAIR_TARGET_TREE_SYSTEM = """You are writing the reply a smart voice \
-assistant should give when background chatter cost it exactly one piece of a \
-spoken command.
-
-You get the user's real COMMAND and the LOST-PIECE of it that did not reach \
-the device. Every other part of the command was heard correctly, so those are \
-the words to build your question around.
-
-Write ONE short natural question (under 20 words) recovering ONLY the lost \
-piece. Test: if the user replied with just the missing words, the command \
-would be complete.
-- NEVER ask about the parts that were heard correctly -- asking again would \
-sound like the assistant wasn't listening. Quote or paraphrase them instead, \
-to show what did get through.
-- NEVER say the LOST-PIECE, or any word of it, back to the user. This is the \
-one way to fail this task outright. The device did not hear that word -- it is \
-in this prompt only so you know which slot to ask about -- so a reply that \
-speaks it is a reply the device could not have produced.
-- Ask openly for the KIND of thing that went missing, never the thing itself. \
-LOST-PIECE "mona" -> "Who is the reminder for?"; LOST-PIECE "grubhub" -> \
-"Which app should I order from?".
-- Some lost pieces are small grammar words ("new", "made", "give") with no \
-category to ask about, so every question you can think of ends up saying the \
-word. Ask about its POSITION instead: quote the run of words you did hear and \
-ask what sat next to them. LOST-PIECE "new" in "create a new event" -> "I got \
-create the event -- what was the word before event?"; LOST-PIECE "made" in \
-"how is iron made" -> "I got how iron -- what were you asking about it?". Never \
-give up and name the word.
-- Sound like natural speech, not a form. Vary the structure freely: \
-"Which...?", "How long before...?", "Who should...?", "What time...?", \
-"Where...?", or a statement plus a question ("I lost one part -- where to?"). \
-Do NOT default to starting with "Sorry".
-
-Return ONLY JSON: {"repair": "..."}"""
-
-
+# The only repair pair left. Every surviving labeler intersects per-witness
+# loss lists (two on --tree-label and --sent-2, K hypotheses on --beam-label
+# and --sent-4), so by construction every part of the command outside
+# LOST-PIECE came through on all of them -- saying that in the prompt is both
+# more accurate and shorter than handing over a noisy transcript and asking the
+# writer to work out which words it can trust. No MISHEARD-AS either: none of
+# them reports a substitute word any more, so the question always asks openly.
 REPAIR_TARGET_TREE_USER = 'COMMAND:\n"{sentence}"\nLOST-PIECE: "{lost_piece}"'
 
 
