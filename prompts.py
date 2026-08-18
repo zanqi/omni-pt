@@ -552,43 +552,8 @@ real command or the garbled transcription — the assistant cannot trust any of 
 what was that?", "I couldn't catch that over the noise, could you say it \
 again?"). Do NOT default to starting with "Sorry".
 """
-ANSWER_TARGET_SYSTEM = """You are writing training targets for a smart voice \
-assistant that has full access to the user's apps, accounts, information, and the internet.
 
-You will be given, in the next message, the user's spoken COMMAND. It was \
-recorded under background chatter, but every piece needed to perform the task \
-survived the noise, so treat the whole command as heard correctly.
 
-Return ONLY valid JSON in exactly this shape:
-{"answer": "<a short natural response, covering every part of the request>"}
-
-Rules for "answer": despite background chatter, the full command was heard correctly.
-    - If the command asks for more than one distinct thing (e.g. two \
-questions joined by "and", asked back-to-back, or a request plus a \
-follow-up question), your response must address EVERY part — never answer \
-only the first part and drop the rest.
-    - If the request asks for information (time, weather, facts) \
-and you know the answer, answer DIRECTLY with the correct fact(s), using as \
-few natural sentences as it takes to cover every part asked (often one, \
-sometimes two). Otherwise, say you are looking it up, but ground the \
-response in what was heard: refer to each part of the request so it is \
-clear the assistant followed everything.
-    - "Knowing the answer" means stable general knowledge -- capital cities, \
-who wrote a book, how many oceans there are. It NEVER covers anything \
-private to this user (their emails, calendar, alarms, reminders, messages, \
-files, playlists) or anything that changes by the minute (the time, today's \
-weather, exchange rates, scores, traffic). Having access to those is not the \
-same as knowing them: say you are checking or fetching, and name what you \
-are looking for. "There are no alarms set", "I found two recent emails from \
-Anna this morning" and "the rate is 0.79 pounds" are fabrications however \
-plausible they sound -- "Checking your alarms now" and "Looking up the \
-dollar to pound rate" are the correct shape.
-    - If the request is a task request, confirm the assistant is carrying \
-out the request in one or two natural sentences. Use present or future \
-tense ("I'm setting...", "I'll remind you...")
-    - never claim the action is already done.
-    - Stay natural and concise — don't pad with extra sentences beyond what \
-covering the full request requires."""
 CLASSIFY_SYSTEM = """You are labeling noisy-audio for training a smart \
 voice assistant. You will be given three texts:
 - COMMAND: the user's real spoken command.
@@ -889,21 +854,7 @@ HYP 4: we went to minder manchester
    -- the four hypotheses read as four different sentences, none of them the \
 command; nothing survived to anchor a question on, so one bundled entry names \
 the whole thing"""
-REPEAT_POOL_SYSTEM = """You are writing a pool of interchangeable replies for a \
-smart voice assistant, for the case where background chatter cost it too much \
-of a spoken command for any targeted question to be possible.
 
-Each entry is ONE short natural request (under 15 words) asking the user to \
-say the whole thing again.
-- The assistant heard nothing it can trust, so no entry may reference, guess \
-at, or hint at ANY content: no topics, no entities, no actions. A generic \
-frame ("that", "your request") is fine.
-- Mentioning the noise is fine and helps explain why.
-- Sound like natural speech. Every entry must be a DIFFERENT sentence, not a \
-reworded copy: vary the opening word, the sentence shape, and the length.
-- Never start an entry with "Sorry".
-
-Return ONLY JSON: {"repeats": ["...", "...", ...]}"""
 
 LABEL_TARGET_SYSTEM = """You are labeling noisy-audio data for a smart voice \
 assistant.
@@ -1034,23 +985,62 @@ HEARD:   yes
 "reply": "I missed that over the noise -- could you say it again?"}
    -- nothing distinguishable survived, so one bundled entry is enough; \
 "lost" having only one item doesn't make this a "repair" """
-REPAIR_TARGET_SYSTEM = """You are writing the reply a smart voice assistant \
-should give when background chatter cost it exactly one piece of a spoken \
-command.
 
-You get the user's real COMMAND, the HEARD text the device caught, and the \
-LOST-PIECE that did not get through. If MISHEARD-AS is given, the device \
-heard that similar-sounding wrong word in place of the lost piece.
+# === Target Generation System Prompts ===
 
-HEARD may hold several alternative transcriptions of the same audio (HYP 1, \
-HYP 2, ...), best guess first -- they are competing readings of one recording, \
-not separate things the user said. Ground your question in what they agree on.
+ANSWER_TARGET_SYSTEM = """You are writing training targets for a smart voice \
+assistant that has full access to the user's apps, accounts, information, and the internet.
 
-Write ONE short natural question (under 20 words) recovering ONLY that piece. \
-Test: if the user replied with just the missing words, the command would be \
-complete.
-- NEVER ask about parts that were heard correctly -- asking again would sound \
-like the assistant wasn't listening.
+You will be given, in the next message, the user's spoken COMMAND. It was \
+recorded under background chatter, but every piece needed to perform the task \
+survived the noise, so treat the whole command as heard correctly.
+
+Return ONLY valid JSON in exactly this shape:
+{"answer": "<a short natural response, covering every part of the request>"}
+
+Rules for "answer": despite background chatter, the full command was heard correctly.
+    - If the command asks for more than one distinct thing (e.g. two \
+questions joined by "and", asked back-to-back, or a request plus a \
+follow-up question), your response must address EVERY part — never answer \
+only the first part and drop the rest.
+    - If the request asks for information (time, weather, facts) \
+and you know the answer, answer DIRECTLY with the correct fact(s), using as \
+few natural sentences as it takes to cover every part asked (often one, \
+sometimes two). Otherwise, say you are looking it up, but ground the \
+response in what was heard: refer to each part of the request so it is \
+clear the assistant followed everything.
+    - "Knowing the answer" means stable general knowledge -- capital cities, \
+who wrote a book, how many oceans there are. It NEVER covers anything \
+private to this user (their emails, calendar, alarms, reminders, messages, \
+files, playlists) or anything that changes by the minute (the time, today's \
+weather, exchange rates, scores, traffic). Having access to those is not the \
+same as knowing them: say you are checking or fetching, and name what you \
+are looking for. "There are no alarms set", "I found two recent emails from \
+Anna this morning" and "the rate is 0.79 pounds" are fabrications however \
+plausible they sound -- "Checking your alarms now" and "Looking up the \
+dollar to pound rate" are the correct shape.
+    - If the request is a task request, confirm the assistant is carrying \
+out the request in one or two natural sentences. Use present or future \
+tense ("I'm setting...", "I'll remind you...")
+    - never claim the action is already done.
+    - Stay natural and concise — don't pad with extra sentences beyond what \
+covering the full request requires."""
+
+
+REPAIR_TARGET_TREE_SYSTEM = """You are writing the reply a smart voice \
+assistant should give when background chatter cost it exactly one piece of a \
+spoken command.
+
+You get the user's real COMMAND and the LOST-PIECE of it that did not reach \
+the device. Every other part of the command was heard correctly, so those are \
+the words to build your question around.
+
+Write ONE short natural question (under 20 words) recovering ONLY the lost \
+piece. Test: if the user replied with just the missing words, the command \
+would be complete.
+- NEVER ask about the parts that were heard correctly -- asking again would \
+sound like the assistant wasn't listening. Quote or paraphrase them instead, \
+to show what did get through.
 - NEVER say the LOST-PIECE, or any word of it, back to the user. This is the \
 one way to fail this task outright. The device did not hear that word -- it is \
 in this prompt only so you know which slot to ask about -- so a reply that \
@@ -1071,6 +1061,23 @@ give up and name the word.
 Do NOT default to starting with "Sorry".
 
 Return ONLY JSON: {"repair": "..."}"""
+
+
+REPEAT_TARGET_SYSTEM = """You are writing the reply a smart voice assistant \
+should give when background chatter cost it so much of a spoken command that no \
+targeted question is possible.
+
+You get the user's real COMMAND for context only. The device heard nothing it \
+can trust, so the reply must NOT reference, guess at, or hint at ANY content \
+from it -- no topics, no entities, no actions. A generic frame ("that", "your \
+request") is all that is left.
+
+Write ONE short natural request (under 15 words) asking the user to say the \
+whole thing again.
+- Mentioning the noise is fine and helps explain why.
+
+Return ONLY JSON: {"repeat": "..."}"""
+
 
 # ===
 # Sentence based key info
@@ -1337,38 +1344,3 @@ KEY PIECES:
 REPLY: it's really loud in here -- what was that?
 {"reason": "Asks for the whole thing again, engaging with nothing.", "lost": [1, 2, 3]}"""
 
-
-REPAIR_TARGET_TREE_SYSTEM = """You are writing the reply a smart voice \
-assistant should give when background chatter cost it exactly one piece of a \
-spoken command.
-
-You get the user's real COMMAND and the LOST-PIECE of it that did not reach \
-the device. Every other part of the command was heard correctly, so those are \
-the words to build your question around.
-
-Write ONE short natural question (under 20 words) recovering ONLY the lost \
-piece. Test: if the user replied with just the missing words, the command \
-would be complete.
-- NEVER ask about the parts that were heard correctly -- asking again would \
-sound like the assistant wasn't listening. Quote or paraphrase them instead, \
-to show what did get through.
-- NEVER say the LOST-PIECE, or any word of it, back to the user. This is the \
-one way to fail this task outright. The device did not hear that word -- it is \
-in this prompt only so you know which slot to ask about -- so a reply that \
-speaks it is a reply the device could not have produced.
-- Ask openly for the KIND of thing that went missing, never the thing itself. \
-LOST-PIECE "mona" -> "Who is the reminder for?"; LOST-PIECE "grubhub" -> \
-"Which app should I order from?".
-- Some lost pieces are small grammar words ("new", "made", "give") with no \
-category to ask about, so every question you can think of ends up saying the \
-word. Ask about its POSITION instead: quote the run of words you did hear and \
-ask what sat next to them. LOST-PIECE "new" in "create a new event" -> "I got \
-create the event -- what was the word before event?"; LOST-PIECE "made" in \
-"how is iron made" -> "I got how iron -- what were you asking about it?". Never \
-give up and name the word.
-- Sound like natural speech, not a form. Vary the structure freely: \
-"Which...?", "How long before...?", "Who should...?", "What time...?", \
-"Where...?", or a statement plus a question ("I lost one part -- where to?"). \
-Do NOT default to starting with "Sorry".
-
-Return ONLY JSON: {"repair": "..."}"""

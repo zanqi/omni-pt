@@ -30,7 +30,7 @@ from prompts import (
     KEY_PIECES_SYSTEM,
     LABEL_TARGET_SYSTEM,
     REPAIR_TARGET_TREE_SYSTEM,
-    REPEAT_POOL_SYSTEM,
+    REPEAT_TARGET_SYSTEM,
     RESP_LOSS_SYSTEM,
     SENT_ASR_LOSS_SYSTEM,
     SENT_RESP_LOSS_SYSTEM,
@@ -761,115 +761,26 @@ def label_beam(sentence, hyps):
 REPAIR_TARGET_TREE_USER = 'COMMAND:\n"{sentence}"\nLOST-PIECE: "{lost_piece}"'
 
 
-# A repeat reply references nothing from the probe -- it cannot, since the
-# assistant must not hint at content it never heard. So the prompt was
-# byte-identical on every row, and one LLM call per row just sampled the same
-# distribution a thousand times: beam-v1 put ONE phrasing on 97 of 1000 rows
-# and its top four on 264, handing SFT a single string to memorize as the
-# cheapest reply to any degraded audio (the trained model then emitted that
-# exact sentence on 37/50 repeat rows and 18/50 repair rows). Passing the
-# garbled transcript in to force variety only softened it -- beam-v2 still had
-# a 59x mode.
+# The sentence is passed only to keep this a per-row call; the rules forbid
+# using it. A repeat reply cannot reference the probe -- the assistant must not
+# hint at content it never heard -- so every call samples the same distribution.
 #
-# Since the reply is a pure phrase draw, generate the phrasings once, spread
-# over style buckets so the distribution is wide, then sample per row. Also
-# drops ~1000 LLM calls per build.
-REPEAT_POOL_SIZE = 300
-REPEAT_POOL_BATCH = 40
-# below this the pool is too narrow to be worth building a dataset on
-REPEAT_POOL_MIN = 120
-REPEAT_POOL_MAX_TOKENS = 2048
-REPEAT_POOL = []  # filled in __main__, for the tracks that call write_target
-
-# One bucket per call. The style is the only thing that varies between calls,
-# so it is what fans the pool out; without it the model returns near-identical
-# lists however high the temperature.
-REPEAT_STYLES = (
-    "blame the background noise explicitly",
-    "very short and clipped, at most six words",
-    "a plain question opening with a question word",
-    "a statement about missing it, then a short question",
-    "warm and conversational, like a person leaning in to listen",
-    "matter-of-fact: no apology, no mention of noise",
-    "admit only part of it came through",
-    "offer to listen again",
-    "slightly informal, with a natural filler word",
-    "polite and brief, and never using the word sorry",
-)
-
-
-REPEAT_POOL_USER = "Style for this batch: {style}\nWrite {n} of them."
-
-
-# Half of a generated pool comes back as a STATEMENT about the noise
-# ("Background noise is completely masking your spoken command") rather than a
-# request to say it again. The judge accepts those, but as SFT targets they
-# leave "repeat" as an assortment of observations with no action to learn,
-# which is how beam-v3 ended up with F=0.02 while the model answered every
-# degraded audio with a repair question instead. Requiring the action keeps the
-# pool wide without letting it drift into commentary. Volume requests ("speak
-# up", "louder") are deliberately not cues: they ask for a different delivery,
-# not for the command again.
-REPEAT_ACTION_CUE = re.compile(
-    r"\b(again|repeat|one more time|rephrase|retry|restate|resend)\b", re.I
-)
-
-
-def build_repeat_pool(size):
-    """Generate the repeat-reply phrase pool once, before any probing.
-
-    Called from __main__ for the tracks whose targets come from write_target.
-    Fails loudly rather than quietly building a dataset on a handful of
-    phrasings, since that is the failure this exists to prevent.
-    """
-
-    def one_batch(style):
-        return gpt_json(
-            REPEAT_POOL_SYSTEM,
-            REPEAT_POOL_USER.format(style=style, n=REPEAT_POOL_BATCH),
-            temperature=1.0,
-            max_tokens=REPEAT_POOL_MAX_TOKENS,
-        )
-
-    pool, seen = [], set()
-    # One round = one call per style bucket, all in flight together; the buckets
-    # don't depend on each other, and run sequentially this took >5 min. Later
-    # rounds yield less as duplicates get dropped, so stop as soon as the pool
-    # is big enough.
-    for _ in range(3):
-        if len(pool) >= size:
-            break
-        with ThreadPoolExecutor(max_workers=len(REPEAT_STYLES)) as ex:
-            objs = list(ex.map(one_batch, REPEAT_STYLES))
-        for obj in objs:
-            if obj is None:
-                continue
-            for s in obj.get("repeats", []):
-                s = str(s).strip()
-                key = _normalize_text(s)
-                # the prompt forbids opening with "Sorry" and it still slips
-                # through on ~1 in 400; cheaper to drop than to re-prompt
-                if (
-                    s
-                    and key
-                    and key not in seen
-                    and not key.startswith("sorry")
-                    and REPEAT_ACTION_CUE.search(s)
-                ):
-                    seen.add(key)
-                    pool.append(s)
-        log(
-            f"repeat pool: {len(pool)}/{size} after a round of "
-            f"{len(REPEAT_STYLES)} calls"
-        )
-
-    if len(pool) < REPEAT_POOL_MIN:
-        raise RuntimeError(
-            f"repeat pool only reached {len(pool)} phrasings (need "
-            f"{REPEAT_POOL_MIN}); check the vLLM box before building a dataset"
-        )
-    log(f"repeat pool: {len(pool)} distinct phrasings, e.g. {pool[:3]}")
-    return pool
+# Sampled this way it concentrates on its own: one opener family ("it's too loud
+# to hear...") on 50-80% of rows, 6-10 distinct openers, the single top phrasing
+# verbatim on 8-16%. That is not a defect to engineer away. "repeat" is the one
+# kind with no content to condition on, so style is the only thing left to vary
+# and varying it carries no information -- while the concentration is what makes
+# the kind learnable at all. Every build sampled like this scored F=0.74-0.91.
+#
+# Do NOT replace this with a style-bucketed phrase pool again. Doing so flattened
+# the top phrasing to ~1% across 110+ openers, and F fell to 0.00-0.38 on all
+# four tracks built that way (beam-v3 0.22, tree-v2 0.14, sent4-v1 0.02,
+# sent2-v1 0.00): with no dominant repeat form, the repair template won every
+# degraded-audio row instead. The pool was introduced to stop beam-v1's mode
+# from bleeding into repair rows and costing R, but v3 and v4 are *more*
+# mode-collapsed than beam-v1 (16.3% and 14.5% on the top phrasing, vs 9.7%)
+# and beat it on both R and F -- so mode collapse here was never the cause.
+REPEAT_TARGET_USER = 'COMMAND:\n"{sentence}"'
 
 
 def write_target(sentence, kind, probe):
@@ -879,13 +790,7 @@ def write_target(sentence, kind, probe):
     temperature 0 so a rerun reproduces the dataset while the reply wants 0.7
     so a few thousand targets don't all open the same way, and a target retry
     here must not re-roll the row's kind.
-
-    "repeat" costs no call at all -- it is a draw from REPEAT_POOL; see
-    build_repeat_pool for why.
     """
-    if kind == "repeat":
-        return random.choice(REPEAT_POOL)
-
     # on repair the label's `lost` is the single agreed piece, and it is the
     # only thing the question may not speak
     lost_piece = probe["lost"][0] if kind == "repair" else ""
@@ -893,6 +798,9 @@ def write_target(sentence, kind, probe):
     if kind == "answer":
         system = ANSWER_TARGET_SYSTEM
         user = ANSWER_TARGET_USER.format(sentence=sentence)
+    elif kind == "repeat":
+        system = REPEAT_TARGET_SYSTEM
+        user = REPEAT_TARGET_USER.format(sentence=sentence)
     else:
         # every labeler that reaches here now reports losses as key-piece ids
         # against one inventory, with no witness of a similar-sounding
@@ -1563,9 +1471,6 @@ if __name__ == "__main__":
     PROBE_DIR = os.path.join(AUDIO_DIR, "probes")
     os.makedirs(PROBE_DIR, exist_ok=True)
     log(f"audio dir: {AUDIO_DIR}")
-
-    if TRACK in ("tree", "beam", "sent-2", "sent-4"):
-        REPEAT_POOL = build_repeat_pool(REPEAT_POOL_SIZE)
 
     # init base omni model
     base_family = detect_model_family(args.omni_path)
