@@ -761,25 +761,6 @@ def label_beam(sentence, hyps):
 REPAIR_TARGET_TREE_USER = 'COMMAND:\n"{sentence}"\nLOST-PIECE: "{lost_piece}"'
 
 
-# The sentence is passed only to keep this a per-row call; the rules forbid
-# using it. A repeat reply cannot reference the probe -- the assistant must not
-# hint at content it never heard -- so every call samples the same distribution.
-#
-# Sampled this way it concentrates on its own: one opener family ("it's too loud
-# to hear...") on 50-80% of rows, 6-10 distinct openers, the single top phrasing
-# verbatim on 8-16%. That is not a defect to engineer away. "repeat" is the one
-# kind with no content to condition on, so style is the only thing left to vary
-# and varying it carries no information -- while the concentration is what makes
-# the kind learnable at all. Every build sampled like this scored F=0.74-0.91.
-#
-# Do NOT replace this with a style-bucketed phrase pool again. Doing so flattened
-# the top phrasing to ~1% across 110+ openers, and F fell to 0.00-0.38 on all
-# four tracks built that way (beam-v3 0.22, tree-v2 0.14, sent4-v1 0.02,
-# sent2-v1 0.00): with no dominant repeat form, the repair template won every
-# degraded-audio row instead. The pool was introduced to stop beam-v1's mode
-# from bleeding into repair rows and costing R, but v3 and v4 are *more*
-# mode-collapsed than beam-v1 (16.3% and 14.5% on the top phrasing, vs 9.7%)
-# and beat it on both R and F -- so mode collapse here was never the cause.
 REPEAT_TARGET_USER = 'COMMAND:\n"{sentence}"'
 
 
