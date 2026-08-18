@@ -27,18 +27,18 @@ from prompts import (
     BEAM_LOSS_SYSTEM,
     CLASSIFY_SYSTEM,
     HEARD_PREFILL,
+    KEY_PIECES_SYSTEM,
     LABEL_TARGET_SYSTEM,
     REPAIR_TARGET_TREE_SYSTEM,
     REPEAT_POOL_SYSTEM,
     RESP_LOSS_SYSTEM,
+    SENT_ASR_LOSS_SYSTEM,
+    SENT_RESP_LOSS_SYSTEM,
     TARGET_SYSTEM,
     TASK_PROMPT,
     TASK_PROMPT_TREE,
     split_heard_reply,
     task_prompt,
-    KEY_PIECES_SYSTEM,
-    SENT_ASR_LOSS_SYSTEM,
-    SENT_RESP_LOSS_SYSTEM,
 )
 from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
 
@@ -80,6 +80,12 @@ PROBE_BATCH_SIZE = 16
 # The dropped task-response pass buys the wall clock back.
 BEAM_PROBE_BATCH_SIZE = 8
 MAX_PROBES = 3
+# A round draws probes for the slots it still needs, not for the three it
+# started with: the first round asks for all of KINDS and hits the cap above,
+# but a second round chasing one leftover kind paid the same 16-audio GPU pass
+# to fill one slot. 8 draws off a single weighted band is plenty, and the
+# multi-slot rounds are unchanged because the cap still binds there.
+PROBE_PER_SLOT = 8
 ANSWER_PROBE_BATCH_SIZE = 4
 UTTERANCE_WORKERS = 4
 GPU_LOCK = threading.Lock()
@@ -110,6 +116,14 @@ ASR_MAX_NEW_TOKENS = 64
 ASR_N_BEST = 4
 ASR_NUM_BEAMS = 8
 RESP_MAX_NEW_TOKENS = 256  # task response from base omni model
+# --heard-reply keeps the full 256: there the reply IS the SFT target. On the
+# tracks below, the response is only a witness -- the labeler reads it to
+# decide which key pieces went missing and nothing else keeps it -- so the
+# tail is decoded for nobody. Batched generate runs until the LONGEST sequence
+# stops, so the cap, not the mean, sets the wall clock: base responses measured
+# over results/bab_results_*.jsonl are 42 words at the mean and 111 at p99, so
+# 128 tokens leaves ~97% of them whole and halves the worst-case decode.
+PROBE_RESP_MAX_NEW_TOKENS = 128
 
 KINDS = ("answer", "repair", "repeat")
 
@@ -921,7 +935,8 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
         clean_power = float(np.mean(clean**2))
         bands = SLOT_SNR if TRACK == "two-pass" else SLOT_SNR_DISJOINT
         paths, snrs = [], []
-        while len(paths) < batch_size:
+        n_draw = min(batch_size, PROBE_PER_SLOT * len(kinds_need))
+        while len(paths) < n_draw:
             weights = [SLOT_WEIGHTS[k] for k in kinds_need]
             slot = rng.choices(kinds_need, weights=weights, k=1)[0]
 
@@ -1080,7 +1095,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                 # get batch omni assistant respond
                 task = TASK_PROMPT_TREE if TRACK in ("tree", "sent-2") else TASK_PROMPT
                 convs = [_conv(p, sysp, task) for p in paths]
-                responses = base_generate_batch(convs, RESP_MAX_NEW_TOKENS)
+                responses = base_generate_batch(convs, PROBE_RESP_MAX_NEW_TOKENS)
 
             if TRACK == "two-pass":
                 label_one = classify
@@ -1096,17 +1111,20 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                     )
                 )
 
+        filled = False
         for snr, probe_path, transcript, response, hyps, label in zip(
             snrs, paths, transcripts, responses, hyp_lists, labels
         ):
             if label is None:
                 continue
+
             kind = label["kind"]
             # tree/beam/two-pass call it "missing" and quote it out of the
             # command; the sent tracks call it "lost" and it is already exact
             # key-piece text
             lost = label.get("lost", label.get("missing", []))
             if kind in results and results[kind] is None:
+                filled = True
                 results[kind] = {
                     "snr_db": snr,
                     "audio": probe_path,
@@ -1128,7 +1146,6 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                     # hypotheses read as some other sentence entirely
                     "hypotheses": list(hyps),
                     "beam_losses": label.get("per_hypothesis", []),
-                    "unintelligible": label.get("unintelligible", False),
                 }
 
         # clean up non-kept wav files
@@ -1136,6 +1153,13 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
         for p in paths:
             if p not in kept:
                 os.remove(p)
+
+        if not filled:
+            # a whole round of labeled probes claimed no slot: the SNR bands
+            # are already redrawn per probe, so a second identical draw is not
+            # a new experiment. Most starved utterances used to burn all
+            # MAX_PROBES rounds to reach the same skip.
+            break
 
     return results
 
@@ -1213,7 +1237,6 @@ def make_row(kind, target, path, probe, slurp_id, sentence):
             if probe["beam_losses"]
             else ""
         ),
-        "unintelligible": probe["unintelligible"],
         "key_pieces": probe["pieces"],
         "slurp_id": slurp_id,
         "sentence": sentence,
@@ -1470,7 +1493,7 @@ if __name__ == "__main__":
     #     reads repair_probe["swapped"] and will KeyError there.
     #   --beam-label: still decodes K hypotheses, but is labeled by
     #     label_sent_beam now, so label_beam / BEAM_LOSS_SYSTEM are unused and
-    #     the beam_losses + unintelligible columns come out empty.
+    #     the beam_losses column comes out empty.
     # --heard-reply and --tree-label are unaffected.
     track = ap.add_mutually_exclusive_group()
     track.add_argument(
