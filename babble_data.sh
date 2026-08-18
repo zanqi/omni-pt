@@ -19,6 +19,13 @@ source ~/.bashrc
 #                            # two loss lists intersected) -> ...-tree-v1 ids
 #   BEAM=1 ./babble_data.sh  # the beam-consensus track (one N-best ASR pass, no
 #                            # task-response pass) -> ...-beam-v1 ids
+#   SENT2=1 ./babble_data.sh # sent-loss over the same two witnesses as TREE, but
+#                            # labeled in two stages: one call inventories the
+#                            # command's key pieces, then one call per witness
+#                            # returns the ids it lost -> ...-sent2-v1 ids
+#   SENT4=1 ./babble_data.sh # sent-loss over the four beam hypotheses instead;
+#                            # same GPU pass as BEAM, no task-response pass
+#                            # -> ...-sent4-v1 ids
 set -eo pipefail
 
 WHICH="${1:-both}"
@@ -34,6 +41,14 @@ elif [[ -n "${BEAM:-}" ]]; then
     TRACK_FLAG="--beam-label"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-beam-v1"
+elif [[ -n "${SENT2:-}" ]]; then
+    TRACK_FLAG="--sent-2"
+    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-sent2-v1"
+    DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-sent2-v1"
+elif [[ -n "${SENT4:-}" ]]; then
+    TRACK_FLAG="--sent-4"
+    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-sent4-v1"
+    DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-sent4-v1"
 else
     TRACK_FLAG=""
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-v3"

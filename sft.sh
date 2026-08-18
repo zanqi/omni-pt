@@ -26,6 +26,12 @@
 #                         # probed under), <model>-bab-tree-adapter-<n>x
 #   BEAM=1 ./sft.sh       # beam-consensus track — beam-v1 datasets, plain
 #                         # TASK_PROMPT, adapters <model>-bab-beam-adapter-<n>x
+#   SENT2=1 ./sft.sh      # sent-loss, two witnesses — sent2-v1 datasets. Same
+#                         # two probe passes as TREE, so the same restate
+#                         # prompt, <model>-bab-sent2-adapter-<n>x
+#   SENT4=1 ./sft.sh      # sent-loss, four hypotheses — sent4-v1 datasets. No
+#                         # reply pass, so plain TASK_PROMPT like BEAM,
+#                         # <model>-bab-sent4-adapter-<n>x
 #   CR=1 ./sft.sh         # C/R-only track — beam-v3 datasets with the repeat
 #                         # rows dropped and answer capped to match repair
 #                         # (1K:1K), adapters <model>-bab-cr[-adapter-<n>x]
@@ -69,6 +75,18 @@ elif [[ -n "${BEAM:-}" ]]; then
     ADAPTER_KIND="bab-beam-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-beam-v1"
+elif [[ -n "${SENT2:-}" ]]; then
+    # same two probe passes as the tree track, so the same restate prompt
+    PROMPT_FLAG="--restate-prompt"
+    ADAPTER_KIND="bab-sent2-adapter"
+    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-sent2-v1"
+    DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-sent2-v1"
+elif [[ -n "${SENT4:-}" ]]; then
+    # no task-response pass on this track, so its rows were probed under the
+    # plain TASK_PROMPT -- no prompt flag, same as beam
+    ADAPTER_KIND="bab-sent4-adapter"
+    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-sent4-v1"
+    DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-sent4-v1"
 elif [[ -n "${CR:-}" ]]; then
     # C/R only: the beam-v3 rows as built, minus every repeat row, with answer
     # cut from 2K to the 1K that matches repair. Same audio and targets as the

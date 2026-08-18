@@ -21,6 +21,13 @@
 #   HR=1   ./eval.sh   hr-v1 data, TASK_PROMPT_HR, few-shot judge, hr adapters
 #   TREE=1 ./eval.sh   tree-v1 data, restate prompt, rules judge, tree adapters,
 #                      and the tree score matrix (repeat-row repair = 0)
+#   SENT2=1 ./eval.sh  sent2-v1 data, restate prompt, per-kind judges, sent2
+#                      adapters. SENT4=1 is the same with the plain prompt.
+#                      Both tracks are scored twice -- see exp/sent-2.sh, which
+#                      re-runs each with EVAL_FLAGS="--score-matrix tree ..."
+#                      and its own TAG, so the per-kind numbers (comparable
+#                      with beam) and the type-judge numbers (comparable with
+#                      tree) both exist for the same adapter.
 #   BEAM=1 ./eval.sh   beam-v1 data, plain prompt, beam adapters, and the three
 #                      per-kind judges instead of the type judge + matrix. The
 #                      repair rubric sees the lost piece and scores a confident
@@ -63,11 +70,19 @@ BEAM_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1"
 BEAM_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-beam-v1"
 CR_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v3"
 CR_DS_QWEN3=""  # no qwen3 beam dataset exists; pass DS_QWEN3 explicitly
+SENT2_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-sent2-v1"
+SENT2_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-sent2-v1"
+SENT4_DS_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-sent4-v1"
+SENT4_DS_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-sent4-v1"
 # captured before the case overwrites it, so a crossed run (one track's flags
 # against another's adapters) can name the adapters explicitly
 ADAPTER_KIND_ENV="${ADAPTER_KIND:-}"
+# likewise for the judge: a track keeps its datasets, adapters and tag while
+# EVAL_FLAGS is swapped wholesale, for scoring one run under two rubrics.
+# Respell the track's prompt flag when you do -- this replaces the whole string.
+EVAL_FLAGS_ENV="${EVAL_FLAGS:-}"
 ADAPTER_KIND="bab-adapter"
-case "${ABL:-${HR:+hr}${TREE:+tree}${BEAM:+beam}${CR:+cr}}" in
+case "${ABL:-${HR:+hr}${TREE:+tree}${BEAM:+beam}${CR:+cr}${SENT2:+sent2}${SENT4:+sent4}}" in
     hr)
         TRACK_DESC="heard-reply"
         EVAL_FLAGS="--heard-reply --fewshot-judge"
@@ -88,6 +103,16 @@ case "${ABL:-${HR:+hr}${TREE:+tree}${BEAM:+beam}${CR:+cr}}" in
         EVAL_FLAGS="--judge-mode per-kind --kinds answer,repair"
         DEFAULT_QWEN25="$CR_DS_QWEN25"; DEFAULT_QWEN3="$CR_DS_QWEN3"
         ADAPTER_KIND="bab-cr-adapter"; DEFAULT_TAG="cr" ;;
+    sent2)
+        TRACK_DESC="sent-loss, two witnesses"
+        EVAL_FLAGS="--judge-mode per-kind --restate-prompt"
+        DEFAULT_QWEN25="$SENT2_DS_QWEN25"; DEFAULT_QWEN3="$SENT2_DS_QWEN3"
+        ADAPTER_KIND="bab-sent2-adapter"; DEFAULT_TAG="sent2" ;;
+    sent4)
+        TRACK_DESC="sent-loss, four hypotheses"
+        EVAL_FLAGS="--judge-mode per-kind"
+        DEFAULT_QWEN25="$SENT4_DS_QWEN25"; DEFAULT_QWEN3="$SENT4_DS_QWEN3"
+        ADAPTER_KIND="bab-sent4-adapter"; DEFAULT_TAG="sent4" ;;
     a)
         TRACK_DESC="ablation A (judge swap only)"
         EVAL_FLAGS="--fewshot-judge"
@@ -106,6 +131,7 @@ case "${ABL:-${HR:+hr}${TREE:+tree}${BEAM:+beam}${CR:+cr}}" in
 esac
 
 [[ -n "$ADAPTER_KIND_ENV" ]] && ADAPTER_KIND="$ADAPTER_KIND_ENV"
+[[ -n "$EVAL_FLAGS_ENV" ]] && EVAL_FLAGS="$EVAL_FLAGS_ENV"
 DS_QWEN25="${DS_QWEN25:-$DEFAULT_QWEN25}"
 DS_QWEN3="${DS_QWEN3:-$DEFAULT_QWEN3}"
 # Where the adapters live: "checkpoints" for sft.sh's local output dirs,
