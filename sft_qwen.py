@@ -305,8 +305,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ds-id", default="keylazy/slurp-babble-Qwen2.5-Omni-3B")
     ap.add_argument("--train-split", default="train")
-    ap.add_argument("--eval-split", default="test")
-    ap.add_argument("--no-eval", action="store_true")
     ap.add_argument("--omni-path", default="Qwen/Qwen2.5-Omni-3B")
     ap.add_argument("--epochs", type=float, default=3.0)
     ap.add_argument("--lr", type=float, default=2e-4)
@@ -336,9 +334,9 @@ def main():
     ap.add_argument(
         "--kinds",
         default=None,
-        help="Keep only these row kinds, comma-separated, in BOTH the train and "
-        "eval splits, e.g. 'answer,repair' to train the C/R-only variant on a "
-        "dataset that also carries repeat rows.",
+        help="Keep only these row kinds of the train split, comma-separated, "
+        "e.g. 'answer,repair' to train the C/R-only variant on a dataset that "
+        "also carries repeat rows.",
     )
     ap.add_argument(
         "--train-caps",
@@ -405,11 +403,6 @@ def main():
     if args.answerable_token:
         print(f"answerable-token mode: answer targets -> {ANSWERABLE_TOKEN!r}")
 
-    eval_ds = None
-    if not args.no_eval and not args.smoke:
-        eval_hf = load_ds_split(args.ds_id, args.eval_split, kinds=kinds)
-        eval_ds = SlurpDataset(eval_hf, answerable_token=args.answerable_token)
-
     processor = load_processor(args.omni_path, family)
     model = load_model(args.omni_path, family, args.qlora)
 
@@ -431,14 +424,13 @@ def main():
         output_dir=out,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
         bf16=True,
         logging_steps=10,
-        eval_strategy="no" if eval_ds is None else "epoch",
+        eval_strategy="no",
         save_strategy="epoch",
         gradient_checkpointing=True,  # TODO: what?
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -452,7 +444,6 @@ def main():
         model=model,
         args=training_args,
         train_dataset=train_ds,
-        eval_dataset=eval_ds,
         data_collator=OmniSFTCollator(
             processor,
             system_prompt=system_prompt,

@@ -517,7 +517,10 @@ def main():
                 "asr_transcript": asr_transcript,
                 "base_response": row.get("omni_response", ""),
                 "lost": lost,
-                "target": row["target"],
+                # dropped from the test split of newer datasets -- nothing
+                # here scores against it, it is only carried through for
+                # eyeballing a row in the .jsonl
+                "target": row.get("target", ""),
                 "response": resp,
                 "heard": result["heard"],
                 "reply": result["reply"],

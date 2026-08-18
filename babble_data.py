@@ -1214,7 +1214,7 @@ def collect_babble_pool(split):
 
 
 def make_row(kind, target, path, probe, slurp_id, sentence):
-    if TRACK == "heard-reply":
+    if TRACK == "heard-reply" and target:
         target = f"Heard: {probe['transcript']}\nReply: {target}"
     return {
         "id": next(ROW_ID),
@@ -1286,6 +1286,10 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
             # name the slot that never filled: the kind is the labeler's call,
             # not the SNR band's, so which band starves is not predictable
             return {"skip": f"probe:{','.join(starved)}"}
+
+        if split == "test":
+            # test split skips target writing
+            return {"triplet": triplet, "targets": {k: "" for k in KINDS}}
 
         if TRACK == "heard-reply":
             # already written, one call per probe audio alongside its label
