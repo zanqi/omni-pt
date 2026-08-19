@@ -7,8 +7,8 @@
 # matrix -- with no restate prompt on either pass, since these rows were probed
 # and trained under the plain TASK_PROMPT.
 
-sbatch --job-name=sent4_v1_e2e --account=cse --partition=gpu-l40s \
-  --nodes=1 --cpus-per-task=16 --mem=188G --gpus=1 --time=1-00:00:00 \
+sbatch --job-name=sent4_v1_e2e --account=sciencehub --partition=gpu-a40 \
+  --nodes=1 --cpus-per-task=8 --mem=128G --gpus=1 --time=1-00:00:00 \
   --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt --output=logs/sent4_v1_e2e_%j.log \
   --mail-type=ALL --mail-user=zanqil@uw.edu \
   --export=all --wrap='DS=keylazy/slurp-babble-Qwen2.5-Omni-3B-sent4-v1; \

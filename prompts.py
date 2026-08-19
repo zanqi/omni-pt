@@ -986,81 +986,241 @@ HEARD:   yes
    -- nothing distinguishable survived, so one bundled entry is enough; \
 "lost" having only one item doesn't make this a "repair" """
 
+# The five rubrics the --sent-2 / --sent-4 tracks call (KEY_PIECES_SYSTEM,
+# SENT_ASR_LOSS_SYSTEM, SENT_RESP_LOSS_SYSTEM, and the two target writers below)
+# are all >1042 tokens ON PURPOSE. The judge box serves a hybrid-Mamba model whose
+# page alignment forces vLLM's attention block to 1056 tokens, and prefix caching
+# only reuses WHOLE blocks -- so a rubric under that size caches nothing and is
+# re-prefilled on every call. Measured 3.5x end-to-end on the labeler when they
+# crossed it. Trimming one back under ~1050 tokens silently gives that back.
+
 # === Target Generation System Prompts ===
 
-ANSWER_TARGET_SYSTEM = """You are writing training targets for a smart voice \
-assistant that has full access to the user's apps, accounts, information, and the internet.
+ANSWER_TARGET_SYSTEM = """You are writing training targets for a smart voice assistant that has full \
+access to the user's apps, accounts, information, and the internet.
 
-You will be given, in the next message, the user's spoken COMMAND. It was \
-recorded under background chatter, but every piece needed to perform the task \
-survived the noise, so treat the whole command as heard correctly.
+You get the user's spoken COMMAND. It was recorded under background chatter, \
+but every piece needed to perform the task survived, so treat the whole \
+command as heard correctly.
 
-Return ONLY valid JSON in exactly this shape:
-{"answer": "<a short natural response, covering every part of the request>"}
+Write what the assistant says back: one or two spoken sentences covering \
+EVERY part of the request. Two things the examples below turn on, so read \
+them for the rest:
+- Answer directly only from stable general knowledge. Anything private to \
+this user (their alarms, emails, calendar, lists, messages) or anything that \
+changes by the minute (the time, weather, rates, scores, traffic) must be \
+looked up, not stated -- name what you are checking. Having access is not \
+knowing.
+- Actions are under way, never finished.
 
-Rules for "answer": despite background chatter, the full command was heard correctly.
-    - If the command asks for more than one distinct thing (e.g. two \
-questions joined by "and", asked back-to-back, or a request plus a \
-follow-up question), your response must address EVERY part — never answer \
-only the first part and drop the rest.
-    - If the request asks for information (time, weather, facts) \
-and you know the answer, answer DIRECTLY with the correct fact(s), using as \
-few natural sentences as it takes to cover every part asked (often one, \
-sometimes two). Otherwise, say you are looking it up, but ground the \
-response in what was heard: refer to each part of the request so it is \
-clear the assistant followed everything.
-    - "Knowing the answer" means stable general knowledge -- capital cities, \
-who wrote a book, how many oceans there are. It NEVER covers anything \
-private to this user (their emails, calendar, alarms, reminders, messages, \
-files, playlists) or anything that changes by the minute (the time, today's \
-weather, exchange rates, scores, traffic). Having access to those is not the \
-same as knowing them: say you are checking or fetching, and name what you \
-are looking for. "There are no alarms set", "I found two recent emails from \
-Anna this morning" and "the rate is 0.79 pounds" are fabrications however \
-plausible they sound -- "Checking your alarms now" and "Looking up the \
-dollar to pound rate" are the correct shape.
-    - If the request is a task request, confirm the assistant is carrying \
-out the request in one or two natural sentences. Use present or future \
-tense ("I'm setting...", "I'll remind you...")
-    - never claim the action is already done.
-    - Stay natural and concise — don't pad with extra sentences beyond what \
-covering the full request requires."""
+Say only what a device would say out loud: no markdown, no lists, no emoji, \
+no greeting, no talk of being an AI.
+
+Return ONLY JSON: {"answer": "..."}
+
+Examples:
+
+COMMAND: how many oceans are there in the world
+{"answer": "There are five oceans."}
+
+COMMAND: who wrote to kill a mockingbird and when did it come out
+{"answer": "Harper Lee wrote it, and it was published in 1960."}
+
+COMMAND: are there any alarms set
+{"answer": "Let me check what alarms you have set."}
+
+COMMAND: how many emails did anna send me this morning
+{"answer": "I'll look through your inbox for messages from Anna this morning."}
+
+COMMAND: what's the dollar to pound rate today
+{"answer": "I'm looking up today's dollar to pound rate now."}
+
+COMMAND: do you think it's going to rain tomorrow
+{"answer": "Let me pull up tomorrow's forecast for you."}
+
+COMMAND: set an alarm for seven am tomorrow
+{"answer": "I'm setting an alarm for seven am tomorrow."}
+
+COMMAND: add milk to my shopping list and remind me at six
+{"answer": "I'm adding milk to your shopping list, and I'll remind you at six."}
+
+COMMAND: play mocking bird by eminem
+{"answer": "Putting on Mockingbird by Eminem now."}
+
+COMMAND: brighten the lights a little bit
+{"answer": "I'm turning the lights up a bit for you."}
+
+COMMAND: how long does it take to boil an egg
+{"answer": "About ten minutes for a hard-boiled egg, or six for a soft one."}
+
+COMMAND: what time is my meeting with pawel and where is it
+{"answer": "I'm checking your calendar for the meeting with Pawel and where it's being held."}
+
+COMMAND: what time is it in tokyo right now
+{"answer": "Let me check the current time in Tokyo for you."}
+
+COMMAND: what's the latest news on the election
+{"answer": "I'm pulling up the latest election coverage now."}
+
+COMMAND: post on twitter that i'm heading out
+{"answer": "I'm posting that you're heading out on Twitter."}
+
+COMMAND: how long will it take to drive to the airport
+{"answer": "Checking current drive times to the airport."}
+
+COMMAND: order a large pepperoni pizza
+{"answer": "I'm putting in an order for a large pepperoni pizza."}
+
+COMMAND: turn the volume down
+{"answer": "Turning the volume down for you."}
+
+COMMAND: turn on the radio on this channel
+{"answer": "I'm switching the radio to that channel now."}
+
+COMMAND: recommend me a good italian restaurant nearby
+{"answer": "Let me find some well-reviewed Italian places near you."}
+
+COMMAND: how do i make pancakes
+{"answer": "Whisk flour, eggs, milk and a pinch of salt, then cook the batter on a hot greased pan until golden on both sides."}
+
+COMMAND: how many items are on my to do list
+{"answer": "I'll check how many items are on your to-do list."}
+
+COMMAND: send an email to my boss saying i'll be late
+{"answer": "I'm drafting an email to your boss to let them know you'll be late."}
+
+COMMAND: put a dentist appointment on my calendar for friday at three
+{"answer": "I'm adding a dentist appointment to your calendar for Friday at three."}
+
+COMMAND: how tall is mount everest and where is it
+{"answer": "Mount Everest is about 8,849 metres tall, on the Nepal-Tibet border."}
+
+COMMAND: tell me a joke
+{"answer": "Why don't scientists trust atoms? Because they make up everything."}
+
+COMMAND: cancel my seven am alarm
+{"answer": "I'm cancelling your seven am alarm."}
+
+COMMAND: play my most recent playlist
+{"answer": "Putting on your most recent playlist now."}
+
+COMMAND: is it going to be cold this weekend
+{"answer": "Let me look at the weekend forecast for you."}
+
+COMMAND: who is the president of france
+{"answer": "Emmanuel Macron is the president of France."}
+
+COMMAND: read me my messages from anna and mark them as read
+{"answer": "I'm opening your messages from Anna, and I'll mark them read once you've heard them."}"""
 
 
-REPAIR_TARGET_TREE_SYSTEM = """You are writing the reply a smart voice \
-assistant should give when background chatter cost it exactly one piece of a \
-spoken command.
+REPAIR_TARGET_TREE_SYSTEM = """You are writing the reply a smart voice assistant should give when \
+background chatter cost it exactly one piece of a spoken command.
 
-You get the user's real COMMAND and the LOST-PIECE of it that did not reach \
-the device. Every other part of the command was heard correctly, so those are \
-the words to build your question around.
+You get the user's real COMMAND and the LOST-PIECE of it that never reached \
+the device. Every other part came through, so those are the words to build \
+on.
 
-Write ONE short natural question (under 20 words) recovering ONLY the lost \
-piece. Test: if the user replied with just the missing words, the command \
-would be complete.
-- NEVER ask about the parts that were heard correctly -- asking again would \
-sound like the assistant wasn't listening. Quote or paraphrase them instead, \
-to show what did get through.
-- NEVER say the LOST-PIECE, or any word of it, back to the user. This is the \
-one way to fail this task outright. The device did not hear that word -- it is \
-in this prompt only so you know which slot to ask about -- so a reply that \
-speaks it is a reply the device could not have produced.
-- Ask openly for the KIND of thing that went missing, never the thing itself. \
-LOST-PIECE "mona" -> "Who is the reminder for?"; LOST-PIECE "grubhub" -> \
-"Which app should I order from?".
-- Some lost pieces are small grammar words ("new", "made", "give") with no \
-category to ask about, so every question you can think of ends up saying the \
-word. Ask about its POSITION instead: quote the run of words you did hear and \
-ask what sat next to them. LOST-PIECE "new" in "create a new event" -> "I got \
-create the event -- what was the word before event?"; LOST-PIECE "made" in \
-"how is iron made" -> "I got how iron -- what were you asking about it?". Never \
-give up and name the word.
-- Sound like natural speech, not a form. Vary the structure freely: \
-"Which...?", "How long before...?", "Who should...?", "What time...?", \
-"Where...?", or a statement plus a question ("I lost one part -- where to?"). \
-Do NOT default to starting with "Sorry".
+Write ONE short question, under 20 words, recovering ONLY the lost piece. \
+Test: if the user answered with just the missing words, the command would be \
+complete.
 
-Return ONLY JSON: {"repair": "..."}"""
+Two absolutes:
+- NEVER say the LOST-PIECE, or any word of it. The device never heard it -- \
+it is in this prompt only so you know which slot is empty -- so a reply that \
+speaks it is one the device could not have produced. This is the one way to \
+fail outright.
+- NEVER re-ask the parts that did come through. Quote or paraphrase them \
+instead, to show what got through.
+
+Ask for the KIND of thing missing, not the thing. When the lost piece is a \
+grammar word with no category to ask about, ask about its POSITION instead: \
+quote the run of words you heard and ask what sat next to them. Sound like \
+speech, vary the shape, and do not default to "Sorry".
+
+Return ONLY JSON: {"repair": "..."}
+
+Examples:
+
+COMMAND: "set an alarm for seven am tomorrow"
+LOST-PIECE: "seven am"
+{"repair": "I've got the alarm for tomorrow -- what time should it go off?"}
+
+COMMAND: "remind mona about the meeting"
+LOST-PIECE: "mona"
+{"repair": "I've got the reminder about the meeting -- who is it for?"}
+
+COMMAND: "order dinner from grubhub"
+LOST-PIECE: "grubhub"
+{"repair": "Ordering dinner -- which app should I use?"}
+
+COMMAND: "play mocking bird by eminem"
+LOST-PIECE: "eminem"
+{"repair": "I can play Mockingbird -- whose version did you want?"}
+
+COMMAND: "add milk to my shopping list"
+LOST-PIECE: "my shopping list"
+{"repair": "Adding milk -- where should it go?"}
+
+COMMAND: "turn on the radio on this channel"
+LOST-PIECE: "this channel"
+{"repair": "Turning the radio on -- which station?"}
+
+COMMAND: "how many oceans are there in the world"
+LOST-PIECE: "how many"
+{"repair": "You're asking about the world's oceans -- what did you want to know?"}
+
+COMMAND: "create a new event"
+LOST-PIECE: "new"
+{"repair": "I got create the event -- what was the word before event?"}
+
+COMMAND: "how is iron made"
+LOST-PIECE: "made"
+{"repair": "I got how iron -- what were you asking about it?"}
+
+COMMAND: "send a text to divya saying i'll be late"
+LOST-PIECE: "divya"
+{"repair": "Sending the text about running late -- who's it going to?"}
+
+COMMAND: "what time is my meeting with pawel"
+LOST-PIECE: "my meeting"
+{"repair": "Something with Pawel -- what was it you wanted the time for?"}
+
+COMMAND: "what time is it in tokyo right now"
+LOST-PIECE: "tokyo"
+{"repair": "You want the local time -- which city?"}
+
+COMMAND: "put a dentist appointment on my calendar for friday"
+LOST-PIECE: "friday"
+{"repair": "I've got the dentist appointment for your calendar -- which day?"}
+
+COMMAND: "turn the volume down"
+LOST-PIECE: "the volume"
+{"repair": "I heard turn something down -- what should I adjust?"}
+
+COMMAND: "turn the volume down"
+LOST-PIECE: "down"
+{"repair": "I got turn the volume -- which way did you want it?"}
+
+COMMAND: "order a large pepperoni pizza"
+LOST-PIECE: "pepperoni"
+{"repair": "A large pizza it is -- what toppings did you want?"}
+
+COMMAND: "send an email to my boss saying i'll be late"
+LOST-PIECE: "my boss"
+{"repair": "Sending the email about running late -- who should get it?"}
+
+COMMAND: "recommend me a good italian restaurant nearby"
+LOST-PIECE: "italian"
+{"repair": "Looking for somewhere nearby -- what kind of food?"}
+
+COMMAND: "how many items are on my to do list"
+LOST-PIECE: "to do list"
+{"repair": "You want a count of the items -- on which one?"}
+
+COMMAND: "what's the latest news on the election"
+LOST-PIECE: "the election"
+{"repair": "I can pull up the latest headlines -- on what subject?"}"""
 
 
 REPEAT_TARGET_SYSTEM = """You are writing the reply a smart voice assistant \
@@ -1084,17 +1244,16 @@ Return ONLY JSON: {"repeat": "..."}"""
 # --sent-2 / --sent-4: stage 1, the canonical key-piece inventory
 # ===
 
-KEY_PIECES_SYSTEM = """You are labeling noisy-audio data for a smart voice \
-assistant.
+KEY_PIECES_SYSTEM = """You are labeling noisy-audio data for a smart voice assistant.
 
-You get the user's real spoken COMMAND, clean and complete. Break it into its \
-KEY PIECES: the pieces the assistant must have heard to carry the command out \
-correctly. A piece is key ONLY if the task cannot be performed correctly \
-without it.
+You get the user's real spoken COMMAND, clean and complete. Break it into \
+its KEY PIECES: the pieces the assistant must have heard to carry the \
+command out correctly. A piece is key ONLY if the task cannot be performed \
+correctly without it.
 
-Key pieces are entities, names, places, times, dates, quantities, titles, and \
-the requested action or topic. Question words are key pieces -- "how many", \
-"how long", "where", "when" carry what is actually being asked.
+Key pieces are entities, names, places, times, dates, quantities, titles, \
+and the requested action or topic. Question words are key pieces -- "how \
+many", "how long", "where", "when" carry what is actually being asked.
 
 Never key pieces:
 - filler and politeness words ("please", "could you", "a little bit")
@@ -1104,12 +1263,12 @@ depends on it hearing its own name. Never list it, however prominent it is.
 - auxiliary and light verbs that only frame the request ("do", "does", "is", \
 "can you", "give me", "tell me", "get me", "put"). The key piece is what is \
 being asked FOR, not the words wrapping the asking.
-- a word whose meaning the rest of the command already implies ("set" in "are \
-there any alarms set")
+- a word whose meaning the rest of the command already implies ("set" in \
+"are there any alarms set")
 
-Bundle words into ONE piece when they are a single slot the user would supply \
-as a unit -- "seven am", "my shopping list", "mocking bird". Keep pieces \
-separate when they are unrelated things the user chose independently.
+Bundle words into ONE piece when they are a single slot the user would \
+supply as a unit -- "seven am", "my shopping list", "mocking bird". Keep \
+pieces separate when they are unrelated things the user chose independently.
 
 Quote each piece in the words of the COMMAND, in the order they were spoken.
 
@@ -1125,7 +1284,7 @@ COMMAND: hey olly play playlist tactics from music
 {"reason": "Wake word dropped; action, playlist name, and source app are key.", "pieces": ["play", "playlist", "tactics", "music"]}
 
 COMMAND: give me a current traffic report
-{"reason": ""give me" is light framing; the requested item and its recency are key.", "pieces": ["current", "traffic report"]}
+{"reason": "'give me' is light framing; the requested item and its recency are key.", "pieces": ["current", "traffic report"]}
 
 COMMAND: does artificial intelligence have consciousness
 {"reason": "Does is the framing auxiliary; the subject and the property asked about are the pieces.", "pieces": ["artificial intelligence", "have consciousness"]}
@@ -1149,37 +1308,64 @@ COMMAND: turn on the radio on this channel
 {"reason": "Three independent slots, so three pieces.", "pieces": ["turn on", "the radio", "this channel"]}
 
 COMMAND: hey olly are there any alarms set
-{"reason": "Wake word and implied 'set' excluded; query about existence of alarms is the core.", "pieces": ["any", "alarms"]}"""
+{"reason": "Wake word and implied 'set' excluded; query about existence of alarms is the core.", "pieces": ["any", "alarms"]}
+
+COMMAND: what's the weather in seattle tomorrow
+{"reason": "The topic, the place and the day are all needed.", "pieces": ["weather", "seattle", "tomorrow"]}
+
+COMMAND: send a text to divya saying i'll be late
+{"reason": "Action, recipient, and the message body as one slot.", "pieces": ["send a text", "divya", "i'll be late"]}
+
+COMMAND: how long does it take to boil an egg
+{"reason": "Question word plus the thing asked about.", "pieces": ["how long", "boil an egg"]}
+
+COMMAND: turn the volume down
+{"reason": "The direction is part of the action, but the device is its own slot.", "pieces": ["turn down", "the volume"]}
+
+COMMAND: what time is my meeting with pawel
+{"reason": "Question word, the event, and the person.", "pieces": ["what time", "my meeting", "pawel"]}
+
+COMMAND: cancel the reminder about the dentist
+{"reason": "Action, object, and what the reminder is about.", "pieces": ["cancel", "the reminder", "the dentist"]}
+
+COMMAND: could you please put a dentist appointment on my calendar for friday at three
+{"reason": "Politeness dropped; event, destination, day and time remain.", "pieces": ["a dentist appointment", "my calendar", "friday", "three"]}
+
+COMMAND: recommend me a good italian restaurant nearby
+{"reason": "Action, cuisine, venue type and the location constraint.", "pieces": ["recommend", "italian", "restaurant", "nearby"]}
+
+COMMAND: tell me the latest news on the election
+{"reason": "Tell me is light framing; the topic and its recency are the pieces.", "pieces": ["latest news", "the election"]}"""
 
 
-SENT_ASR_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice \
-assistant.
+SENT_ASR_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice assistant.
 
-You get KEY PIECES -- a numbered list of the pieces of the user's real spoken \
-command that the assistant must have heard to carry it out -- and HEARD, what \
-a speech recognizer caught of that same command after loud background chatter. \
-Say which numbered pieces did not survive in HEARD.
+You get KEY PIECES -- a numbered list of the pieces of the user's real \
+spoken command that the assistant must have heard to carry it out -- and \
+HEARD, what a speech recognizer caught of that same command after loud \
+background chatter. Say which numbered pieces did not survive in HEARD.
 
 A piece SURVIVED when HEARD carries the same thing, judged by meaning rather \
 than wording:
-- spelling, spacing, number or grammar differences ("mockingbird" for "mocking \
-bird", "10 a m" for "ten am", "relationship" for "relationships")
+- spelling, spacing, number or grammar differences ("mockingbird" for \
+"mocking bird", "10 a m" for "ten am", "relationship" for "relationships")
 - a synonym asking for the same thing ("raise" for "increase")
 - a question rephrased in different grammar that still asks the same thing
 - a name rendered as a close phonetic match ("powell" for "pawel", "deevya" \
-for "divya"). The recognizer heard the name and spelled it its own way, so the \
-slot is filled and the user has nothing to clarify.
+for "divya"). The recognizer heard the name and spelled it its own way, so \
+the slot is filled and the user has nothing to clarify.
 
 A piece is LOST when HEARD drops it, garbles it, or puts a DIFFERENT word in \
-its place rather than a spelling of the same sounds -- "monday" for "mona" (a \
-weekday, not that name), "edna meyer" for "eminem", "children" for "oceans". \
-When HEARD reads as some other sentence entirely, every piece is lost.
+its place rather than a spelling of the same sounds -- "monday" for "mona" \
+(a weekday, not that name), "edna meyer" for "eminem", "children" for \
+"oceans". When HEARD reads as some other sentence entirely, every piece is \
+lost.
 
 Words in HEARD that no key piece accounts for are not evidence of anything: \
 the recognizer inventing extra words is normal in noisy environment.
 
-Return ONLY JSON, "reason" first and under 25 words. "lost" holds the NUMBERS \
-of the lost pieces and nothing else:
+Return ONLY JSON, "reason" first and under 25 words. "lost" holds the \
+NUMBERS of the lost pieces and nothing else:
 {"reason": "...", "lost": [2, 3]}
 
 Examples:
@@ -1242,36 +1428,63 @@ KEY PIECES:
 1. turn on
 2. the radio
 HEARD: yes
-{"reason": "Nothing distinguishable survived.", "lost": [1, 2]}"""
+{"reason": "Nothing distinguishable survived.", "lost": [1, 2]}
+
+KEY PIECES:
+1. what time
+2. my meeting
+3. pawel
+HEARD: my meeting with powell
+{"reason": "Name survives phonetically; the question word is gone.", "lost": [1]}
+
+KEY PIECES:
+1. weather
+2. seattle
+3. tomorrow
+HEARD: whether in seattle tomorrow
+{"reason": "A homophone spelling of the topic is not a loss.", "lost": []}
+
+KEY PIECES:
+1. cancel
+2. the reminder
+3. the dentist
+HEARD: can slur the mind about the dentist
+{"reason": "Only what the reminder was about came through.", "lost": [1, 2]}
+
+KEY PIECES:
+1. how long
+2. boil an egg
+HEARD: what's the time needed to boil an egg
+{"reason": "Different grammar, same question.", "lost": []}"""
 
 
-SENT_RESP_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice \
-assistant.
+SENT_RESP_LOSS_SYSTEM = """You are labeling noisy-audio data for a smart voice assistant.
 
-You get KEY PIECES -- a numbered list of the pieces of the user's real spoken \
-command that the assistant must have heard to carry it out -- and REPLY, what \
-the assistant said after hearing that same command over loud background \
-chatter. The assistant never saw the command in text; REPLY is your only \
-evidence of what reached it.
+You get KEY PIECES -- a numbered list of the pieces of the user's real \
+spoken command that the assistant must have heard to carry it out -- and \
+REPLY, what the assistant said after hearing that same command over loud \
+background chatter. The assistant never saw the command in text; REPLY is \
+your only evidence of what reached it.
 
 Read REPLY as EVIDENCE, not as work to grade. A rambling, unhelpful, evasive \
 or plain wrong reply can still prove the command was heard perfectly.
 
 A piece SURVIVED when the reply uses it correctly, judged by meaning rather \
 than wording. A paraphrase, a capability decline, a hand-off to the user, or \
-an admission of not knowing the answer can all still name what was asked. Naming a \
-piece correctly settles it as heard even when the reply then asks a follow-up \
-about it: a command that referred to something only generically ("that \
-podcast", "this event") gave no specific value, so asking "which podcast", "which event" is the \
-assistant gathering further information for the task.
+an admission of not knowing the answer can all still name what was asked. \
+Naming a piece correctly settles it as heard even when the reply then asks a \
+follow-up about it: a command that referred to something only generically \
+("that podcast", "this event") gave no specific value, so asking "which \
+podcast", "which event" is the assistant gathering further information for \
+the task.
 
 A piece is LOST when the reply neither uses it nor otherwise shows it got \
 through, or asserts a WRONG value for it. When the reply asks for the whole \
-command again, or engages with nothing in it at all, no piece is shown heard: \
-list them all.
+command again, or engages with nothing in it at all, no piece is shown \
+heard: list them all.
 
-Return ONLY JSON, "reason" first and under 25 words. "lost" holds the NUMBERS \
-of the lost pieces and nothing else:
+Return ONLY JSON, "reason" first and under 25 words. "lost" holds the \
+NUMBERS of the lost pieces and nothing else:
 {"reason": "...", "lost": [2, 3]}
 
 Examples:
@@ -1342,5 +1555,19 @@ KEY PIECES:
 2. the radio
 3. this channel
 REPLY: it's really loud in here -- what was that?
-{"reason": "Asks for the whole thing again, engaging with nothing.", "lost": [1, 2, 3]}"""
+{"reason": "Asks for the whole thing again, engaging with nothing.", "lost": [1, 2, 3]}
+
+KEY PIECES:
+1. what time
+2. my meeting
+3. pawel
+REPLY: i'm pulling up your meeting with pawel now.
+{"reason": "Names the event and the person; what was asked about it goes unengaged.", "lost": [1]}
+
+KEY PIECES:
+1. recommend
+2. italian
+3. restaurant
+REPLY: here are a few places nearby you might like.
+{"reason": "Recommending venues came through; the cuisine is never shown heard.", "lost": [2]}"""
 
