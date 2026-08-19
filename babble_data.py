@@ -1187,7 +1187,16 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
             }
 
         if TRACK in ("tree", "beam", "sent-2", "sent-4"):
-            targets = {k: write_target(sentence, k, triplet[k]) for k in KINDS}
+            with ThreadPoolExecutor(max_workers=len(KINDS)) as ex:
+                targets = dict(
+                    zip(
+                        KINDS,
+                        ex.map(
+                            lambda k: write_target(sentence, k, triplet[k]), KINDS
+                        ),
+                    )
+                )
+
             if not all(targets.values()):
                 return {"skip": "targets"}
             return {"triplet": triplet, "targets": targets}
