@@ -173,6 +173,14 @@ def _conv(audio, system_prompt, user_prompt):
 
 @torch.inference_mode()
 def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
+    """One batched greedy/beam pass. Takes GPU_LOCK itself -- callers don't.
+
+    The chat template, the audio loads and the mel features are pure CPU work
+    that used to sit inside the caller's `with GPU_LOCK`, so a worker preparing
+    its batch blocked the worker that actually had the GPU. Only the transfer
+    and generate hold the lock now, and the tensors stay on CPU until it is
+    held, so a worker queued behind the lock keeps its features off the device.
+    """
     logging.disable(logging.WARNING)
     try:
         texts = base_processor.apply_chat_template(
@@ -183,6 +191,10 @@ def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
     if prefill is not None:
         texts = [t + prefill for t in texts]
     mm_audios, images, videos = process_mm_info(convs, use_audio_in_video=False)
+
+    # inputs computed on CPU do not need to lock the GPU
+    # Only the transfering of inputs from cpu to gpu
+    # needs lock
     inputs = base_processor(
         text=texts,
         audio=mm_audios,
@@ -190,7 +202,8 @@ def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
         videos=videos,
         return_tensors="pt",
         padding=True,
-    ).to(base_model.device, dtype=base_model.dtype)
+    )
+
     gen_kwargs = dict(do_sample=False)
     if n_best > 1:
         gen_kwargs = dict(
@@ -198,14 +211,18 @@ def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
             num_beams=ASR_NUM_BEAMS,
             num_return_sequences=n_best,
         )
-    out = base_model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        eos_token_id=IM_END_ID,
-        pad_token_id=IM_END_ID,
-        **gen_kwargs,
-    )
-    gen = out[:, inputs["input_ids"].shape[1] :]
+    with GPU_LOCK:
+        inputs = inputs.to(base_model.device, dtype=base_model.dtype)
+        out = base_model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=IM_END_ID,
+            pad_token_id=IM_END_ID,
+            **gen_kwargs,
+        )
+        # off the device before releasing, so the decode below -- and the
+        # tensors it would otherwise pin -- are outside the critical section
+        gen = out[:, inputs["input_ids"].shape[1] :].cpu()
     decoded = [
         t.lower().strip()
         for t in base_processor.batch_decode(gen, skip_special_tokens=True)
@@ -938,12 +955,11 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
         # only --beam-label fills this in; the others keep one transcript
         hyp_lists = [[] for _ in paths]
         if TRACK in ("beam", "sent-4"):
-            with GPU_LOCK:
-                asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-                convs = [_conv(p, asr_sysp, ASR_PROMPT) for p in paths]
-                hyp_lists = base_generate_batch(
-                    convs, ASR_MAX_NEW_TOKENS, n_best=ASR_N_BEST
-                )
+            asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
+            convs = [_conv(p, asr_sysp, ASR_PROMPT) for p in paths]
+            hyp_lists = base_generate_batch(
+                convs, ASR_MAX_NEW_TOKENS, n_best=ASR_N_BEST
+            )
             # the top beam is what the row and the logs call the transcript
             transcripts = [h[0] for h in hyp_lists]
             # no task-response pass on this track: nothing reads it, so
@@ -954,11 +970,10 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                     ex.map(lambda h: label_sent_beam(pieces, h), hyp_lists)
                 )
         elif TRACK == "heard-reply":
-            with GPU_LOCK:
-                convs = [_conv(p, sysp, task_prompt(True)) for p in paths]
-                outs = base_generate_batch(
-                    convs, RESP_MAX_NEW_TOKENS, prefill=HEARD_PREFILL
-                )
+            convs = [_conv(p, sysp, task_prompt(True)) for p in paths]
+            outs = base_generate_batch(
+                convs, RESP_MAX_NEW_TOKENS, prefill=HEARD_PREFILL
+            )
             pairs = [split_heard_reply(o) for o in outs]
             transcripts = [h for h, _ in pairs]
             responses = [r for _, r in pairs]
@@ -974,16 +989,17 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
                 labels = list(ex.map(lambda h: label_target(sentence, h), transcripts))
         else:  # 2-witness (sent-2) track goes here
-            with GPU_LOCK:
-                # get batch omni asr respond
-                asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-                convs = [_conv(p, asr_sysp, ASR_PROMPT) for p in paths]
-                transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
+            # get batch omni asr respond
+            asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
+            convs = [_conv(p, asr_sysp, ASR_PROMPT) for p in paths]
+            transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
 
-                # get batch omni assistant respond
-                task = TASK_PROMPT_TREE if TRACK in ("tree", "sent-2") else TASK_PROMPT
-                convs = [_conv(p, sysp, task) for p in paths]
-                responses = base_generate_batch(convs, PROBE_RESP_MAX_NEW_TOKENS)
+            # get batch omni assistant respond. 
+            # The lock is released between 2 base_generate_batch calls.
+            # It allows others more chance to use the GPU
+            task = TASK_PROMPT_TREE if TRACK in ("tree", "sent-2") else TASK_PROMPT
+            convs = [_conv(p, sysp, task) for p in paths]
+            responses = base_generate_batch(convs, PROBE_RESP_MAX_NEW_TOKENS)
 
             if TRACK == "two-pass":
                 label_one = classify
