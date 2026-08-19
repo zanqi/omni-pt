@@ -1074,12 +1074,23 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
 
 
 def imap_ordered(items, work, workers):
+    """Yield (item, work(item)) in input order, `workers` builds at a time.
+
+    The queue is kept deeper than the pool is wide. With a window of exactly
+    `workers`, nothing is submitted until the head is yielded, so a slow head
+    left the other threads sitting on finished futures -- and utterance times
+    vary a lot here (an early skip after one probe round vs. three rounds plus
+    three target calls). The pool still runs `workers` at once; the extra
+    queued items only keep a thread from idling.
+    """
+
     it = iter(items)
     pending = deque()
+    window = workers * 3
     with ThreadPoolExecutor(max_workers=workers) as ex:
         try:
             while True:
-                while len(pending) < workers:
+                while len(pending) < window:
                     item = next(it, None)
                     if item is None:
                         break
