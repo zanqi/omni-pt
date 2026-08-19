@@ -78,7 +78,6 @@ PROBE_BATCH_SIZE = 16
 # --beam-label runs ASR_NUM_BEAMS sequences per probe against a 30s audio
 # context, so the batch has to shrink to keep the same beams-in-flight budget.
 # The dropped task-response pass buys the wall clock back.
-BEAM_PROBE_BATCH_SIZE = 8
 MAX_PROBES = 3
 # A round draws probes for the slots it still needs, not for the three it
 # started with: the first round asks for all of KINDS and hits the cap above,
@@ -87,7 +86,7 @@ MAX_PROBES = 3
 # multi-slot rounds are unchanged because the cap still binds there.
 PROBE_PER_SLOT = 8
 ANSWER_PROBE_BATCH_SIZE = 4
-UTTERANCE_WORKERS = 4
+UTTERANCE_WORKERS = 6
 GPU_LOCK = threading.Lock()
 
 SLOT_SNR = {
@@ -114,7 +113,7 @@ CLASSIFY_WORKERS = 8  # parallel classifier calls to vLLM
 
 ASR_MAX_NEW_TOKENS = 64
 ASR_N_BEST = 4
-ASR_NUM_BEAMS = 8
+ASR_NUM_BEAMS = 4
 RESP_MAX_NEW_TOKENS = 256  # task response from base omni model
 # --heard-reply keeps the full 256: there the reply IS the SFT target. On the
 # tracks below, the response is only a witness -- the labeler reads it to
@@ -974,7 +973,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             skip["format"] += n_format_fail
             with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
                 labels = list(ex.map(lambda h: label_target(sentence, h), transcripts))
-        else:
+        else:  # 2-witness (sent-2) track goes here
             with GPU_LOCK:
                 # get batch omni asr respond
                 asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
@@ -1438,7 +1437,6 @@ if __name__ == "__main__":
     )
     log(f"track: {TRACK}")
     if TRACK in ("beam", "sent-4"):
-        PROBE_BATCH_SIZE = BEAM_PROBE_BATCH_SIZE
         log(f"probe batch size: {PROBE_BATCH_SIZE} (beams: {ASR_NUM_BEAMS})")
 
     # ---
