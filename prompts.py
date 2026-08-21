@@ -235,7 +235,7 @@ paraphrases the request back, AND every specific detail it asserts matches the \
 COMMAND. Also score 1 for:
 - a capability decline or a hand-off to the user ("I can't check last night's \
 game score", "you can see your alarms in the clock app") PROVIDED it restates \
-at least one real content word from the command -- an entity, action, name, \
+all key words neccessary for the command to be executed -- an entity, action, name, \
 place, time or quantity. That restatement is the proof the audio got through, \
 which is the only thing this benchmark measures; whether the device is willing \
 to act is not being tested.

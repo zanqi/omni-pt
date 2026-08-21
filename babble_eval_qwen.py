@@ -273,7 +273,6 @@ def main():
     )
     ap.add_argument(
         "--judge-model",
-        default="Qwen/Qwen3.5-122B-A10B-FP8",
         help="from vllm --served-model-name; from openai, gpt-4o",
     )
     ap.add_argument(
@@ -367,6 +366,21 @@ def main():
     ds = load_dataset(args.dataset, split=args.split)
 
     ds = ds.cast_column("audio", Audio(sampling_rate=AUDIO_SAMPLING_RATE))
+    # The EAR (white-noise) dataset masks exactly one critical span and names it
+    # `crit_phrase`; nothing is mixed in, so there is no SNR. Map it onto the
+    # babble schema so the same per-kind judges score both tracks -- one masked
+    # span is one lost piece, which is what the repair rubric means by targeted.
+    # Both columns are read without touching `audio`, so this costs no decode.
+    if "lost" not in ds.column_names:
+        ds = ds.add_column(
+            "lost",
+            [
+                [c] if k == "repair" else []
+                for c, k in zip(ds["crit_phrase"], ds["kind"])
+            ],
+        )
+    if "snr_db" not in ds.column_names:
+        ds = ds.add_column("snr_db", [None] * len(ds))
     if len(kinds) < 3:
         # before the --num-rows slice, so the budget buys only wanted kinds
         keep = [i for i, k in enumerate(ds["kind"]) if k in kinds]
