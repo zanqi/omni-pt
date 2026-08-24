@@ -76,7 +76,7 @@ def load_ds_split(ds_id, split, limit=None, kinds=None):
 
 class OmniSFTCollator:
     def __init__(
-        self, processor, system_prompt=None, heard_reply=False, restate=False
+        self, processor, system_prompt=None, heard_reply=False, plain=False
     ) -> None:
         self.processor = processor
         # Qwen3-Omni's HF page says NO system prompt should be set; only
@@ -84,7 +84,7 @@ class OmniSFTCollator:
         self.system_prompt = system_prompt
         # must match the prompt the dataset's targets were built under, and
         # the one babble_eval_qwen.py evaluates with
-        self.task_prompt = task_prompt(heard_reply, restate)
+        self.task_prompt = task_prompt(heard_reply, plain)
 
     def _conv(self, audio, answer=None):
         conv = []
@@ -264,14 +264,14 @@ def load_model(omni_path, family, use_qlora):
 
 
 def run_smoke(
-    model, processor, dataset, batch_size, system_prompt, heard_reply, restate
+    model, processor, dataset, batch_size, system_prompt, heard_reply, plain
 ):
     print("\n=== SMOKE TEST ===")
     coll = OmniSFTCollator(
         processor,
         system_prompt=system_prompt,
         heard_reply=heard_reply,
-        restate=restate,
+        plain=plain,
     )
     n = min(batch_size, len(dataset))
     exs = [dataset[i] for i in range(n)]
@@ -324,11 +324,17 @@ def main():
         "'Heard: ... / Reply: ...' strings.",
     )
     ap.add_argument(
+        "--plain-prompt",
+        action="store_true",
+        help="Train under TASK_PROMPT, which does not ask the model to restate "
+        "what it heard. Restating is the default now that the answer targets "
+        "are written to do it; pass this to reproduce an older adapter.",
+    )
+    ap.add_argument(
         "--restate-prompt",
         action="store_true",
-        help="Train under TASK_PROMPT_TREE, which asks the model to restate "
-        "every piece of the request it caught. Match this to the dataset: "
-        "babble_data.py --tree-label probes under that prompt.",
+        help="No-op, kept so existing drivers still run: TASK_PROMPT_TREE is "
+        "the default. See --plain-prompt.",
     )
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument(
@@ -414,7 +420,7 @@ def main():
             args.batch_size,
             system_prompt,
             args.heard_reply,
-            args.restate_prompt,
+            args.plain_prompt,
         )
         return
 
@@ -448,7 +454,7 @@ def main():
             processor,
             system_prompt=system_prompt,
             heard_reply=args.heard_reply,
-            restate=args.restate_prompt,
+            plain=args.plain_prompt,
         ),
     )
 

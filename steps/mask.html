@@ -1,0 +1,644 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mask track: babble-bedded masking dataset, SFT, DPO</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5b5b5b; --rule: #ddd;
+    --code-bg: #f4f4f5; --accent: #8a3ffc; --bad: #c0392b; --ok: #1a7f37;
+    --card: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#15161a; --fg:#e8e8ea; --muted:#a0a0a8; --rule:#33343a;
+      --code-bg:#1e1f25; --accent:#b794ff; --bad:#ff6b6b; --ok:#4fd07a; --card:#1b1c22; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 880px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem;
+  }
+  h1 { font-size: 1.7rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.8rem; border-bottom: 1px solid var(--rule); padding-bottom: .4rem; }
+  h3 { font-size: 1.02rem; margin-top: 1.6rem; color: var(--accent); }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .87em; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg); padding: .9rem 1rem; border-radius: 8px;
+    overflow-x: auto; line-height: 1.5; border: 1px solid var(--rule);
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--rule); padding: .45rem .6rem; text-align: left; }
+  th { background: var(--code-bg); }
+  .card {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1rem 1.2rem; margin: 1rem 0;
+  }
+  .step-badge {
+    display: inline-block; background: var(--accent); color: #fff;
+    border-radius: 999px; width: 1.6em; height: 1.6em; line-height: 1.6em;
+    text-align: center; font-weight: 600; font-size: .85em; margin-right: .5em;
+  }
+  .risk { border-left: 3px solid var(--bad); padding-left: .9rem; margin: .8rem 0; }
+  .good { color: var(--ok); }
+  .bad { color: var(--bad); }
+  .muted { color: var(--muted); }
+  ul { padding-left: 1.3rem; }
+  li { margin: .3rem 0; }
+  .toc { columns: 2; column-gap: 2rem; }
+  .toc a { color: var(--fg); text-decoration: none; }
+  .toc a:hover { color: var(--accent); }
+  footer { margin-top: 3rem; color: var(--muted); font-size: .85rem; border-top: 1px solid var(--rule); padding-top: 1rem; }
+</style>
+</head>
+<body>
+<h1>Mask track: babble-bedded masking, SFT, then DPO</h1>
+<p class="subtitle">A third data/eval track. Every row is masked; the mask is the only loss mechanism,
+delivered four different ways, over a babble bed or over clean audio. Plan only &mdash; nothing here is
+built yet.</p>
+
+<div class="card">
+<b>New files.</b>
+<code>mask_data.py</code> (builder) &middot;
+<code>mask_dpo_data.py</code> (preference-pair sampler) &middot;
+<code>dpo_qwen.py</code> (DPO trainer) &middot;
+<code>mask_eval_qwen.py</code> (C/R/EAR) &middot;
+<code>exp/mask.sh</code> + <code>exp/mask-run.sh</code> (sweep driver).<br>
+<b>Hub.</b> dataset <code>keylazy/slurp-mask-v1</code>, prefs <code>keylazy/slurp-mask-dpo-v1</code>,
+adapters <code>keylazy/Qwen2.5-Omni-3B-mask-sft</code> and <code>-mask-dpo</code>.<br>
+<b>Untouched.</b> <code>babble_data.py</code>, <code>slurp_sft_data_qwen.py</code>, <code>babble_eval_qwen.py</code>
+&mdash; the new builder imports helpers from the first, the eval is a fork of the third.
+</div>
+
+<h2 id="toc">Contents</h2>
+<div class="toc">
+<a href="#s1">1. Row taxonomy</a><br>
+<a href="#s2">2. Which span gets masked</a><br>
+<a href="#s3">3. Babble bed + whisper gate</a><br>
+<a href="#s4">4. The four masks</a><br>
+<a href="#s5">5. Targets</a><br>
+<a href="#s6">6. Splits, sizes, dedupe</a><br>
+<a href="#s7">7. Builder skeleton</a><br>
+<a href="#s8">8. SFT</a><br>
+<a href="#s9">9. DPO data</a><br>
+<a href="#s10">10. DPO training</a><br>
+<a href="#s11">11. Eval</a><br>
+<a href="#s12">12. Run order</a><br>
+<a href="#s13">13. Risks &amp; checks</a><br>
+</div>
+
+<h2 id="s1"><span class="step-badge">1</span>Row taxonomy</h2>
+
+<p>Two kinds, and <b>every row carries a mask</b>. No probe loop and no classifier: because the mask is
+placed by us over a span we chose, the kind is true <em>by construction</em>, which is what makes this
+builder ~10&times; cheaper per row than <code>babble_data.py</code>.</p>
+
+<table>
+<tr><th>kind</th><th>masked span</th><th>what the model should do</th></tr>
+<tr><td>answer</td><td>a <b>non-critical</b> span &mdash; a stopword, or a rank-5 slot</td>
+<td>act &mdash; a mask alone is not a reason to ask</td></tr>
+<tr><td>repair</td><td>the <b>top-priority slot</b> (&sect;2)</td>
+<td>ask one targeted question about the missing piece</td></tr>
+</table>
+
+<p>These two rows are the whole dataset, and the pairing is the point: same background, same masking
+artefact, same duration, same voice &mdash; the <em>only</em> difference is the
+<em>informativeness</em> of what was covered. Unmasked rows are deliberately absent. They would let the
+model separate the kinds on a cue that is not the one we want it to learn (&ldquo;heard a burst &rarr;
+ask&rdquo;), which is exactly the over-triggering <a href="dpo.html">dpo.html</a> is about; here the burst is
+present in both classes and carries no information about which one it is.</p>
+
+<h3>Background</h3>
+<p>Background is drawn <b>per utterance</b>, not per kind: 3-speaker babble at <b>0&ndash;20&nbsp;dB</b> SNR
+with probability <code>1 &minus; CLEAN_BG_PROB</code>, otherwise the raw clean utterance.
+<code>CLEAN_BG_PROB = 0.25</code>, following <code>babble_data.py</code>'s
+<code>CLEAN_ANSWER_PROB</code> &mdash; noise-free audio is the common case in deployment and the model should
+not learn that a masked span only ever appears in noise.</p>
+<p>Per utterance, so an utterance's <code>answer</code> and <code>repair</code> rows always share a
+background and the pair stays controlled. The 25% clean share therefore lands on both kinds equally, and
+<code>by_bg</code> in the eval summary (&sect;11) reports whether the model behaves differently in the two
+conditions &mdash; it is derived from <code>snr_db</code> being null, so no separate column is needed.</p>
+
+<p>No <code>repeat</code> kind. EAR is therefore the two-factor <code>2CR/(C+R)</code>, same as the
+white-noise track and the <code>--kinds answer,repair</code> runs in <code>exp/white-cr-run.sh</code>.</p>
+
+<h3>Columns</h3>
+<pre><code>id, kind, target, audio,
+mask          # "white" | "silence" | "splice" | "burst"   -- never absent
+snr_db        # babble bed SNR in dB, or null for a clean background
+mask_snr_db   # local SNR inside the span, only for mask="burst"
+slot_type     # SLURP slot the masked phrase came from ("" for a stopword mask)
+slot_rank     # its priority rank, 1..5 (see §2); "" for a stopword mask
+lost          # ["divya"] -- list, so the judge prompt's _fmt_lost() works unchanged
+splice_n      # chunk count, only for mask="splice"
+mask_start, mask_end   # seconds, for auditing a bad row by ear
+slurp_id, sentence</code></pre>
+<p><code>lost</code> is a list of one for judge-prompt compatibility with
+<code>babble_eval_qwen.py</code>; on <code>kind="answer"</code> it holds the non-critical phrase that was
+masked &mdash; never empty, since every row is masked.</p>
+
+<h2 id="s2"><span class="step-badge">2</span>Which span gets masked</h2>
+
+<p>Aligner + SLURP slot annotation, no probing. The SLURP <code>[slot : phrase]</code> annotation tags
+entities verbatim in the sentence, so <code>find_phrase_indices()</code> from
+<code>slurp_sft_data_qwen.py</code> maps a phrase to a contiguous token range, and
+<code>indices_to_span()</code> turns that into a time span.</p>
+
+<p><code>extract_critical_targets()</code> currently picks a slot with <code>random.choice</code>. That is
+the one thing to replace: <em>&ldquo;send a mail to my friend divya&rdquo;</em> tags both
+<code>relation=friend</code> and <code>person=divya</code>, and masking <code>friend</code> leaves a command
+that is still perfectly actionable. Rank the slots and take the best one.</p>
+
+<table>
+<tr><th>rank</th><th>slot types</th><th>rationale</th></tr>
+<tr><td>1</td><td><code>person</code>, <code>relation</code>&dagger;, <code>business_name</code>, <code>place_name</code>,
+<code>app_name</code>, <code>device_type</code>, <code>email_address</code>, <code>personal_info</code>,
+<code>artist_name</code></td><td>names the target of the action; unrecoverable from context</td></tr>
+<tr><td>2</td><td><code>date</code>, <code>time</code>, <code>timeofday</code>, <code>general_frequency</code>,
+<code>time_zone</code></td><td>when &mdash; the action cannot be scheduled without it</td></tr>
+<tr><td>3</td><td><code>change_amount</code>, <code>currency_name</code>, <code>order_type</code>,
+<code>player_setting</code>, <code>color_type</code></td><td>quantities and settings the action needs</td></tr>
+<tr><td>4</td><td><code>song_name</code>, <code>playlist_name</code>, <code>podcast_name</code>,
+<code>radio_name</code>, <code>audiobook_name</code>, <code>movie_name</code>, <code>game_name</code>,
+<code>news_topic</code>, <code>event_name</code>, <code>list_name</code>, <code>definition_word</code>,
+<code>food_type</code>, <code>drink_type</code>, <code>ingredient</code>, <code>coffee_type</code></td>
+<td>content selectors; usually essential, occasionally guessable</td></tr>
+<tr><td>5</td><td>everything else &mdash; <code>media_type</code>, <code>music_genre</code>,
+<code>movie_type</code>, <code>meal_type</code>, <code>house_place</code>, <code>business_type</code>,
+<code>transport_type</code>, <code>weather_descriptor</code>, <code>joke_type</code>,
+<code>cooking_type</code>, <code>email_folder</code>, <code>podcast_descriptor</code>, unknown slots</td>
+<td>category-level; the command often survives without it</td></tr>
+</table>
+
+<p>&dagger;<b>The <code>relation</code> exception.</b> <code>relation</code> sits at rank 1 in the table but is
+demoted to rank 5 <em>whenever the same sentence also carries a <code>person</code> slot</em> &mdash; that is
+exactly the <em>friend / divya</em> case. Alone (&ldquo;call my mom&rdquo;) a relation <em>is</em> the target
+and stays rank 1. One special case, applied in <code>rank_slots()</code>; no other cross-slot rules.</p>
+
+<ul>
+<li><b>repair span</b> = the lowest-rank-number slot; ties broken by longest token span, then leftmost.
+Skip the utterance for repair if its best slot is rank 5.</li>
+<li><b>answer/mask span</b> = a stopword from <code>STOPWORDS</code> outside every slot span, else the
+<em>worst</em>-ranked slot if it is rank 5. Skip that row if neither exists.</li>
+<li>Both spans are chosen <b>before</b> the aligner runs, as in <code>slurp_sft_data_qwen.py</code>:
+feasibility is a text-only question, so an unusable sentence costs no GPU.</li>
+</ul>
+<h2 id="s3"><span class="step-badge">3</span>Babble bed, and the Whisper-tiny gate</h2>
+
+<p>The 75% of utterances that get a babble background are mixed exactly as <code>babble_data.py</code>
+does it: sample <code>BABBLE_SPEAKERS=3</code> clips from a 300-clip pool drawn from the same split (never
+the utterance's own <code>slurp_id</code>), average them, scale to a sampled SNR, add, peak-normalise if it
+clips. The other 25% skip this entirely and carry the clean signal through.</p>
+
+<p>The band is <b>0&ndash;20&nbsp;dB</b>, and the same band for <em>every</em> kind &mdash; including repair.
+It goes down to 0 deliberately: the target condition is <em>loud interference on top of a mask</em>, not a
+quiet room with a hole in it, and the low end is where a voice device actually lives. But the babble is still
+atmosphere, not the loss mechanism &mdash; the only thing that removes information is the mask we place, and
+the gate below is what enforces that.</p>
+
+<p>0&nbsp;dB babble is not reliably survivable, so at the low end the gate will reject a lot. That is the
+intended trade: the SNR the row ships with is a <em>gate-conditioned</em> draw, not a uniform one, censored
+upward by however much the utterance needed to stay intact. <code>snr_db</code> records what it actually
+got, so the realised distribution is measurable after the build rather than assumed &mdash; read it once on
+the first 100 utterances and adjust the band if the mass has all slid to the top.</p>
+
+<div class="card">
+<h3 style="margin-top:0">The gate</h3>
+<p>Babble at 0&ndash;8&nbsp;dB frequently buries a word outright &mdash; and one accidentally-buried word
+turns a <code>repair</code> row into a two-losses row whose target only asks about one of them. So before
+any mask is applied, <b>transcribe the still-unmasked background audio with Whisper-tiny and require
+that nothing was lost.</b> On a clean background the gate still runs, with no SNR to retry: it is then a
+cheap audio-quality filter, and an utterance whisper-tiny cannot transcribe cleanly is one whose forced
+alignment should not be trusted either.</p>
+<pre><code>bg = "clean" if rng.random() &lt; CLEAN_BG_PROB else "babble"
+bed = clean if bg == "clean" else mix_babble(clean, pool, snr)   # snr ~ U(0, 20)
+hyp = whisper_tiny(bed)                     # openai/whisper-tiny.en, greedy
+if not bed_intact(hyp, sentence, spans):    # see below
+    if bg == "clean": skip["bed-clean"] += 1; give up on this utterance
+    redraw the 3 babble clips once at the same snr   # unlucky mixture, not a bad SNR
+    then snr += BED_SNR_STEP                # 4 dB, up to BED_MAX_RETRIES=4
+    retry, then skip["bed"] += 1</code></pre>
+<p><code>bed_intact()</code>: normalise both sides with <code>_normalize_text</code>, then require</p>
+<ul>
+<li>every <b>content word</b> of the sentence (whitespace tokens minus <code>NON_PIECE_WORDS</code>) appears
+in the hypothesis, and</li>
+<li>the <b>repair span phrase</b> and the <b>answer-mask span phrase</b> both appear verbatim as
+subsequences &mdash; these two are the spans we are about to claim sole responsibility for.</li>
+</ul>
+<p>Function words are deliberately <em>not</em> required: whisper-tiny drops &ldquo;the&rdquo;/&ldquo;a&rdquo;
+on clean audio too, and failing on that would reject good beds. When the answer-mask span <em>is</em> a
+stopword, its verbatim check above still applies &mdash; and a stopword that whisper-tiny cannot hear on the
+bed is a bad choice of answer-mask span anyway, so falling through to the next candidate stopword before
+raising SNR is the cheaper repair (<code>BED_STOPWORD_RETRIES=2</code>).</p>
+</div>
+
+<p><b>One background per utterance.</b> The gate runs once; the accepted background is then reused for
+every row that utterance produces &mdash; its answer row, its repair row, and in test all four mask variants
+of each. So those rows differ <em>only</em> in the masked span and the mask type, which is what makes both
+the answer/repair pairing (&sect;1) and the per-variant C/R comparison (&sect;11) controlled. Cost is one whisper-tiny forward per accepted utterance &mdash; batched over
+<code>UTTERANCE_WORKERS</code> it is noise next to the aligner.</p>
+
+<p><b>There is no second gate.</b> An earlier build re-transcribed every finished masked audio and dropped
+rows whose mask did not verify. It is gone: the masks are constructed, not sampled &mdash; a silenced span is
+silent because we wrote zeros into it &mdash; so the only variant whose success is in question is
+<code>burst</code>, and paying a whisper pass over every row to catch that one is not the trade. What the
+gate did earn was one real bug (see &sect;13); with that fixed, verification moves to the bed, where the
+question is genuinely open.</p>
+
+<p>The cost of dropping it: rows now ship unverified. A <code>burst</code> row where &minus;10&nbsp;dB does
+not bury the word is a mislabeled repair row, at roughly the rate the old gate measured &mdash; about one in
+fifty burst rows. Every utterance now yields its full complement (2 rows in train, 8 in test), so a test
+split is exactly <code>n_test &times; 8</code> rows rather than ~96% of it.</p>
+
+<p>Implementation: HF <code>WhisperForConditionalGeneration</code>, greedy, <code>max_new_tokens=64</code>,
+one batch per utterance. The model is <code>--asr-model</code>, defaulting to
+<b><code>openai/whisper-small.en</code></b>. tiny.en was the first choice and it does not work here: it
+misreads utterance onsets on SLURP's clean audio ("put" &rarr; "her", "take out" &rarr; "They've hacked",
+"new" &rarr; "Do it"), so the bed gate rejected beds at 15&ndash;20&nbsp;dB SNR. A gate that fails a
+20&nbsp;dB bed is not verifying the babble &mdash; it is selecting for sentences a 39M model can spell,
+which is the bias the gate exists to prevent. Both sides of every comparison are normalized for ASR
+spelling (a token within 0.8 similarity counts as the word) and for digits ("3 days" == "three days").</p>
+
+<h2 id="s4"><span class="step-badge">4</span>The four masks</h2>
+
+<p>All four replace the <em>same</em> time span &mdash; <code>indices_to_span()</code> on the aligner's word
+timestamps, padded by <code>MASK_PAD=0.05&nbsp;s</code> and floored at
+<code>MIN_MASK_SEC=0.10&nbsp;s</code> as in <code>inject_noise()</code>. All four are applied
+<b>to the mixed bed, in place</b>, so nothing shifts and the alignment stays valid for the rest of the
+utterance.</p>
+
+<p><b>Alignment runs on the clean audio</b>, before mixing: the aligner is forcing a known transcript onto
+the signal, and it does that measurably better without babble on top &mdash; which matters more now that
+the bed can sit at 0&nbsp;dB. The timestamps then
+transfer to the bed unchanged, because the mix is sample-aligned.</p>
+
+<table>
+<tr><th><code>mask</code></th><th>what it does</th><th>why it is in the set</th></tr>
+<tr><td><code>white</code></td>
+<td>Gaussian noise at the span's local mean-abs amplitude, exactly
+<code>slurp_sft_data_qwen.py:inject_noise()</code> but computed on the mixed signal so the burst matches the
+bed's level, not the clean speech's.</td>
+<td>The EAR track's mask. Keeps this dataset comparable with
+<code>keylazy/slurp-ear-sft</code> and with the <code>white-cr</code> results already in
+<code>results/</code>.</td></tr>
+<tr><td><code>silence</code></td>
+<td>Remove the speech from the span and let the background run: on a babble bed the span keeps the bed alone
+at its existing level; on a clean background it is digital silence. 20&nbsp;ms raised-cosine ramps at both
+edges so there is no click. <code>--silence-hard</code> flips it to zeroing the mixed signal outright &mdash;
+a hard dropout, babble and all.</td>
+<td>The zero-energy end of the scale, and the one case with <em>no added signal at all</em> &mdash; nothing
+for the model to mistake for a word. If a model asks correctly here and nowhere else, its repair behaviour is
+keyed on energy, not on content.</td></tr>
+<tr><td><code>splice</code></td>
+<td><b>Shred the speaker's own audio.</b> Cut the span of duration <i>T</i> into <i>N</i> slots of
+<i>T</i>/<i>N</i>, fill each with a chunk of the same length taken from a random offset elsewhere in
+<em>this</em> utterance, and concatenate. Total duration is exactly <i>T</i>, so nothing shifts. Chunks are
+drawn from the clean signal outside the mask span (&plusmn;<code>MASK_PAD</code>), 5&nbsp;ms raised-cosine
+cross-fades at every internal seam and at the two edges, then gain-matched to the span's local RMS.</td>
+<td>Same voice, same room, same babble bed, speech-like spectrum &mdash; but with <i>N</i> large enough the
+fragments are below the length of a phoneme and no word survives the reassembly. So the model cannot key on
+timbre or on a foreign talker: the only cue is that the syllables there are not a word.</td></tr>
+<tr><td><code>burst</code></td>
+<td>Keep the clean speech in the span and raise the babble inside it until the local SNR is
+&minus;10&nbsp;dB, with 50&nbsp;ms raised-cosine ramps in and out so there is no click. Level solved on the
+span's own clean power, so the target is a true local SNR.</td>
+<td>No artefact at all &mdash; same noise source as the bed, just louder. This is the variant a model cannot
+detect by timbre, only by intelligibility.</td></tr>
+</table>
+
+<div class="card">
+<b>Choosing <i>N</i>.</b> Fix the <em>chunk length</em>, not <i>N</i>: a span is 0.15&ndash;0.6&nbsp;s
+depending on the phrase, so a constant <i>N</i> would give a 3-syllable name chunks four times longer than a
+short one. Set <code>SPLICE_CHUNK_SEC = 0.04</code> and derive
+<code>N = max(4, round(T / SPLICE_CHUNK_SEC))</code> &mdash; 40&nbsp;ms is under a phoneme and comfortably
+over a pitch period, so each chunk is voiced-sounding but carries no identifiable segment. The floor of 4
+keeps the shortest spans from degenerating into a single reordered copy of themselves. <i>N</i> and the
+realised chunk length go into the row as <code>splice_n</code> so the post-mask gate's failures in
+&sect;13 can be read against them.
+</div>
+
+<p><b>Variant assignment.</b> Per the decision: <b>train</b> draws one variant uniformly from the four per
+masked row (independently for its repair row and its answer row, so a sentence can carry two different mask
+types); <b>test</b> emits all four for every masked row on the shared background.</p>
+
+<p>The four are ordered by how much signal they leave behind &mdash; <code>silence</code> (none),
+<code>white</code> (noise), <code>splice</code> (speech-like, wordless), <code>burst</code> (the real word,
+buried at &minus;10&nbsp;dB). A model that only repairs on the first two is detecting a hole; one that also
+repairs on <code>burst</code> is judging intelligibility. That gradient is what <code>by_mask</code> in the
+eval summary is for.</p>
+
+<h2 id="s5"><span class="step-badge">5</span>Targets</h2>
+
+<p>Reuse <code>babble_data.write_target()</code> verbatim &mdash; import it, do not fork it. It already does
+everything this track needs:</p>
+<ul>
+<li><code>kind="answer"</code> &rarr; <code>ANSWER_TARGET_SYSTEM</code> off the sentence alone.</li>
+<li><code>kind="repair"</code> &rarr; <code>REPAIR_TARGET_TREE_SYSTEM</code> off
+<code>COMMAND + LOST-PIECE</code>. Its prompt's premise &mdash; <em>everything outside LOST-PIECE came
+through</em> &mdash; is stated as an inference from intersecting witnesses on the sent tracks; here the
+whisper gate makes it a fact about the audio.</li>
+<li>The leak check (<code>leakable &amp; target words</code>, <code>skip["target-leak"]</code>) applies
+unchanged, and matters more here: the masked phrase is a name far more often than on the babble track.</li>
+</ul>
+<p>It reads <code>probe["lost"][0]</code>, so the builder hands it <code>{"lost": [masked_phrase]}</code> and
+nothing else. Temperature 0.7, <code>TARGET_RETRIES=8</code>, served by the same vLLM box
+(<code>TARGET_MODEL</code>, node from <code>VLLM_HOST_FILE</code>) &mdash; the long SYSTEM rubric stays in the
+prefix cache across the whole build.</p>
+<p><b>Train split only.</b> Test rows ship <code>target=""</code>, matching
+<code>build_triplets()</code>'s <code>if split == "test"</code> branch &mdash; the judge scores the model's
+answer against the rubric, never against a written target.</p>
+<h2 id="s6"><span class="step-badge">6</span>Splits, sizes, dedupe</h2>
+
+<table>
+<tr><th></th><th>utterances</th><th>rows produced</th><th>total</th></tr>
+<tr><td><b>train</b> (SLURP train)</td><td>1500</td>
+<td>1 repair + 1 answer, each with its own sampled mask variant</td>
+<td>3000 rows (1500 repair / 1500 answer); ~75% babble background, ~25% clean</td></tr>
+<tr><td><b>test</b> (SLURP test)</td><td>80</td>
+<td>4 repair (one per variant) + 4 answer (one per variant)</td>
+<td>640 rows: 320 repair, 320 answer</td></tr>
+</table>
+
+<p>One audio, one answer row, one repair row &mdash; the set is 50/50 by construction, and every
+<code>answer</code> row has a <code>repair</code> row on the same background and the same voice. There is no
+composition knob: an utterance contributes one of each or, if the gate drops one, whatever survived.
+<code>--n-train</code>, <code>--n-test</code>, <code>--clean-bg-prob</code>, <code>--mask-pad</code> and
+<code>--asr-model</code> are the flags; the numbers above are defaults.</p>
+
+<p>Train is raised to 1500 utterances because each now yields 2 rows rather than ~3.25 &mdash; this keeps the
+row count and therefore the SFT step count roughly where the existing runs sat, so the new numbers are
+comparable to them.</p>
+
+<h3>Dedupe</h3>
+<p>Same rule as <code>babble_data.py</code>: <code>slurp_id</code> is a <em>sentence</em> id, claimed in the
+producer so the ~10 back-to-back recordings of one prompt cannot race through together, and each sentence is
+used at most once per build. On top of that:</p>
+<ul>
+<li>The <b>test</b> split excludes every <code>slurp_id</code> in the <b>train</b> split of
+<code>keylazy/slurp-ear-sft</code> and of the babble dataset, so the sent2/sent4/ear adapters can be scored
+on it without leakage &mdash; that cross-track comparison is the whole reason to have a shared test set.</li>
+<li>The <b>train</b> split is built second and excludes the ids the test split just claimed.</li>
+<li>It does <em>not</em> exclude ear/babble <em>train</em> ids. This track supersedes them rather than
+running alongside, so re-using a sentence costs nothing; the old
+<code>MASK_DS_ID</code> exclusion existed only to stop one sentence being double-weighted across two
+concurrently-used datasets.</li>
+</ul>
+
+<h2 id="s7"><span class="step-badge">7</span>Builder skeleton</h2>
+
+<p><code>mask_data.py</code>, run in the <b>qwen3omni</b> env &mdash; that is where transformers is a dev
+build carrying <code>Qwen3ASRProcessor.prepare_forced_aligner_inputs</code> (qwen25omni pins 4.52.3, which
+predates it) and where <code>openai-whisper</code> is installed. The builder loads <b>no omni model at all</b>
+&mdash; the aligner (0.6B) and whisper-tiny are the only GPU residents, so this fits a small allocation and
+runs far faster than <code>babble_data.py</code>.</p>
+
+<pre><code>for row in slurp_ds_stream(split):            # imported from babble_data
+    plan = plan_spans(sentence, annotation)   # §2: ranked slot + stopword, text only
+    if plan is None: skip; continue           # no rank<=4 slot, or no maskable stopword
+
+    words = align_words(clean, sentence)      # ported from slurp_sft_data_qwen
+    if bad alignment: skip                    # token-count mismatch guard, kept
+
+    bed, bg, snr, hyp = verified_bed(clean, pool, plan, rng)  # §3: 25% clean, gate, SNR retries
+    if bed is None: skip
+
+    audios = {}                               # (kind, span_i, variant) -> wav path
+    for kind, spans in (("repair", plan.crit[:1]), ("answer", plan.non_crit[:ANS_PER_UTT])):
+        for i, span in enumerate(spans):
+            for variant in (VARIANTS if split == "test" else [rng.choice(VARIANTS)]):
+                a = apply_mask(bed, span, variant, rng)   # §4
+                if not masked_phrase_gone(a, plan, kind): retry once, else drop row
+                audios[kind, i, variant] = write_wav(a)
+
+    targets = {k: write_target(sentence, k, {"lost": [plan.phrase[k]]})
+               for k in ("answer", "repair")} if split == "train" else ...
+    emit rows</code></pre>
+
+<p>Threading and I/O copy <code>babble_data.py</code> exactly: <code>imap_ordered()</code> over
+<code>UTTERANCE_WORKERS</code> threads with a <code>GPU_LOCK</code> around aligner/whisper batches,
+<code>tqdm</code> + a <code>skip</code> Counter in the postfix, wavs written to
+<code>babble_audio/&lt;ds-name&gt;/</code>, a <code>rows.json</code> dumped next to them before the push, and
+<code>--no-push</code> for a throwaway <code>--ds-id</code>. Reused by import:
+<code>slurp_ds_stream</code>, <code>collect_babble_pool</code>, <code>imap_ordered</code>,
+<code>_normalize_text</code>, <code>gpt_json</code>, <code>write_target</code>, <code>skip</code>.
+Importing <code>babble_data</code> costs only the OpenAI-client construction against the vLLM host &mdash; the
+omni model is loaded in its <code>__main__</code>, which does not run on import.</p>
+
+<h2 id="s8"><span class="step-badge">8</span>SFT</h2>
+
+<p>No code change. <code>sft_qwen.py</code> already takes <code>--ds-id</code>, filters with
+<code>--kinds</code>, and builds its label mask by diffing the two chat-template renders:</p>
+<pre><code>python sft_qwen.py \
+  --ds-id keylazy/slurp-mask-v1 \
+  --kinds answer,repair \
+  --run-name Qwen2.5-Omni-3B-mask-sft \
+  --epochs 3 --lr 2e-4 --batch-size 16</code></pre>
+<p>Adapter lands in <code>checkpoints/Qwen2.5-Omni-3B-mask-sft</code> and is pushed to
+<code>keylazy/</code>&hellip;. LoRA is attached to the <code>Qwen2_5OmniForSFT</code> wrapper so the saved keys
+keep their <code>thinker.</code> prefix &mdash; which is what lets the eval scripts
+<code>PeftModel.from_pretrained</code> + <code>merge_and_unload()</code> them onto a plain
+<code>Qwen2_5OmniForConditionalGeneration</code>. Run it as an <code>exp/mask-sft.sh</code> sbatch alongside
+the existing ones.</p>
+
+<h2 id="s9"><span class="step-badge">9</span>DPO data</h2>
+
+<p><code>mask_dpo_data.py</code>, qwen25omni env, one GPU. Sampling is <b>on-policy from the SFT
+checkpoint</b>, and pairs are ranked by the same judge the eval uses &mdash; so the preference signal and the
+reported metric agree by construction.</p>
+
+<ol>
+<li><b>Sample.</b> Load base + the mask-SFT adapter (merged). For each <code>train</code> row, sample
+<code>K=4</code> responses at <code>temperature=1.0, top_p=0.95</code>, batched, with the eval's exact
+<code>TASK_PROMPT</code> and system prompt &mdash; a train/eval prompt mismatch would teach the wrong
+conditional.</li>
+<li><b>Judge.</b> Score all 4&times;N with the vLLM judge and the per-kind rubric
+(<code>COMPETENCE_SYSTEM</code> for <code>answer</code>, <code>REPAIR_SYSTEM</code> for
+<code>repair</code>), scores in {0, 0.5, 1}. Reuse <code>make_judge()</code> from the eval module by import.</li>
+<li><b>Pair.</b> chosen = highest-scoring sample, rejected = lowest. <b>Keep only pairs with margin
+&ge; 0.5</b>; a row where all four agree carries no gradient and just burns compute. Ties inside a score
+level broken by shorter-is-chosen, which mildly discourages the rambling that the judged transcripts already
+show.</li>
+<li><b>Fallback.</b> If every sample scores 1.0 on a <code>repair</code> row, drop it. If every sample
+scores 0 &mdash; the interesting failure &mdash; use the <b>dataset's written target as chosen</b> and the
+worst sample as rejected. This is the only off-policy chosen in the set; count them and report the number,
+because a set dominated by them is really just more SFT.</li>
+<li><b>Reference logprobs.</b> While the SFT model is loaded, also compute and store the
+sequence logprob of chosen and rejected under it. That is <em>exactly</em> the DPO reference model, so
+&sect;10 then needs one model in memory instead of two. Columns <code>ref_logp_chosen</code>,
+<code>ref_logp_rejected</code>.</li>
+</ol>
+<p>Output columns: everything from the source row, plus <code>chosen</code>, <code>rejected</code>,
+<code>chosen_score</code>, <code>rejected_score</code>, <code>ref_logp_*</code>, <code>pair_source</code>
+(<code>"sampled"</code> | <code>"gold-chosen"</code>). Pushed to
+<code>keylazy/slurp-mask-dpo-v1</code>. Expect roughly 40&ndash;60% of train rows to survive the margin
+filter &mdash; ~1300&ndash;2000 pairs, which is a normal size for a LoRA DPO pass.</p>
+<h2 id="s10"><span class="step-badge">10</span>DPO training</h2>
+
+<p><code>dpo_qwen.py</code>. <b>TRL is not installed in <code>qwen25omni</code></b> (peft 0.19.1,
+transformers 4.52.3, accelerate 1.14.0 are), and <code>DPOTrainer</code> does not handle the omni processor's
+audio path anyway. The loss is ~15 lines; write it against the pieces <code>sft_qwen.py</code> already has
+rather than adding a dependency.</p>
+
+<h3>Model topology</h3>
+<pre><code>base = Qwen2_5OmniForSFT.from_pretrained(...)          # same wrapper as SFT
+model = PeftModel.from_pretrained(base, mask_sft_adapter).merge_and_unload()
+model = get_peft_model(model, LoraConfig(...))         # fresh LoRA, trains from zero</code></pre>
+<p>Merging the SFT adapter down into the weights means the policy starts <em>at</em> the SFT model and the
+new LoRA is the only thing that moves. The reference is the SFT model, and its logprobs were precomputed in
+&sect;9 &mdash; so nothing else needs to be resident. (Had they not been precomputed, the same topology gives
+the reference for free via <code>with model.disable_adapter():</code>, at the cost of two extra forwards per
+step.)</p>
+
+<h3>Batch and loss</h3>
+<ul>
+<li><b>Collator.</b> Subclass <code>OmniSFTCollator</code>: build each example twice, once with
+<code>chosen</code> as the assistant turn and once with <code>rejected</code>, and concatenate them into one
+batch of <code>2B</code>. The audio is identical in both halves, so <code>process_mm_info</code> runs once
+per example and its features are duplicated &mdash; the audio encoder is the expensive part of this model
+and halving its work matters.</li>
+<li><b>Sequence logprob.</b> Sum the per-token logprobs over the label-masked positions &mdash; the mask the
+existing collator already computes by diffing the full render against the <code>add_generation_prompt</code>
+render.</li>
+<li><b>Loss.</b> Standard sigmoid DPO:
+<code>-logsigmoid(&beta;&middot;((&pi;<sub>c</sub>&minus;ref<sub>c</sub>) &minus; (&pi;<sub>r</sub>&minus;ref<sub>r</sub>)))</code>,
+<code>&beta;=0.1</code>.</li>
+<li>Log <code>reward_accuracy</code> (fraction of pairs with implicit reward margin &gt; 0) and mean margin
+every <code>logging_steps</code> &mdash; if accuracy pins at 1.0 in the first hundred steps the pairs are too
+easy and the margin filter in &sect;9 needs raising.</li>
+</ul>
+
+<h3>Hyperparameters</h3>
+<table>
+<tr><th>knob</th><th>value</th><th>why</th></tr>
+<tr><td>lr</td><td>5e-6</td><td>Two orders below the SFT's 2e-4. DPO on a converged policy is a nudge; a
+high LR here is the classic way to get degenerate short outputs.</td></tr>
+<tr><td>epochs</td><td>1</td><td>Two is where over-optimisation against the judge usually shows up. Save the
+adapter each half-epoch so a regression is recoverable without a re-run.</td></tr>
+<tr><td>&beta;</td><td>0.1</td><td>Default. Raise to 0.3 if eval shows the model drifting off the SFT
+style.</td></tr>
+<tr><td>batch</td><td>4 pairs (= 8 sequences), grad-accum 4</td><td>Twice the sequences per step of SFT at the
+same audio count; halve <code>--batch-size</code> from the SFT job.</td></tr>
+<tr><td>LoRA</td><td>same rank/targets as SFT</td><td>Keeps the two stages comparable and lets both adapters
+be stacked or swapped in the eval sweep.</td></tr>
+</table>
+
+<h2 id="s11"><span class="step-badge">11</span>Eval</h2>
+
+<p><code>mask_eval_qwen.py</code>, forked from <code>babble_eval_qwen.py</code> &mdash; the third
+near-duplicate, deliberately, so this track's summary schema can change without touching the two published
+result sets. What carries over unchanged: family auto-detection, <code>--adapter-path</code> merge,
+<code>disable_talker()</code>, the fixed <code>TASK_PROMPT</code>, the per-kind judge with reason-before-score,
+the vLLM <code>--judge-base-url</code> path, and one JSON record per row plus a trailing summary.</p>
+
+<ul>
+<li><b>Kinds.</b> <code>answer,repair</code> only &rarr; <code>EAR = 2CR/(C+R)</code>.</li>
+<li><b>New: per-variant breakdown.</b> The summary record gains
+<code>by_mask: {silence: {C, R, EAR, n}, white: {...}, splice: {...}, burst: {...}}</code>, plus
+<code>by_bg: {babble: {...}, clean: {...}}</code> (split on <code>snr_db is None</code>) and
+<code>by_snr</code> in 5&nbsp;dB bins &mdash; with the band now reaching 0&nbsp;dB, whether C falls off at the
+noisy end is a question the summary should answer directly. Top-level <code>C</code>, <code>R</code>, <code>EAR</code>, <code>model</code>,
+<code>judge_model</code> keep their current names and position on the last line, so
+<code>results/viz.ipynb</code>'s <code>load_summary</code> reads these files with no change.</li>
+<li><b>Output.</b> <code>results/mask_results_&lt;model-or-adapter-name&gt;_&lt;tag&gt;.jsonl</code>.</li>
+<li><b>Stages.</b> Three runs per sweep &mdash; base, +SFT adapter, +DPO adapter &mdash; on the identical test
+split and the identical judge, so the three lines are directly comparable:
+<pre><code>base       Qwen/Qwen2.5-Omni-3B
+sft        --adapter-path checkpoints/Qwen2.5-Omni-3B-mask-sft
+dpo        --adapter-path checkpoints/Qwen2.5-Omni-3B-mask-dpo</code></pre></li>
+<li><b>Optional 4th and 5th.</b> The existing <code>keylazy/Qwen2.5-Omni-3B-bab-sent4-sft</code> and
+<code>-ear-sft-adapter</code> adapters, for cross-track transfer &mdash; the test split was built leak-free
+against both (&sect;6) precisely so this is legitimate.</li>
+</ul>
+
+<p><code>exp/mask.sh</code> + <code>exp/mask-run.sh</code> follow <code>exp/white-cr*.sh</code> exactly,
+including the two habits worth keeping: fail fast if the judge box is unreachable, and <b>read the judge model
+name off <code>/v1/models</code></b> rather than trusting a default &mdash; the box gets re-served with
+different models and a mismatch is a 404 on every row, discovered ~7 minutes in.</p>
+
+<h2 id="s12"><span class="step-badge">12</span>Run order</h2>
+
+<pre><code># 0. judge/target box must be up; it serves both the builder and the evals
+sbatch /gscratch/sciencehub/zanqil/vllm_judge/vllm_judge.slurm
+
+# 1. build (qwen3omni env: dev transformers for the aligner + whisper)
+python mask_data.py --ds-id keylazy/slurp-mask-v1 --n-train 1500 --n-test 80 --ans-per-utt 1
+
+# 2. SFT (qwen25omni)
+sbatch exp/mask-sft.sh          # -> checkpoints/Qwen2.5-Omni-3B-mask-sft
+
+# 3. eval stage 1 -- base + SFT
+sbatch exp/mask.sh              # -> results/mask_results_*_mask-v1.jsonl
+
+# 4. preference pairs from the SFT checkpoint
+python mask_dpo_data.py --ds-id keylazy/slurp-mask-v1 \
+    --adapter-path checkpoints/Qwen2.5-Omni-3B-mask-sft \
+    --out-ds-id keylazy/slurp-mask-dpo-v1 -k 4
+
+# 5. DPO
+sbatch exp/mask-dpo.sh          # -> checkpoints/Qwen2.5-Omni-3B-mask-dpo
+
+# 6. eval stage 2 -- rerun the same sweep, now with the DPO adapter
+sbatch exp/mask.sh</code></pre>
+
+<p>Steps 1&ndash;3 are the checkpoint worth stopping at: if SFT does not beat base on R without losing C,
+DPO has nothing to correct and the answer is upstream, in &sect;2 or &sect;4.</p>
+
+<h2 id="s13"><span class="step-badge">13</span>Risks &amp; checks</h2>
+
+<div class="risk"><b>&minus;10&nbsp;dB may not be enough, and nothing checks it now.</b> The
+<code>burst</code> level is a guess, and with the post-mask gate gone a burst row that fails to bury the
+word ships as a mislabeled repair row. The old gate put the rate at about one in fifty. To re-measure
+without reinstating it: build a few hundred rows with <code>--no-push</code>, transcribe the
+<code>mask="burst"</code> wavs offline, and count how many still carry the phrase in <code>lost</code>. If
+it has drifted, &minus;15&nbsp;dB is the next stop.</div>
+
+<div class="risk"><b>The gate is also the bug detector.</b> On its first run it reported the masked phrase
+still audible on six <code>silence</code> rows &mdash; acoustically impossible, and the cause was a real
+inverted-blend bug that left the middle of every silence span untouched. Span energy on the written wavs
+confirmed it (a clean-background row measured <code>span_rms/utt_rms = 1.07</code>, now
+<code>0.000</code>). Treat an impossible gate verdict as a masking bug before treating it as an ASR
+artefact.</div>
+
+<div class="risk"><b>Splice can accidentally say something.</b> The chunks come from the same speaker
+saying the same sentence, so a reassembly can land on a real syllable sequence &mdash; and the model then
+confidently acts on the wrong entity instead of asking, which scores as a repair failure that is really a
+data bug, and nothing in the build looks for it &mdash; a gate on the original phrase would not have caught
+a substitute appearing anyway. Mitigations, in order: keep chunks at 40&nbsp;ms; forbid two consecutive
+chunks whose source offsets are adjacent in the original (that is what would rebuild a real word);
+transcribe the <code>mask="splice"</code> wavs of a <code>--no-push</code> build offline and read 20 before
+committing to the full one.</div>
+
+<div class="risk"><b>Alignment token-count mismatch.</b> <code>slurp_sft_data_qwen.py</code> skips whenever
+the aligner's word count differs from the whitespace split. That guard stays &mdash; it is cheap and the
+alternative is masking the wrong span &mdash; but it is a meaningful share of skips, so watch the counter and
+do not mistake it for a bug.</div>
+
+<div class="risk"><b>Judge over-optimisation in DPO.</b> Pairs are ranked by the same judge that reports the
+metric, so a DPO gain on EAR is partly a gain at pleasing that judge. Cheap control: score the final three
+stages once more with a <em>different</em> judge model on the same box (the results already in
+<code>results/</code> were produced under at least two). If the ordering holds, the gain is real.</div>
+
+<div class="risk"><b>Answer rows may be too easy.</b> If the masked stopword is short, the row is nearly an
+unmasked one &mdash; and with unmasked rows now gone, that quietly reintroduces the cue this design removes.
+Prefer the longest available stopword span, and if C on <code>kind=answer</code> comes back at ceiling in the
+base-model eval, promote the answer mask to a rank-5 slot phrase.</div>
+
+<div class="risk"><b>No unmasked rows at all is itself a bet.</b> Every training audio has a burst in it, so
+the model never sees a clean command in this dataset and could drift toward asking on genuinely clear audio
+&mdash; the opposite failure. The eval cannot see this: its test rows are all masked too. Cheap control:
+score the finished stages on the <em>babble</em> track's test split as well (all three stages, same judge)
+and watch C on its unmasked answer rows. If it drops against base, add back a small unmasked answer slice
+and retrain.</div>
+
+<footer>
+Plan for the mask track &mdash; builder, SFT, DPO, and a three-stage C/R/EAR eval.
+Sibling documents: <a href="dpo.html">dpo.html</a>, <a href="data.html">data.html</a>,
+<a href="beam.html">beam.html</a>, <a href="2pass.html">2pass.html</a>.
+</footer>
+
+</body>
+</html>

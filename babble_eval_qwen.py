@@ -304,11 +304,18 @@ def main():
         "half. Required for adapters trained with sft_qwen.py --heard-reply.",
     )
     ap.add_argument(
+        "--plain-prompt",
+        action="store_true",
+        help="Prompt with TASK_PROMPT, which does not ask the model to restate "
+        "what it heard. Restating is the default now that the answer targets "
+        "are written to do it; pass this to reproduce a run from before that, "
+        "or to score a plain-prompt model on the same split.",
+    )
+    ap.add_argument(
         "--restate-prompt",
         action="store_true",
-        help="Prompt with TASK_PROMPT_TREE, which asks the model to restate "
-        "every piece of the request it caught. Required for adapters trained "
-        "with sft_qwen.py --restate-prompt.",
+        help="No-op, kept so existing drivers still run: TASK_PROMPT_TREE is "
+        "the default. See --plain-prompt.",
     )
     ap.add_argument(
         "--score-matrix",
@@ -371,7 +378,7 @@ def main():
     )
     score_matrix = SCORE_MATRICES[args.score_matrix]
     print(
-        f"prompt: {'heard-reply' if args.heard_reply else 'restate' if args.restate_prompt else 'plain'} | "
+        f"prompt: {'heard-reply' if args.heard_reply else 'plain' if args.plain_prompt else 'restate'} | "
         f"judge: {'per-kind' if per_kind else 'rules, no-restate' if args.no_restate_judge else 'rules'} | "
         f"scores: {'direct' if per_kind else args.score_matrix} | "
         f"kinds: {','.join(kinds)}"
@@ -456,7 +463,7 @@ def main():
                 sr,
                 args.max_new_tokens,
                 args.heard_reply,
-                args.restate_prompt,
+                args.plain_prompt,
             )
 
         heard, reply = ("", "")
@@ -596,7 +603,7 @@ def main():
                     "model_family": family,
                     "judge_model": args.judge_model,
                     "heard_reply": args.heard_reply,
-                    "restate_prompt": args.restate_prompt,
+                    "restate_prompt": not args.plain_prompt,
                     "judge_mode": args.judge_mode,
                     "score_matrix": args.score_matrix,
                     "no_restate_judge": args.no_restate_judge,

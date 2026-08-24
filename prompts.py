@@ -36,10 +36,17 @@ TASK_PROMPT_TREE = (
 )
 
 
-def task_prompt(heard_reply, restate=False):
+def task_prompt(heard_reply, plain=False):
+    """The system prompt a run generates under. Restating is the default.
+
+    Naming the request's specifics back is what the answer targets are written
+    to do, so instructing the model to do anything else trains against the
+    data. TASK_PROMPT (no restatement clause) is still reachable with
+    `plain=True`, which is what reproduces the runs already in results/.
+    """
     if heard_reply:
         return TASK_PROMPT_HR
-    return TASK_PROMPT_TREE if restate else TASK_PROMPT
+    return TASK_PROMPT if plain else TASK_PROMPT_TREE
 
 
 # Literal text to force onto the assistant turn before generation, so the base
@@ -322,14 +329,19 @@ audio.
 Score the REPLY:
 
 1 -- it carries out the task, answers it, says it is looking the answer up, or \
-paraphrases the request back, AND every specific detail it asserts matches the \
-COMMAND. Also score 1 for:
+paraphrases the request back, AND it names back the command's specifics -- the \
+action and each entity, name, place, time, quantity, and any word that narrows \
+what was asked -- AND every specific detail it asserts matches the COMMAND. \
+That restatement is the proof the audio got through, which is the only thing \
+this benchmark measures. A reply that acts on the right thing while staying \
+vague about it ("Let me check the forecast" for "is there snow in the \
+forecast") scores 0.5: right action, no evidence it heard the detail. \
+Also score 1 for:
 - a capability decline or a hand-off to the user ("I can't check last night's \
 game score", "you can see your alarms in the clock app") PROVIDED it restates \
 all key words neccessary for the command to be executed -- an entity, action, name, \
-place, time or quantity. That restatement is the proof the audio got through, \
-which is the only thing this benchmark measures; whether the device is willing \
-to act is not being tested.
+place, time or quantity. Whether the device is willing to act is not being \
+tested.
 - an engaged, on-topic reply to a phatic or rhetorical prompt ("anything on \
 your mind?", "how are you feeling?"), which adds no facts but shows the \
 command was heard.
@@ -569,6 +581,9 @@ HEARD:   get to make copies
 COMMAND: please turn on the radio
 HEARD:   yes
 {"reason": "Nothing distinguishable survived.", "lost": ["turn on", "the radio"]}"""
+
+
+
 TARGET_SYSTEM = """You are writing training targets for a smart voice \
 assistant that has full access to the user's apps, accounts, information, and the internet.
 
@@ -1095,8 +1110,18 @@ but every piece needed to perform the task survived, so treat the whole \
 command as heard correctly.
 
 Write what the assistant says back: one or two spoken sentences covering \
-EVERY part of the request. Two things the examples below turn on, so read \
-them for the rest:
+EVERY part of the request. Three rules matter most, and the worked examples at \
+the end show all three in use -- follow those examples for anything not spelled \
+out here:
+- RESTATE THE REQUEST. Name back every concrete detail the command gave -- \
+the action and each entity, name, place, time, quantity, and any word that \
+narrows what was asked ("snow" in "is there snow in the forecast", "friend" \
+in "my friend divya", "unread" in "unread emails"). The restatement is the \
+proof the audio got through, which is the only thing being trained here, so a \
+reply that acts on the right thing while staying vague about it ("Let me \
+check the forecast for you") is wrong however helpful it sounds. Say the \
+detail in natural words -- a paraphrase that keeps the specifics is fine, \
+dropping them is not.
 - Answer directly only from stable general knowledge. Anything private to \
 this user (their alarms, emails, calendar, lists, messages) or anything that \
 changes by the minute (the time, weather, rates, scores, traffic) must be \
@@ -1127,7 +1152,13 @@ COMMAND: what's the dollar to pound rate today
 {"answer": "I'm looking up today's dollar to pound rate now."}
 
 COMMAND: do you think it's going to rain tomorrow
-{"answer": "Let me pull up tomorrow's forecast for you."}
+{"answer": "Let me pull up tomorrow's forecast and see if rain is coming."}
+
+COMMAND: please send a mail to my friend kate how are you
+{"answer": "I'm sending your friend Kate an email asking how she is."}
+
+COMMAND: read me my unread emails from anna
+{"answer": "Here are your unread emails from Anna."}
 
 COMMAND: set an alarm for seven am tomorrow
 {"answer": "I'm setting an alarm for seven am tomorrow."}
