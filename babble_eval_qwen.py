@@ -36,6 +36,7 @@ from prompts import (
     REPAIR_JUDGE_SYSTEM,
     REPAIR_ON_TARGET_SYSTEM,
     REPEAT_JUDGE_SYSTEM,
+    RESPONSE_TYPE_NORESTATE_SYSTEM,
     RESPONSE_TYPE_SYSTEM,
     split_heard_reply,
     task_prompt,
@@ -319,6 +320,15 @@ def main():
         "under 'tree' measures the cell change on its own.",
     )
     ap.add_argument(
+        "--no-restate-judge",
+        action="store_true",
+        help="Type judge only: classify replies with "
+        "RESPONSE_TYPE_NORESTATE_SYSTEM, which credits 'answer' to a reply "
+        "that acts on the command without requiring it to echo back every "
+        "element it heard. Use when a restate-prompted adapter and plain-"
+        "prompt models are scored on the same split.",
+    )
+    ap.add_argument(
         "--judge-mode",
         default="type",
         choices=["type", "per-kind"],
@@ -354,11 +364,15 @@ def main():
     if kinds != ["answer", "repair", "repeat"]:
         tag = "-".join(kinds)
     out_path = args.out or f"results/bab_results_{model_name}_{tag}.jsonl"
-    judge_system = RESPONSE_TYPE_SYSTEM
+    judge_system = (
+        RESPONSE_TYPE_NORESTATE_SYSTEM
+        if args.no_restate_judge
+        else RESPONSE_TYPE_SYSTEM
+    )
     score_matrix = SCORE_MATRICES[args.score_matrix]
     print(
         f"prompt: {'heard-reply' if args.heard_reply else 'restate' if args.restate_prompt else 'plain'} | "
-        f"judge: {'per-kind' if per_kind else 'rules'} | "
+        f"judge: {'per-kind' if per_kind else 'rules, no-restate' if args.no_restate_judge else 'rules'} | "
         f"scores: {'direct' if per_kind else args.score_matrix} | "
         f"kinds: {','.join(kinds)}"
     )
@@ -585,6 +599,7 @@ def main():
                     "restate_prompt": args.restate_prompt,
                     "judge_mode": args.judge_mode,
                     "score_matrix": args.score_matrix,
+                    "no_restate_judge": args.no_restate_judge,
                     "kinds": kinds,
                     "heard_parse_failures": parse_failures,
                     "judge_parse_failures": judge_failures,

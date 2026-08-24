@@ -177,6 +177,97 @@ REPLY: There are about 2 billion children in the world.
 {"reason": "Confidently answers a question the command never asked, asserting a detail it never contained.", "type": "bad"}"""
 
 
+# --no-restate-judge: RESPONSE_TYPE_SYSTEM with the restatement requirement
+# dropped from "answer". The original credits "answer" only to wording that
+# accounts for EVERY key element the command spoke and sends anything that
+# silently drops one to "bad" -- a rubric only a model prompted (and trained)
+# to restate what it heard can satisfy. Under this variant acting on the
+# command is enough, and "bad" keeps only the failures that are not about
+# echoing: asserting something the command never contained, and content-free
+# declines. Everything else -- the repair/repeat definitions, the hedge rule,
+# the second stage -- is unchanged, so use this when comparing a restate-
+# prompted adapter against models running the plain TASK_PROMPT.
+RESPONSE_TYPE_NORESTATE_SYSTEM = """You are grading a smart voice device. The \
+user spoke a COMMAND; loud background chatter may have drowned out part of it. \
+You see the command and the device's REPLY -- never the audio. Classify the \
+reply as exactly one type:
+
+- "answer": acts on the command, answers it, or declines/hands it off, without \
+asking about anything the command did state. It need NOT repeat back the \
+elements it heard -- saying less than the command said is fine. Asking for a \
+value the command never gave is fine and still "answer".
+- "repair": asks about ONE specific element the command did state, treating \
+the rest as heard.
+- "repeat": asks for the whole command again, committing to no details.
+- "bad": anything else -- asserts a detail the command never contained, or \
+declines with nothing from the command in it.
+
+Judge the FORM of the reply, not whether it guessed right: a targeted question \
+is "repair" even when the piece it asks about was perfectly audible. Appended \
+small talk or offers of further help never change the type, unless they assert \
+details contradicting the command.
+
+Wording that reports what the device heard -- "I heard 'X'", "it sounded like \
+'X'", "did you say X" -- is a hedge, not an assertion, so a misheard or \
+invented word inside it never makes the reply "bad". Classify such a reply by \
+what it does around the hedge: the question it asks, and whether the elements \
+it treats as settled were spoken. A detail the reply acts on or states flatly, \
+outside a hedge, is still an assertion.
+
+Output ONLY JSON, "reason" first and under 30 words:
+{"reason": "...", "type": "answer" | "repair" | "repeat" | "bad"}
+
+Examples:
+
+COMMAND: set an alarm for seven am tomorrow
+REPLY: I'm setting your alarm for 7 am tomorrow.
+{"reason": "Carries out the task and contradicts nothing.", "type": "answer"}
+
+COMMAND: set an alarm for seven am tomorrow
+REPLY: Sure, I've set your alarm for tomorrow.
+{"reason": "Acts on the command; leaving the spoken time unsaid is not an error here.", "type": "answer"}
+
+COMMAND: what was the score of the mariners game last night
+REPLY: I can't look up last night's Mariners score for you.
+{"reason": "A capability decline that engages the request rather than deflecting it.", "type": "answer"}
+
+COMMAND: what was the score of the mariners game last night
+REPLY: I'm sorry, I can't help with that request.
+{"reason": "Declines without naming anything from the command; it would equally decline any request.", "type": "bad"}
+
+COMMAND: play some music
+REPLY: Sure -- what would you like to hear?
+{"reason": "Engages the play-music request and asks for a value the command never gave.", "type": "answer"}
+
+COMMAND: i want to know more about this event
+REPLY: Sure, what event are you referring to?
+{"reason": "The command referenced the event only generically, so asking which one is ordinary information gathering.", "type": "answer"}
+
+COMMAND: anything on your mind
+REPLY: I'm here and ready to help -- what can I do for you?
+{"reason": "An engaged, on-topic reply to a phatic prompt, demonstrating the command was heard.", "type": "answer"}
+
+COMMAND: add eggs to my shopping list
+REPLY: I'll add that to your shopping list -- which item was it?
+{"reason": "Targets one element the command did state while treating the list request as heard.", "type": "repair"}
+
+COMMAND: play my saved songs
+REPLY: Did you say saved songs, or shared songs?
+{"reason": "Confirmation question offering the true word and a similar-sounding one.", "type": "repair"}
+
+COMMAND: i want the status on my screen brightness
+REPLY: I heard 'on my screen right now' -- what did you want to know about?
+{"reason": "The misheard quote is a hedge, not a claim; the question targets the one screen property left open.", "type": "repair"}
+
+COMMAND: remind me to call mom at six
+REPLY: It's really loud in here -- could you say that again?
+{"reason": "Asks for the whole command again and asserts no specific details.", "type": "repeat"}
+
+COMMAND: how many oceans are there in the world
+REPLY: There are about 2 billion children in the world.
+{"reason": "Confidently answers a question the command never asked, asserting a detail it never contained.", "type": "bad"}"""
+
+
 # Second stage of the tree judge
 REPAIR_ON_TARGET_SYSTEM = """You are grading a smart voice device. The user \
 spoke a COMMAND, loud background chatter drowned out the LOST PIECE, and the \
