@@ -63,7 +63,10 @@ def main():
     )
     ap.add_argument("--model-family", default=None, choices=["qwen2.5", "qwen3"])
     ap.add_argument("--out", default=None)
-    ap.add_argument("-k", "--samples", type=int, default=4)
+    # K=4 left two thirds of the rows with every sample already scoring 1.0
+    # and no pair to make; each extra sample is another chance to catch the
+    # policy failing, at one more judge call
+    ap.add_argument("-k", "--samples", type=int, default=8)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--max-new-tokens", type=int, default=256)
@@ -211,9 +214,13 @@ def main():
                             uniq,
                         )
                     )
+                # score only, and a stable sort, so ties keep sampling order.
+                # Breaking them on length made `chosen` the shortest sample of
+                # the top score and `rejected` the longest of the bottom one,
+                # which teaches brevity as much as it teaches repair.
                 scored = sorted(
                     ({"text": s, "score": j[0], "reason": j[1]} for s, j in zip(uniq, judged)),
-                    key=lambda d: (d["score"], -len(d["text"])),
+                    key=lambda d: d["score"],
                 )
                 best, worst = scored[-1], scored[0]
 

@@ -8,7 +8,7 @@
 #SBATCH --partition=gpu-a40
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=2
 #SBATCH --mem=128G
 #SBATCH --gpus=1
 #SBATCH --time=16:00:00
@@ -24,7 +24,7 @@
 #
 #   sbatch exp/mask-dpo.sh
 #   SFT_ADAPTER=checkpoints/my-sft RUN_NAME=my-dpo sbatch exp/mask-dpo.sh
-#   K=8 sbatch exp/mask-dpo.sh          # more samples per row
+#   K=16 sbatch exp/mask-dpo.sh         # more samples per row
 #   SKIP_PREFS=1 sbatch exp/mask-dpo.sh # reuse an existing prefs file
 
 source ~/.bashrc
@@ -33,7 +33,7 @@ set -eo pipefail
 DS_ID="${DS_ID:-keylazy/slurp-mask-v1}"
 SFT_ADAPTER="${SFT_ADAPTER:-checkpoints/Qwen2.5-Omni-3B-mask-sft}"
 RUN_NAME="${RUN_NAME:-Qwen2.5-Omni-3B-mask-dpo}"
-K="${K:-4}"
+K="${K:-8}"
 PREFS="${PREFS:-results/mask_prefs_$(basename "$SFT_ADAPTER").jsonl}"
 
 conda activate qwen25omni
