@@ -4,8 +4,10 @@
 # task-response pass, but each hypothesis is scored against one key-piece
 # inventory and a piece counts lost only if all four missed it. Scored twice off
 # the one adapter -- per-kind (comparable with beam-v3) and type judge + tree
-# matrix -- with no restate prompt on either pass, since these rows were probed
-# and trained under the plain TASK_PROMPT.
+# matrix. These rows were probed and trained under the plain TASK_PROMPT, which
+# eval.sh's sent4 track no longer selects by omission -- TASK_PROMPT_TREE is
+# babble_eval_qwen.py's default now, so reproducing those runs needs an
+# explicit --plain-prompt in EVAL_FLAGS.
 
 sbatch --job-name=sent4_v1_e2e --account=sciencehub --partition=gpu-a40 \
   --nodes=1 --cpus-per-task=8 --mem=128G --gpus=1 --time=1-00:00:00 \

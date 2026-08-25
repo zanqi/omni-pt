@@ -15,7 +15,7 @@ sbatch --job-name=sent2_v1_e2e --account=sciencehub --partition=gpu-a40 \
     SENT2=1 DS_QWEN25=$DS MULTS= ./sft.sh qwen25 && \
     SENT2=1 DS_QWEN25=$DS MULTS= TAG=sent2-v1 ./eval.sh qwen25 && \
     SENT2=1 DS_QWEN25=$DS MULTS= TAG=sent2-v1-typejudge \
-      EVAL_FLAGS="--score-matrix tree --restate-prompt" ./eval.sh qwen25'
+      EVAL_FLAGS="--score-matrix tree" ./eval.sh qwen25'
 
 
 # eval only

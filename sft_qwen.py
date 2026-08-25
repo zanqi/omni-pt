@@ -330,12 +330,6 @@ def main():
         "what it heard. Restating is the default now that the answer targets "
         "are written to do it; pass this to reproduce an older adapter.",
     )
-    ap.add_argument(
-        "--restate-prompt",
-        action="store_true",
-        help="No-op, kept so existing drivers still run: TASK_PROMPT_TREE is "
-        "the default. See --plain-prompt.",
-    )
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument(
         "--kinds",

@@ -90,7 +90,7 @@ case "${ABL:-${HR:+hr}${TREE:+tree}${BEAM:+beam}${CR:+cr}${SENT2:+sent2}${SENT4:
         ADAPTER_KIND="bab-hr-adapter"; DEFAULT_TAG="hr" ;;
     tree)
         TRACK_DESC="two-pass intersection"
-        EVAL_FLAGS="--score-matrix tree --restate-prompt"
+        EVAL_FLAGS="--score-matrix tree"
         DEFAULT_QWEN25="$TREE_DS_QWEN25"; DEFAULT_QWEN3="$TREE_DS_QWEN3"
         ADAPTER_KIND="bab-tree-adapter"; DEFAULT_TAG="tree" ;;
     beam)
@@ -105,7 +105,7 @@ case "${ABL:-${HR:+hr}${TREE:+tree}${BEAM:+beam}${CR:+cr}${SENT2:+sent2}${SENT4:
         ADAPTER_KIND="bab-cr-adapter"; DEFAULT_TAG="cr" ;;
     sent2)
         TRACK_DESC="sent-loss, two witnesses"
-        EVAL_FLAGS="--judge-mode per-kind --restate-prompt"
+        EVAL_FLAGS="--judge-mode per-kind"
         DEFAULT_QWEN25="$SENT2_DS_QWEN25"; DEFAULT_QWEN3="$SENT2_DS_QWEN3"
         ADAPTER_KIND="bab-sent2-adapter"; DEFAULT_TAG="sent2" ;;
     sent4)

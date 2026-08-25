@@ -110,7 +110,7 @@ def get_audio(field):
 
 @torch.inference_mode()
 def run_model(
-    model, processor, family, audio_array, sr, max_new_tokens, heard_reply, restate
+    model, processor, family, audio_array, sr, max_new_tokens, heard_reply, plain
 ):
     """input: audio + task prompt => return: model's text reply"""
     from qwen_omni_utils import process_mm_info
@@ -136,7 +136,7 @@ def run_model(
                     # must match the prompt the adapter was trained under --
                     # evaluating an hr adapter under the plain prompt is a
                     # train/test mismatch that reads as a regression
-                    {"type": "text", "text": task_prompt(heard_reply, restate)},
+                    {"type": "text", "text": task_prompt(heard_reply, plain)},
                 ],
             }
         )
@@ -310,12 +310,6 @@ def main():
         "what it heard. Restating is the default now that the answer targets "
         "are written to do it; pass this to reproduce a run from before that, "
         "or to score a plain-prompt model on the same split.",
-    )
-    ap.add_argument(
-        "--restate-prompt",
-        action="store_true",
-        help="No-op, kept so existing drivers still run: TASK_PROMPT_TREE is "
-        "the default. See --plain-prompt.",
     )
     ap.add_argument(
         "--score-matrix",

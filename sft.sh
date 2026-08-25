@@ -66,24 +66,27 @@ if [[ -n "${HR:-}" ]]; then
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-hr-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-hr-v1"
 elif [[ -n "${TREE:-}" ]]; then
-    PROMPT_FLAG="--restate-prompt"
+    # restate prompt, which is sft_qwen.py's default -- no flag needed
     ADAPTER_KIND="bab-tree-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-tree-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-tree-v1"
 elif [[ -n "${BEAM:-}" ]]; then
-    # beam rows were probed under the plain TASK_PROMPT, so no prompt flag
+    # beam rows were probed under the plain TASK_PROMPT, and restating is
+    # the default now, so it has to be turned off explicitly
+    PROMPT_FLAG="--plain-prompt"
     ADAPTER_KIND="bab-beam-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-beam-v1"
 elif [[ -n "${SENT2:-}" ]]; then
-    # same two probe passes as the tree track, so the same restate prompt
-    PROMPT_FLAG="--restate-prompt"
+    # same two probe passes as the tree track, so the same restate prompt,
+    # which is sft_qwen.py's default -- no flag needed
     ADAPTER_KIND="bab-sent2-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-sent2-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-sent2-v1"
 elif [[ -n "${SENT4:-}" ]]; then
     # no task-response pass on this track, so its rows were probed under the
-    # plain TASK_PROMPT -- no prompt flag, same as beam
+    # plain TASK_PROMPT -- turned off explicitly, same as beam
+    PROMPT_FLAG="--plain-prompt"
     ADAPTER_KIND="bab-sent4-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-sent4-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-sent4-v1"

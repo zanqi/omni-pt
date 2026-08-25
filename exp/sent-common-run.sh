@@ -1,5 +1,5 @@
 #!/bin/bash
-# The body of exp/sent-common.sh's job -- the CRF-style comparison of four
+# The body of exp/sent-common.sh's job -- the CRF-style comparison of five
 # models on ONE common test set, run in-band so the sbatch --wrap stays
 # readable.
 #
@@ -8,7 +8,8 @@
 # base(sent4) are different numbers and the two SFT columns are not directly
 # comparable. Here every row is scored on sent2's test split:
 #
-#   base, sent2 SFT, sent4 SFT, and the white-noise (EAR-track) adapter.
+#   base, sent2 SFT, sent4 SFT, the white-noise (EAR-track) adapter, and the
+#   mask-track DPO checkpoint.
 #
 # Kinds are answer,repair only -- EAR_2 = 2*C*R/(C+R). The ear adapter's track
 # has no `repeat` rows, so including F would score it on a behavior it was
@@ -19,14 +20,23 @@
 # tree matrix (tag `sent-common-typejudge`). Numbers are comparable within a
 # judge only.
 #
-# Prompts are train-matched: only sent2 was trained to restate what it heard,
-# so it alone runs --restate-prompt; base, sent4 and ear run the plain
-# TASK_PROMPT. That asymmetry is also why the type-judge pass adds
-# --no-restate-judge: RESPONSE_TYPE_SYSTEM types a reply "answer" only if its
-# wording accounts for every key element the command spoke, which the three
-# plain-prompt models cannot satisfy by construction. The per-kind pass needs
-# no such flag -- ANSWER_JUDGE_SYSTEM already credits a reply that simply acts
-# on the command.
+# Both passes enforce restatement: an `answer` reply earns full credit only if
+# it names the command's specifics back, which is the evidence the audio got
+# through -- the only thing this benchmark measures. So the type-judge pass
+# uses RESPONSE_TYPE_SYSTEM (no --no-restate-judge), and the per-kind pass uses
+# the post-375dc9b ANSWER_JUDGE_SYSTEM, which drops a right-but-vague reply to
+# 0.5. This is the judge for the track going forward.
+#
+# That makes every row here incomparable to the sent-common files produced on
+# 2026-08-24, which were scored before the ANSWER_JUDGE_SYSTEM change and with
+# --no-restate-judge -- all five rows must be re-run together, which is why
+# MODELS defaults to all of them.
+#
+# Prompts stay train-matched: only sent4 was trained without the restatement
+# clause, so it alone runs --plain-prompt. Everything else -- including the
+# untrained base, which the judge is likewise entitled to ask for a
+# restatement from -- takes TASK_PROMPT_TREE, now babble_eval_qwen.py's
+# default, which is why only sent4 carries a prompt flag at all.
 source ~/.bashrc
 set -eo pipefail
 
@@ -57,7 +67,7 @@ run_eval() {
     name="${name##*/}"
     local out="${OUT_DIR}/bab_${name}_${tag}.jsonl"
 
-    echo "=== eval ${name} (${prompt_flag:-plain prompt}, ${tag}) on ${DS} -> ${out} ==="
+    echo "=== eval ${name} (${prompt_flag:-restate prompt}, ${tag}) on ${DS} -> ${out} ==="
     python -u babble_eval_qwen.py $judge_flags \
         --model-path Qwen/Qwen2.5-Omni-3B \
         ${adapter_path:+--adapter-path "$adapter_path"} \
@@ -75,11 +85,27 @@ run_both_judges() {
     local adapter_path="$1" prompt_flag="$2"
     run_eval "$adapter_path" "$prompt_flag" sent-common "--judge-mode per-kind"
     run_eval "$adapter_path" "$prompt_flag" sent-common-typejudge \
-        "--score-matrix tree --no-restate-judge"
+        "--score-matrix tree"
 }
 
-run_both_judges "" ""
-run_both_judges keylazy/Qwen2.5-Omni-3B-bab-sent2-sft --restate-prompt
-run_both_judges keylazy/Qwen2.5-Omni-3B-bab-sent4-sft ""
-# out-of-track reference: SFT'd on the white-noise EAR split, plain prompt
-run_both_judges keylazy/Qwen2.5-Omni-3B-ear-sft-adapter ""
+# One table row each, "<selector>|<adapter>|<prompt flag>". MODELS names the
+# subset to run -- useful for retrying a single row after a crash, but note
+# that a table mixing rows from two judge revisions is invalid, so the default
+# is all of them.
+ROWS=(
+    "base||"
+    "sent2|keylazy/Qwen2.5-Omni-3B-bab-sent2-sft|"
+    # the one adapter whose targets never restate, so it keeps TASK_PROMPT
+    "sent4|keylazy/Qwen2.5-Omni-3B-bab-sent4-sft|--plain-prompt"
+    # out-of-track reference: SFT'd on the white-noise EAR split
+    "ear|keylazy/Qwen2.5-Omni-3B-ear-sft-adapter|"
+    # mask track, SFT then DPO on the balanced prefs
+    "mask-dpo|keylazy/Qwen2.5-Omni-3B-mask-dpo-bal|"
+)
+MODELS="${MODELS:-base sent2 sent4 ear mask-dpo}"
+
+for row in "${ROWS[@]}"; do
+    IFS='|' read -r selector adapter prompt_flag <<< "$row"
+    [[ " ${MODELS} " == *" ${selector} "* ]] || continue
+    run_both_judges "$adapter" "$prompt_flag"
+done
