@@ -67,9 +67,11 @@ built yet.</p>
 <code>mask_dpo_data.py</code> (preference-pair sampler) &middot;
 <code>dpo_qwen.py</code> (DPO trainer) &middot;
 <code>mask_eval_qwen.py</code> (C/R/EAR) &middot;
-<code>exp/mask.sh</code> + <code>exp/mask-run.sh</code> (sweep driver).<br>
-<b>Hub.</b> dataset <code>keylazy/slurp-mask-v1</code>, prefs <code>keylazy/slurp-mask-dpo-v1</code>,
-adapters <code>keylazy/Qwen2.5-Omni-3B-mask-sft</code> and <code>-mask-dpo</code>.<br>
+<code>exp/mask_data.sh</code>, <code>exp/mask-sft.sh</code>, <code>exp/mask-dpo.sh</code>,
+<code>exp/mask.sh</code> (slurm drivers).<br>
+<b>Hub.</b> dataset <code>keylazy/slurp-mask-v1</code>, adapters
+<code>keylazy/Qwen2.5-Omni-3B-mask-sft</code> and <code>-mask-dpo</code>. The preference pairs stay local
+(see &sect;9).<br>
 <b>Untouched.</b> <code>babble_data.py</code>, <code>slurp_sft_data_qwen.py</code>, <code>babble_eval_qwen.py</code>
 &mdash; the new builder imports helpers from the first, the eval is a fork of the third.
 </div>
@@ -473,9 +475,12 @@ sequence logprob of chosen and rejected under it. That is <em>exactly</em> the D
 </ol>
 <p>Output columns: everything from the source row, plus <code>chosen</code>, <code>rejected</code>,
 <code>chosen_score</code>, <code>rejected_score</code>, <code>ref_logp_*</code>, <code>pair_source</code>
-(<code>"sampled"</code> | <code>"gold-chosen"</code>). Pushed to
-<code>keylazy/slurp-mask-dpo-v1</code>. Expect roughly 40&ndash;60% of train rows to survive the margin
-filter &mdash; ~1300&ndash;2000 pairs, which is a normal size for a LoRA DPO pass.</p>
+(<code>"sampled"</code> | <code>"gold-chosen"</code>), written to
+<code>results/mask_prefs_&lt;adapter&gt;.jsonl</code> and keyed by the dataset's row <code>id</code>.
+Deliberately a local file rather than a pushed dataset: the audio is already on the Hub under
+<code>--ds-id</code>, and re-uploading 3000 wavs per DPO run buys nothing &mdash; <code>dpo_qwen.py</code>
+joins the pairs back onto the audio by <code>id</code> and warns if any id has gone missing. Expect roughly
+40&ndash;60% of train rows to survive the margin filter, which is a normal size for a LoRA DPO pass.</p>
 <h2 id="s10"><span class="step-badge">10</span>DPO training</h2>
 
 <p><code>dpo_qwen.py</code>. <b>TRL is not installed in <code>qwen25omni</code></b> (peft 0.19.1,
@@ -554,7 +559,7 @@ dpo        --adapter-path checkpoints/Qwen2.5-Omni-3B-mask-dpo</code></pre></li>
 against both (&sect;6) precisely so this is legitimate.</li>
 </ul>
 
-<p><code>exp/mask.sh</code> + <code>exp/mask-run.sh</code> follow <code>exp/white-cr*.sh</code> exactly,
+<p><code>exp/mask.sh</code> follows <code>exp/white-cr*.sh</code> exactly,
 including the two habits worth keeping: fail fast if the judge box is unreachable, and <b>read the judge model
 name off <code>/v1/models</code></b> rather than trusting a default &mdash; the box gets re-served with
 different models and a mismatch is a 404 on every row, discovered ~7 minutes in.</p>
@@ -565,23 +570,20 @@ different models and a mismatch is a 404 on every row, discovered ~7 minutes in.
 sbatch /gscratch/sciencehub/zanqil/vllm_judge/vllm_judge.slurm
 
 # 1. build (qwen3omni env: dev transformers for the aligner + whisper)
-python mask_data.py --ds-id keylazy/slurp-mask-v1 --n-train 1500 --n-test 80 --ans-per-utt 1
+sbatch exp/mask_data.sh         # -> keylazy/slurp-mask-v1
 
 # 2. SFT (qwen25omni)
 sbatch exp/mask-sft.sh          # -> checkpoints/Qwen2.5-Omni-3B-mask-sft
 
 # 3. eval stage 1 -- base + SFT
-sbatch exp/mask.sh              # -> results/mask_results_*_mask-v1.jsonl
+STAGES="base sft" sbatch exp/mask.sh   # -> results/mask_results_*_mask.jsonl
 
-# 4. preference pairs from the SFT checkpoint
-python mask_dpo_data.py --ds-id keylazy/slurp-mask-v1 \
-    --adapter-path checkpoints/Qwen2.5-Omni-3B-mask-sft \
-    --out-ds-id keylazy/slurp-mask-dpo-v1 -k 4
+# 4-5. preference pairs from the SFT checkpoint, then DPO on them. One job:
+#      they share a GPU and the second is worthless without the first.
+sbatch exp/mask-dpo.sh          # -> results/mask_prefs_*.jsonl
+                                #    checkpoints/Qwen2.5-Omni-3B-mask-dpo
 
-# 5. DPO
-sbatch exp/mask-dpo.sh          # -> checkpoints/Qwen2.5-Omni-3B-mask-dpo
-
-# 6. eval stage 2 -- rerun the same sweep, now with the DPO adapter
+# 6. eval stage 2 -- the same sweep, now with the DPO adapter
 sbatch exp/mask.sh</code></pre>
 
 <p>Steps 1&ndash;3 are the checkpoint worth stopping at: if SFT does not beat base on R without losing C,

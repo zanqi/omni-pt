@@ -40,6 +40,9 @@ def load_model(
     (no talker weights) — used by babble_data.py's ASR/response probes.
     The full model is needed at eval time so PeftModel can match the
     `thinker.`-prefixed adapter keys saved by SFT.
+
+    adapter_path may be a comma-separated stack; see the loop below for when
+    that is required rather than merely convenient.
     """
     print(f"Loading {model_path} (family={family}, thinker_only={thinker_only}) ...")
 
@@ -88,9 +91,35 @@ def load_model(
     if adapter_path:
         from peft import PeftModel
 
-        print(f"attaching LoRA adapter {adapter_path} ...")
-        model = PeftModel.from_pretrained(model, adapter_path)
-        model = model.merge_and_unload()
+        # comma-separated = a stack, merged left to right. An adapter trained
+        # on top of an earlier one (dpo_qwen.py used to merge the SFT adapter
+        # down before attaching its own) still records the plain base in its
+        # adapter_config, so loading it alone silently gives back a
+        # base-shaped policy -- the earlier adapters have to go in first, in
+        # the order they were trained.
+        for path in filter(None, adapter_path.split(",")):
+            print(f"attaching LoRA adapter {path} ...")
+            model = PeftModel.from_pretrained(model, path).merge_and_unload()
 
     model.eval()
     return model, processor
+
+
+def seq_logprobs(logits, labels):
+    """Summed log-prob of each sequence's supervised tokens.
+
+    logits: (B, T, V) straight from the thinker; labels: (B, T) with -100
+    everywhere but the assistant turn, as OmniSFTCollator builds them. Shifts
+    by one so position t predicts token t+1, which is what the training loss
+    does too -- a DPO reward computed off an unshifted sum is wrong by one
+    token and silently favours whichever answer starts with a likelier word.
+
+    Shared by mask_dpo_data.py (reference logps, under the SFT model) and
+    dpo_qwen.py (policy logps, under the LoRA being trained).
+    """
+    logits = logits[:, :-1, :]
+    labels = labels[:, 1:]
+    mask = labels != -100
+    safe = labels.masked_fill(~mask, 0).unsqueeze(-1)
+    token_logp = torch.log_softmax(logits.float(), dim=-1).gather(-1, safe).squeeze(-1)
+    return (token_logp * mask).sum(dim=-1)

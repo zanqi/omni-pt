@@ -551,47 +551,55 @@ def apply_mask(parts, span, variant, rng):
         ).astype(np.float32)
 
     elif variant == "splice":
+        # Built on the main speaker alone, then the babble goes back on top:
+        # shred the clean signal, drop it in place of the key span, and add
+        # bg_only afterwards. Cutting the mixture instead would chop the babble
+        # into the same 40 ms pieces, and a bed that stutters exactly where the
+        # word went is a cue the model could key on without hearing anything.
+        src = parts["speech"]
         chunk = max(int(SPLICE_CHUNK_SEC * sr), 1)
         count = max(SPLICE_MIN_CHUNKS, round(n / chunk))
         chunk = n // count
         if chunk < 2:
             return None, {}
         xfade = min(int(SPLICE_XFADE_SEC * sr), chunk // 4)
-        # offsets come from this utterance's own audio, outside the span, so
+        # offsets come from this utterance's own speech, outside the span, so
         # the fragments carry the same voice and room as the rest of the row
-        pool = [i for i in range(0, len(bed) - chunk) if i + chunk <= start or i >= end]
+        pool = [i for i in range(0, len(src) - chunk) if i + chunk <= start or i >= end]
         if not pool:
             return None, {}
         picks, prev = [], None
         for _ in range(count):
+            # two consecutive chunks lifted from adjacent offsets would rebuild
+            # a real word, which is the one thing this mask must not do
             off = rng.choice(pool)
             for _ in range(4):
-                # two consecutive chunks lifted from adjacent offsets would
-                # rebuild a real word, which is the one thing this mask must
-                # not do
                 if prev is None or abs(off - (prev + chunk)) >= chunk:
                     break
                 off = rng.choice(pool)
             picks.append(off)
             prev = off
-        shred = np.concatenate([bed[o : o + chunk] for o in picks])
+        shred = np.concatenate([src[o : o + chunk] for o in picks])
         if xfade:
             fade = ramp(xfade)
             for i in range(1, count):
                 edge = i * chunk
                 shred[edge : edge + xfade] = (
                     shred[edge : edge + xfade] * fade
-                    + bed[picks[i - 1] + chunk - xfade : picks[i - 1] + chunk] * (1 - fade)
+                    + src[picks[i - 1] + chunk - xfade : picks[i - 1] + chunk] * (1 - fade)
                 )
         shred = np.pad(shred, (0, n - len(shred)), "wrap")[:n]
-        rms = float(np.sqrt(np.mean(bed[start:end] ** 2)))
+        rms = float(np.sqrt(np.mean(src[start:end] ** 2)))
         shred_rms = max(float(np.sqrt(np.mean(shred**2))), 1e-6)
         shred = shred * (rms / shred_rms)
         edge = min(xfade * 4, n // 2)
         blend = np.ones(n, dtype=np.float32)
         blend[:edge] = ramp(edge)
         blend[n - edge :] = ramp(edge)[::-1]
-        out[start:end] = blend * shred + (1 - blend) * bed[start:end]
+        spliced = src.copy()
+        spliced[start:end] = blend * shred + (1 - blend) * src[start:end]
+        # the babble bed is untouched and continuous across the span
+        out = spliced + parts["bg_only"]
         meta["splice_n"] = count
 
     elif variant == "burst":
