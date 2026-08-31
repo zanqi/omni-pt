@@ -1,0 +1,1076 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ft-asr track &mdash; part 1: the ASR adapter</title>
+<style>
+  :root{
+    color-scheme: light dark;
+    --bg:#fbfbfc; --fg:#16171b; --muted:#5f6169; --rule:#e2e3e8;
+    --code-bg:#f2f3f6; --card:#fff; --accent:#0b6cff; --accent2:#8a3ffc;
+    --ok:#0f7b3f; --bad:#c62828; --warn:#a35c00;
+    --add-bg:#e8f7ec; --add-fg:#0f7b3f; --del-bg:#fdecec; --del-fg:#c62828;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#101116; --fg:#e9eaee; --muted:#9b9da6; --rule:#2c2e36;
+      --code-bg:#191b21; --card:#161820; --accent:#63a4ff; --accent2:#b794ff;
+      --ok:#57d081; --bad:#ff7b72; --warn:#e0a458;
+      --add-bg:#12291a; --add-fg:#57d081; --del-bg:#2a1414; --del-fg:#ff7b72;}
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);margin:0;
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:2rem 1.4rem 6rem}
+  h1{font-size:1.8rem;margin:.2rem 0 .3rem;letter-spacing:-.01em}
+  h2{font-size:1.22rem;margin:3rem 0 .8rem;padding-bottom:.35rem;border-bottom:1px solid var(--rule)}
+  h3{font-size:1rem;margin:1.7rem 0 .5rem;color:var(--accent2)}
+  p{margin:.7rem 0}
+  a{color:var(--accent)}
+  .sub{color:var(--muted);margin-top:0;font-size:1.02rem}
+  code,pre,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  code{background:var(--code-bg);padding:.1em .35em;border-radius:4px;font-size:.86em}
+  pre{background:var(--code-bg);border:1px solid var(--rule);border-radius:9px;
+    padding:.85rem 1rem;overflow-x:auto;font-size:.8rem;line-height:1.52;margin:.6rem 0}
+  pre code{background:none;padding:0;font-size:1em}
+  .cb{position:relative}
+  .cb .copy{position:absolute;top:.45rem;right:.45rem;font-size:.68rem;
+    background:var(--card);color:var(--muted);border:1px solid var(--rule);
+    border-radius:5px;padding:.18rem .45rem;cursor:pointer;opacity:.65}
+  .cb:hover .copy{opacity:1}
+  .cb .copy.done{color:var(--ok);border-color:var(--ok)}
+  table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.88rem}
+  th,td{border:1px solid var(--rule);padding:.42rem .6rem;text-align:left;vertical-align:top}
+  th{background:var(--code-bg);font-weight:600}
+  .card{background:var(--card);border:1px solid var(--rule);border-radius:11px;
+    padding:.95rem 1.15rem;margin:1.1rem 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:.8rem}
+  @media (max-width:860px){.grid2,.grid3{grid-template-columns:1fr}}
+  .tag{display:inline-block;font-size:.68rem;letter-spacing:.04em;text-transform:uppercase;
+    padding:.14rem .45rem;border-radius:5px;border:1px solid var(--rule);color:var(--muted);
+    background:var(--code-bg);vertical-align:middle}
+  .tag.new{color:var(--ok);border-color:var(--ok)}
+  .tag.edit{color:var(--warn);border-color:var(--warn)}
+  .tag.gate{color:var(--bad);border-color:var(--bad)}
+  .diff{display:grid;grid-template-columns:1fr 1fr;gap:.7rem;margin:.7rem 0}
+  @media (max-width:860px){.diff{grid-template-columns:1fr}}
+  .diff .pane{border:1px solid var(--rule);border-radius:9px;overflow:hidden}
+  .diff .hd{font-size:.72rem;padding:.3rem .6rem;background:var(--code-bg);
+    border-bottom:1px solid var(--rule);color:var(--muted);font-family:ui-monospace,monospace}
+  .diff .pane.before .hd{color:var(--del-fg)}
+  .diff .pane.after  .hd{color:var(--add-fg)}
+  .diff pre{margin:0;border:0;border-radius:0;background:transparent}
+  ins{background:var(--add-bg);color:var(--add-fg);text-decoration:none;display:block}
+  del{background:var(--del-bg);color:var(--del-fg);text-decoration:none;display:block}
+  details{border:1px solid var(--rule);border-radius:9px;padding:.55rem .85rem;margin:.8rem 0;background:var(--card)}
+  details>summary{cursor:pointer;font-size:.9rem;color:var(--accent2);font-weight:600}
+  details[open]>summary{margin-bottom:.5rem}
+  .why{border-left:3px solid var(--accent2);padding-left:.85rem;color:var(--muted);font-size:.92rem;margin:.7rem 0}
+  .risk{border-left:3px solid var(--bad);padding-left:.85rem;font-size:.92rem;margin:.7rem 0}
+  ol.steps{list-style:none;padding:0;margin:0}
+  ol.steps li{display:flex;gap:.6rem;align-items:flex-start;padding:.32rem 0;
+    border-bottom:1px dashed var(--rule);font-size:.9rem}
+  ol.steps li:last-child{border-bottom:0}
+  ol.steps input{margin-top:.35rem;width:1.05em;height:1.05em;flex:0 0 auto;accent-color:var(--accent)}
+  ol.steps label{cursor:pointer}
+  ol.steps li.done label{opacity:.45;text-decoration:line-through}
+  .chk-wrap{position:sticky;top:0;z-index:5;background:var(--bg);padding-top:.5rem}
+  .bar{height:5px;background:var(--rule);border-radius:99px;overflow:hidden;margin:.4rem 0 .1rem}
+  .bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+  .flow{width:100%;height:auto}
+  .flow text{font:11px ui-monospace,monospace;fill:currentColor}
+  .flow .lbl{font:10px -apple-system,sans-serif;fill:var(--muted)}
+  footer{margin-top:4rem;border-top:1px solid var(--rule);padding-top:1rem;color:var(--muted);font-size:.85rem}
+  .nav{display:flex;gap:.8rem;flex-wrap:wrap;font-size:.85rem;margin:.8rem 0 0}
+  .nav a{padding:.25rem .6rem;border:1px solid var(--rule);border-radius:7px;text-decoration:none;background:var(--card)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>ft-asr track &mdash; part 1: build the ASR adapter</h1>
+<p class="sub">Improve <code>--sent-4</code> by replacing the witness generator. The labeler's four beam
+hypotheses currently come from the <em>untuned</em> base omni model; here a LoRA is fine-tuned to do ASR
+and nothing else, and that adapter produces the hypotheses the key-piece loss labels are derived from.
+Everything downstream (SFT prompt, judge, metric) is held fixed, so a change in EAR is attributable to
+label quality.</p>
+
+<div class="nav">
+  <a href="ft-asr.html"><b>Part 1</b> &middot; ASR data + adapter (steps 0&ndash;5)</a>
+  <a href="ft-asr-2.html">Part 2 &middot; witness swap, gate, sent4-v2 (steps 6&ndash;12)</a>
+</div>
+
+<h2 id="decisions">Decisions on record</h2>
+<div class="grid2">
+<div class="card">
+<b>ASR training data</b> &mdash; fresh mixes, uniform SNR.<br>
+<span class="muted">Not a reuse of sent4-v1 rows: those SNRs are clumped into the kind bands, and their
+sentences are the ones the labels get built from. A new set over SLURP <code>devel</code> is both
+better-conditioned and leakage-free (see <a href="#leak">&sect;leakage</a>).</span>
+</div>
+<div class="card">
+<b>Beam diversity</b> &mdash; keep 4 beams, but measure the collapse.<br>
+<span class="muted">Fine-tuned ASR models often return four identical beams, which silently turns
+&ldquo;lost only if every witness missed it&rdquo; into a one-witness rule. Step&nbsp;8 in part 2 is a hard
+gate on that number.</span>
+</div>
+<div class="card">
+<b>Scope</b> &mdash; labeler only.<br>
+<span class="muted"><code>sft_qwen.py</code> and <code>babble_eval_qwen.py</code> keep running the
+unmodified base model. One variable moves.</span>
+</div>
+<div class="card">
+<b>Config</b> &mdash; one track YAML, every stage reads it.<br>
+<span class="muted"><code>configs/ft-asr.yaml</code>. Additive: the <code>HR=/TREE=/SENT4=</code> env-var
+paths in <code>sft.sh</code>, <code>eval.sh</code>, <code>babble_data.sh</code> are not touched, so no
+existing track's argv changes.</span>
+</div>
+</div>
+
+<h2 id="pipeline">Where the adapter plugs in</h2>
+<p>The only structural change is the box in red. Read the two columns against each other &mdash; every
+other stage is byte-identical to the sent4-v1 run.</p>
+
+<svg class="flow" viewBox="0 0 1120 400" role="img" aria-label="sent4-v1 versus ft-asr pipeline">
+  <style>
+    .bx{fill:var(--card);stroke:var(--rule);stroke-width:1.4;rx:8}
+    .hot{stroke:var(--bad);stroke-width:2}
+    .new{stroke:var(--ok);stroke-width:2;stroke-dasharray:4 3}
+    .ar{stroke:var(--muted);stroke-width:1.3;fill:none;marker-end:url(#a)}
+    .arh{stroke:var(--bad);stroke-width:1.8;fill:none;marker-end:url(#ah)}
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L8 4 L0 8 z" fill="var(--muted)"/></marker>
+    <marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L8 4 L0 8 z" fill="var(--bad)"/></marker>
+  </defs>
+
+  <text x="20" y="24" class="lbl">sent4-v1 (today)</text>
+  <rect class="bx" x="20" y="36" width="150" height="40"/><text x="34" y="61">SLURP train</text>
+  <path class="ar" d="M95 78 V 100"/>
+  <rect class="bx hot" x="20" y="102" width="150" height="52"/>
+  <text x="34" y="124">base omni</text><text x="34" y="140" class="lbl">4 beams (ASR pass)</text>
+  <path class="ar" d="M95 156 V 178"/>
+  <rect class="bx" x="20" y="180" width="150" height="52"/>
+  <text x="34" y="202">sent-loss labeler</text><text x="34" y="218" class="lbl">vLLM, 2-stage</text>
+  <path class="ar" d="M95 234 V 256"/>
+  <rect class="bx" x="20" y="258" width="150" height="40"/><text x="34" y="283">sent4-v1 ds</text>
+  <path class="ar" d="M95 300 V 322"/>
+  <rect class="bx" x="20" y="324" width="150" height="40"/><text x="34" y="349">SFT + eval</text>
+
+  <line x1="215" y1="20" x2="215" y2="380" stroke="var(--rule)" stroke-dasharray="3 4"/>
+
+  <text x="260" y="24" class="lbl">ft-asr (this plan) &mdash; new stage 0 feeds the same pipeline</text>
+
+  <rect class="bx new" x="260" y="36" width="160" height="40"/><text x="274" y="61">SLURP devel</text>
+  <text x="274" y="90" class="lbl">8,690 recordings &mdash;</text>
+  <text x="274" y="103" class="lbl">a split babble_data</text>
+  <text x="274" y="116" class="lbl">never reads</text>
+  <path class="ar" d="M340 78 V 128"/>
+  <rect class="bx new" x="260" y="130" width="160" height="52"/>
+  <text x="274" y="152">asr_data.py</text><text x="274" y="168" class="lbl">uniform SNR 0&ndash;20 dB</text>
+  <path class="ar" d="M340 184 V 206"/>
+  <rect class="bx new" x="260" y="208" width="160" height="52"/>
+  <text x="274" y="230">sft_qwen.py</text><text x="274" y="246" class="lbl">--task asr</text>
+  <path class="ar" d="M340 262 V 284"/>
+  <rect class="bx new" x="260" y="286" width="160" height="52"/>
+  <text x="274" y="308">ASR LoRA</text><text x="274" y="324" class="lbl">thinker-prefixed keys</text>
+
+  <path class="arh" d="M424 312 H 520 V 148 H 596"/>
+  <text x="440" y="300" class="lbl">attached for the ASR pass only</text>
+
+  <rect class="bx" x="600" y="36" width="170" height="40"/><text x="614" y="61">SLURP train</text>
+  <path class="ar" d="M685 78 V 100"/>
+  <rect class="bx hot" x="600" y="102" width="170" height="52"/>
+  <text x="614" y="124">base + ASR LoRA</text><text x="614" y="140" class="lbl">4 beams (ASR pass)</text>
+  <path class="ar" d="M685 156 V 178"/>
+  <rect class="bx" x="600" y="180" width="170" height="52"/>
+  <text x="614" y="202">sent-loss labeler</text><text x="614" y="218" class="lbl">unchanged</text>
+  <path class="ar" d="M685 234 V 256"/>
+  <rect class="bx" x="600" y="258" width="170" height="40"/><text x="614" y="283">sent4-ftasr-v1</text>
+  <path class="ar" d="M685 300 V 322"/>
+  <rect class="bx" x="600" y="324" width="170" height="40"/><text x="614" y="349">SFT + eval</text>
+  <text x="614" y="382" class="lbl">base weights, restate prompt, per-kind judge &mdash; all held fixed</text>
+
+  <rect class="bx" x="820" y="102" width="270" height="140" fill="none"/>
+  <text x="836" y="124">held fixed vs sent4-v1</text>
+  <text x="836" y="146" class="lbl">&bull; ASR_PROMPT / ASR_SYSTEM_PROMPT</text>
+  <text x="836" y="162" class="lbl">&bull; 4 beams, ASR_MAX_NEW_TOKENS=64</text>
+  <text x="836" y="178" class="lbl">&bull; the two-stage sent labeler + prompts</text>
+  <text x="836" y="194" class="lbl">&bull; SNR bands, MAX_PROBES, seeds</text>
+  <text x="836" y="210" class="lbl">&bull; TASK_PROMPT (plain) at SFT + eval</text>
+  <text x="836" y="226" class="lbl">&bull; per-kind judges, EAR = 3CRF/(CR+CF+RF)</text>
+</svg>
+
+<h2 id="files">File inventory</h2>
+<table>
+<tr><th>File</th><th></th><th>What happens to it</th></tr>
+<tr><td><code>configs/ft-asr.yaml</code></td><td><span class="tag new">new</span></td>
+<td>The whole track in one flat file. Read by all six invocations.</td></tr>
+<tr><td><code>asr_data.py</code></td><td><span class="tag new">new</span></td>
+<td>Uniform-SNR babble mixes over SLURP <code>devel</code>. No GPU, no LLM &mdash; runs on a CPU node.</td></tr>
+<tr><td><code>asr_eval_qwen.py</code></td><td><span class="tag new">new</span></td>
+<td>WER + beam-diversity diagnostic. This is the gate in step&nbsp;8, so it deliberately does not import
+<code>babble_data</code> and does not need the vLLM box up.</td></tr>
+<tr><td><code>exp/ft-asr.sh</code>, <code>exp/ft-asr-run.sh</code></td><td><span class="tag new">new</span></td>
+<td>Two sbatch drivers, split at the gate.</td></tr>
+<tr><td><code>util.py</code></td><td><span class="tag edit">edit</span></td>
+<td><code>load_config()</code>; and <code>load_model</code> learns to attach a
+<code>thinker.</code>-prefixed adapter to a <code>thinker_only</code> model (part 2, step 6 &mdash; this is
+the one real trap).</td></tr>
+<tr><td><code>prompts.py</code></td><td><span class="tag edit">edit</span></td>
+<td><code>ASR_SYSTEM_PROMPT</code> / <code>ASR_PROMPT</code> move here from <code>babble_data.py</code> so
+<code>sft_qwen.py</code> can import them without pulling in the OpenAI client.</td></tr>
+<tr><td><code>sft_qwen.py</code></td><td><span class="tag edit">edit</span></td>
+<td><code>--task asr</code> (prompt swap only) and <code>--config</code>.</td></tr>
+<tr><td><code>babble_data.py</code></td><td><span class="tag edit">edit</span></td>
+<td><code>--asr-adapter</code>, <code>--config</code>, and a guard so the adapter can't be used on a track
+where it would also write the task response.</td></tr>
+<tr><td><code>sft.sh</code>, <code>eval.sh</code>, <code>babble_data.sh</code></td><td><span class="tag">untouched</span></td>
+<td>Every existing track keeps its exact argv. The new track bypasses them.</td></tr>
+</table>
+
+<h2 id="checklist">Progress</h2>
+<p class="muted" style="font-size:.9rem">Ticks are stored in this browser (<code>localStorage</code>), so
+you can close the tab between steps. Steps 6&ndash;12 live in <a href="ft-asr-2.html">part 2</a>.</p>
+<div class="chk-wrap">
+<div class="bar"><i id="pbar"></i></div>
+<div class="muted" style="font-size:.8rem" id="pcount"></div>
+</div>
+<ol class="steps" id="chk">
+  <li><input type="checkbox" id="s0"><label for="s0"><b>0</b> &mdash; preflight: confirm <code>devel</code> shares no sentence with <code>train</code>/<code>test</code></label></li>
+  <li><input type="checkbox" id="s1"><label for="s1"><b>1</b> &mdash; <code>configs/ft-asr.yaml</code> + <code>util.load_config</code></label></li>
+  <li><input type="checkbox" id="s2"><label for="s2"><b>2</b> &mdash; move the two ASR prompts into <code>prompts.py</code></label></li>
+  <li><input type="checkbox" id="s3"><label for="s3"><b>3</b> &mdash; write <code>asr_data.py</code> and build the dataset</label></li>
+  <li><input type="checkbox" id="s4"><label for="s4"><b>4</b> &mdash; <code>sft_qwen.py</code>: <code>--task asr</code> + <code>--config</code></label></li>
+  <li><input type="checkbox" id="s5"><label for="s5"><b>5</b> &mdash; train the ASR LoRA</label></li>
+  <li><input type="checkbox" id="s6"><label for="s6"><b>6</b> &mdash; <code>util.load_model</code>: thinker-only adapter attach <span class="muted">(part 2)</span></label></li>
+  <li><input type="checkbox" id="s7"><label for="s7"><b>7</b> &mdash; <code>asr_eval_qwen.py</code>: WER + diversity, base vs adapter <span class="muted">(part 2)</span></label></li>
+  <li><input type="checkbox" id="s8"><label for="s8"><b>8</b> &mdash; <span class="tag gate">gate</span> read the numbers, pick the witness scheme <span class="muted">(part 2)</span></label></li>
+  <li><input type="checkbox" id="s9"><label for="s9"><b>9</b> &mdash; <code>babble_data.py</code>: <code>--asr-adapter</code> + <code>--config</code> <span class="muted">(part 2)</span></label></li>
+  <li><input type="checkbox" id="s10"><label for="s10"><b>10</b> &mdash; build <code>sent4-ftasr-v1</code>, diff the label distribution <span class="muted">(part 2)</span></label></li>
+  <li><input type="checkbox" id="s11"><label for="s11"><b>11</b> &mdash; SFT + eval the new adapter <span class="muted">(part 2)</span></label></li>
+  <li><input type="checkbox" id="s12"><label for="s12"><b>12</b> &mdash; read the outcome off the interpretation matrix <span class="muted">(part 2)</span></label></li>
+</ol>
+
+<h2 id="leak">Step 0 &mdash; preflight: is <code>devel</code> really disjoint?</h2>
+<p>The whole leakage argument rests on one claim: <code>babble_data.py</code> only ever reads SLURP
+<code>train</code> and <code>test</code> (<a href="../babble_data.py">babble_data.py</a>: <code>build_triplets("test", …)</code>,
+<code>build_triplets("train", …)</code>, <code>collect_babble_pool</code>), so an adapter trained on
+<code>devel</code> has heard neither the sentences its witnesses will be judged on nor the ones the
+sent-4 labels are derived from. SLURP partitions by prompt, so this <em>should</em> hold on sentences too.
+Verify before spending a GPU hour on it.</p>
+
+<div class="card"><b>Splits, from the dataset builder</b> &mdash;
+<code>train 50,628</code> &middot; <code>devel 8,690</code> &middot; <code>test 13,078</code> &middot;
+<code>train_synthetic 69,253</code> recordings. <code>devel</code> is the only real-speech split nothing
+else in the repo touches.</div>
+
+<div class="cb"><pre><code>conda activate qwen25omni
+python - &lt;&lt;'PY'
+from datasets import load_dataset
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
+
+N = BasicTextNormalizer()
+sets = {}
+for split in ("devel", "train", "test"):
+    ids, sents = set(), set()
+    # column projection: the parquet reader skips the audio bytes entirely,
+    # so this is minutes, not a 4 GB download
+    stream = load_dataset("qmeeus/slurp", split=split, streaming=True)
+    for r in stream.select_columns(["slurp_id", "sentence"]):
+        ids.add(r["slurp_id"])
+        sents.add(N(r["sentence"]).strip())
+    sets[split] = (ids, sents)
+    print(f"{split:6s} ids={len(ids):6d} distinct-sentences={len(sents):6d}")
+
+for other in ("train", "test"):
+    di, ds = sets["devel"]
+    oi, os_ = sets[other]
+    print(f"devel &cap; {other:5s}: ids={len(di &amp; oi)} sentences={len(ds &amp; os_)}")
+PY</code></pre></div>
+
+<table>
+<tr><th>Result</th><th>What to do</th></tr>
+<tr><td><code>ids=0 sentences=0</code> for both</td><td>Proceed. Nothing to exclude, and the plan's
+<code>configs/ft-asr.yaml</code> is correct as written.</td></tr>
+<tr><td><code>ids=0</code>, <code>sentences=N&gt;0</code></td><td>Prompt text is shared across splits.
+Add the overlapping normalized sentences to an exclusion set in <code>asr_data.py</code> (a
+<code>--exclude-split test</code> flag that builds the set exactly as above and skips matching
+utterances). Overlap with <code>train</code> is the milder problem &mdash; it biases the labels of the
+<em>train</em> rows optimistically; overlap with <code>test</code> is the fatal one, because the babble
+test split is where EAR is measured.</td></tr>
+<tr><td><code>ids&gt;0</code></td><td>Stop &mdash; the splits are not what the repo assumes anywhere, and
+several existing dedupe arguments (CLAUDE.md's <code>slurp_id</code> note) need revisiting first.</td></tr>
+</table>
+
+<details><summary>Why not just reuse the sent4-v1 train rows, which already carry noisy audio + a clean sentence?</summary>
+<p>Two reasons, one methodological and one about conditioning.</p>
+<p><b>Leakage.</b> Those rows are drawn from SLURP <code>train</code>, which is exactly the pool
+<code>build_triplets("train", …)</code> draws the sent4-v2 rows from. The ASR adapter would have memorized
+the sentences whose key pieces it is then asked to witness. Its transcripts on train rows would look
+better than they are, pieces would read as recovered, and the label distribution would shift toward
+<code>answer</code> for a reason that has nothing to do with hearing.</p>
+<p><b>Conditioning.</b> The sent4 SNRs are clumped into the three kind bands
+(<code>SLOT_SNR_DISJOINT</code>: 12&ndash;20 / 5&ndash;12 / 0&ndash;5&nbsp;dB) and 25% of the answer rows are
+clean. An ASR model trained on that mixture sees a trimodal noise distribution; a uniform 0&ndash;20&nbsp;dB
+sweep is the right training distribution for a model whose job is to be honest at every SNR.</p>
+</details>
+
+<h2 id="s1">Step 1 &mdash; the track config</h2>
+<h3><code>configs/ft-asr.yaml</code> <span class="tag new">new</span></h3>
+<p>One flat file, unique keys, the whole track. Every value a stage needs is written here
+<em>explicitly</em> rather than inherited from a script default &mdash; that is the point: sent4-v1's
+reproduction broke because
+<a href="../exp/sent-4.sh#L6">its prompt lived in a Python default that later moved</a>. A value written
+in this file stays right no matter what the default becomes.</p>
+<p>Every key has exactly one field and exactly one CLI flag that overrides it &mdash; no renaming, no
+merging, no prefix rules in the loader. The only structural wrinkle is that <code>sft_qwen.py</code> runs
+twice off the file (the ASR witness adapter, then the repair adapter), so the four values that differ
+between its two runs are spelled both ways &mdash; <code>asr_epochs</code> and <code>epochs</code> &mdash;
+and <code>--task</code> decides which set that script reads. That decision lives in
+<code>sft_qwen.py</code>, where the two runs are, and nowhere else.</p>
+
+<div class="cb"><pre><code>mkdir -p configs</code></pre></div>
+<div class="cb"><pre><code># ft-asr track -- the whole track in one flat file, read by every stage:
+#
+#   python asr_data.py            --config configs/ft-asr.yaml   # ASR train set
+#   python sft_qwen.py --task asr --config configs/ft-asr.yaml   # ASR LoRA
+#   python asr_eval_qwen.py       --config configs/ft-asr.yaml --tag base
+#   python babble_data.py         --config configs/ft-asr.yaml   # sent-4 build
+#   python sft_qwen.py            --config configs/ft-asr.yaml   # repair LoRA
+#   python babble_eval_qwen.py    --config configs/ft-asr.yaml
+#
+
+# Model
+omni_path: Qwen/Qwen2.5-Omni-3B
+
+prompt: restate
+
+# --- the ASR witness ---
+
+# its dataset (asr_data.py)
+asr_ds_id: keylazy/slurp-asr-bab-devel-v1
+slurp_split: devel
+n_rows: 8000
+snr_db: [0.0, 20.0]
+clean_prob: 0.15
+draws_per_utt: 1
+test_every: 20       # hash(slurp_id) % 20 == 0 -&gt; held out for WER
+
+# its LoRA (sft_qwen.py --task asr)
+asr_run_name: Qwen2.5-Omni-3B-asr-sft
+asr_epochs: 2
+asr_lr: 1.0e-4       # half the repair lr: the target is a verbatim transcript,
+                     # and 2e-4 on 8K rows overfits devel fast
+asr_batch_size: 16
+asr_adapter: checkpoints/Qwen2.5-Omni-3B-asr-sft
+
+# its diagnostic, the gate (asr_eval_qwen.py) -- steps/ft-asr-2.html step 8
+n_best: 4            # the probe's ASR_N_BEST
+sample_temp: 0.0     # &gt;0 replaces beam search with K samples (the fallback)
+
+# --- the sent-4 track that consumes it ---
+
+# the build (babble_data.py)
+label: sent-4
+ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent4-ftasr-v1
+n_train: 1000
+n_test: 100          # -&gt; a 300-row test split; every eval pass judges all of it
+n_extra_ans: 1000
+
+# the repair LoRA (sft_qwen.py)
+run_name: Qwen2.5-Omni-3B-bab-sent4ft-sft
+epochs: 3
+lr: 2.0e-4
+
+# the eval (babble_eval_qwen.py). Per-kind judges, so C and R stay comparable
+# with the beam rows in results/viz.ipynb; the type judge + tree matrix is a
+# second pass with its own tag (see exp/ft-asr-run.sh).
+judge_mode: per-kind
+kinds: answer,repair,repeat
+num_rows: -1
+tag: sent4-ftasr</code></pre></div>
+
+<h3><code>util.py</code>: <code>load_config</code> <span class="tag edit">edit</span></h3>
+<p>Six call sites, so it belongs at module level (CLAUDE.md's rule). Each stage declares its own
+<code>@dataclass Config</code> &mdash; the stage's surface and its defaults in one readable block &mdash;
+and this builds one from the flat file. <b>Field names are the YAML key names</b>, so there is no mapping
+table to drift out of sync.</p>
+<p>Add <code>import os</code> at the top of <a href="../util.py">util.py</a> too &mdash; step 6 needs it.</p>
+
+<div class="diff">
+<div class="pane before"><div class="hd">util.py &mdash; before</div>
+<pre><code>import torch
+
+# Default system prompt from the Qwen2.5-Omni HF page.</code></pre></div>
+<div class="pane after"><div class="hd">util.py &mdash; after</div>
+<pre><code><ins>import dataclasses
+import os
+</ins>import torch
+
+# Default system prompt from the Qwen2.5-Omni HF page.</code></pre></div>
+</div>
+
+<div class="cb"><pre><code># --- appended to util.py ---
+
+def load_config(path, cls):
+    """Build a stage's config dataclass from a flat track YAML.
+
+    Three layers, each overriding the one before: the dataclass holds the
+    defaults, the file overrides them, and the CLI overrides the file (see any
+    stage's __main__). The dataclass is the only place a default is written --
+    argparse holds none, so there is nothing to keep in sync.
+
+    Field names are the YAML key names. Keys a stage does not declare are not
+    its business: one flat file serves the whole track, so every stage reads
+    the handful it declares and ignores the rest. A script that needs two sets
+    of the same value declares both and picks between them itself -- that
+    choice belongs to the script, not here.
+    """
+    import yaml  # only the config path needs it; keep it off the import cost
+                 # of every training job that doesn't pass --config
+
+    with open(path) as f:
+        raw = yaml.safe_load(f) or {}
+    names = {f.name for f in dataclasses.fields(cls)}
+    return cls(**{k: v for k, v in raw.items() if k in names})</code></pre></div>
+
+<h3>The shape every stage's <code>__main__</code> uses</h3>
+<p>One structure, four scripts. The config object is resolved first and the CLI overrides it &mdash; the
+CLI does not set argparse defaults.</p>
+
+<div class="cb"><pre><code>@dataclass
+class Config:
+    """This stage's surface. The ONLY place a default is written."""
+    ds_id: str = "keylazy/slurp-asr-bab-devel-v1"
+    n_rows: int = 8000
+    ...
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config")
+    # EVERY flag defaults to None. That is not cosmetic: it is the only way
+    # argparse can tell "absent" from "passed a value that happens to equal the
+    # default", and the override loop below keys on exactly that distinction.
+    ap.add_argument("--ds-id", default=None)
+    ap.add_argument("--n-rows", type=int, default=None)
+    # a bare store_true would default to False, which reads as "passed" and
+    # would silently overwrite the file on every run
+    ap.add_argument("--no-push", action="store_true", default=None)
+    args = ap.parse_args()
+
+    cfg = load_config(args.config, Config) if args.config else Config()
+    for key, value in vars(args).items():
+        if value is not None and key != "config":
+            setattr(cfg, key, value)
+
+    main(cfg)</code></pre></div>
+
+<div class="why"><b>One helper, three layers.</b> <code>load_config</code> is the only config function
+in <code>util.py</code>: it reads the file, and the loop above applies the CLI on top. Defaults live in
+one typed block per stage instead of thirty <code>default=</code> kwargs scattered down a parser, and
+<code>main(cfg)</code> stays callable from a notebook or another script with a hand-built
+<code>Config</code>. The cost is the discipline above &mdash; every flag must say
+<code>default=None</code>, including the booleans, or the override loop treats an absent flag as a passed
+one.</div>
+
+<div class="risk"><b>The one sharp edge: booleans only turn on.</b> With
+<code>action="store_true", default=None</code>, a flag can override <code>False</code> in the file but
+nothing can override <code>True</code> from the CLI. Where that matters, use
+<code>action=argparse.BooleanOptionalAction, default=None</code> (Python&nbsp;3.9+), which gives you both
+<code>--push</code> and <code>--no-push</code> off one declaration and still reports <code>None</code>
+when neither is passed.</div>
+
+<div class="risk"><b>A misspelled key is inert &mdash; read the resolved config.</b> That is the price
+of one flat file serving six invocations: each stage legitimately ignores 15&ndash;20 keys that belong to
+the others, so there is no per-stage list of &ldquo;unknown&rdquo; keys worth printing &mdash; a typo would
+be buried in it. What catches it instead is <code>log(f"config: {cfg}")</code> right after the override
+loop: a typo'd key leaves its field sitting at the dataclass default, visible in one line at the top of
+every log. Read it on the first run of each stage.</div>
+
+<div class="risk"><b>Moving an existing script's defaults is the risky part.</b> For
+<code>sft_qwen.py</code> and <code>babble_data.py</code>, every current <code>default=</code> has to be
+transcribed into the dataclass <em>exactly</em> &mdash; miss one and an existing track's behaviour changes
+even though nothing about its command line did, which is the one thing this plan promised not to do. Do
+the move by diffing, not by memory, and log the resolved config on startup so the first run of each
+existing track shows its own settings:
+<div class="cb"><pre><code># every default that must appear in the dataclass, listed from the file itself
+git show HEAD:sft_qwen.py | grep -n "add_argument" -A2 | grep "default="
+# then, on the first run of an existing track:
+#   log(f"config: {cfg}")   <- add this right after the override loop
+MULTS= SENT2=1 ./sft.sh qwen25   # read the printed config against sft.sh's flags</code></pre></div>
+</div>
+
+<h2 id="s2">Step 2 &mdash; move the two ASR prompts into <code>prompts.py</code></h2>
+<p><code>sft_qwen.py</code> needs the exact prompt pair the probe uses, and it must not import
+<code>babble_data</code> to get it &mdash; that module opens <code>VLLM_HOST_FILE</code> and constructs an
+<code>OpenAI</code> client at import time, which would make every training job depend on the judge box
+being up. <code>prompts.py</code> is where <code>TASK_PROMPT</code> already lives.</p>
+
+<div class="diff">
+<div class="pane before"><div class="hd">babble_data.py:152 &mdash; before</div>
+<pre><code>ASR_SYSTEM_PROMPT = "You are a speech recognition model."
+ASR_PROMPT = "Transcribe the English audio into text without any punctuation marks."  # from Qwen2.5-Omni github cookbooks
+
+
+def _conv(audio, system_prompt, user_prompt):</code></pre></div>
+<div class="pane after"><div class="hd">babble_data.py:152 &mdash; after</div>
+<pre><code><del>ASR_SYSTEM_PROMPT = "You are a speech recognition model."
+ASR_PROMPT = "Transcribe the English audio ..."
+</del>
+
+def _conv(audio, system_prompt, user_prompt):</code></pre></div>
+</div>
+
+<p>Add both to the import block already at the top of <code>babble_data.py</code> (it imports from
+<code>prompts</code> at line 24), and paste the two constants into <code>prompts.py</code> next to
+<code>TASK_PROMPT</code>:</p>
+
+<div class="cb"><pre><code># --- prompts.py, beside TASK_PROMPT ---
+
+# The ASR probe pair. Lives here rather than in babble_data.py because
+# sft_qwen.py --task asr must train under the byte-identical prompt the probe
+# will later decode with: an ASR adapter trained on a different framing is a
+# train/probe mismatch that reads as a worse witness.
+ASR_SYSTEM_PROMPT = "You are a speech recognition model."
+ASR_PROMPT = "Transcribe the English audio into text without any punctuation marks."  # from Qwen2.5-Omni github cookbooks</code></pre></div>
+
+<div class="cb"><pre><code># --- babble_data.py, in the `from prompts import (...)` block ---
+    ANSWER_TARGET_SYSTEM,
++   ASR_PROMPT,
+    ASR_LOSS_SYSTEM,
++   ASR_SYSTEM_PROMPT,
+    BEAM_LOSS_SYSTEM,</code></pre></div>
+
+<div class="cb"><pre><code># verify nothing else broke -- both names are used in three places in the probe
+grep -n "ASR_PROMPT\|ASR_SYSTEM_PROMPT" babble_data.py prompts.py sft_qwen.py
+conda activate qwen25omni &amp;&amp; python -c "import prompts, babble_data; print('imports ok')"</code></pre></div>
+
+<h2 id="s3">Step 3 &mdash; <code>asr_data.py</code> <span class="tag new">new</span></h2>
+<p>Uniform-SNR babble mixes over <code>devel</code>. No GPU pass, no LLM call, no probing loop &mdash; the
+transcript is the ground truth, so there is nothing to label. It writes the <code>target</code> column
+as the normalized sentence, which is what makes step&nbsp;4 a six-line change instead of a new
+<code>Dataset</code> class: <code>SlurpDataset</code> already reads <code>row["target"]</code>.</p>
+
+<div class="cb"><pre><code>"""Build the ASR-only training set for the ft-asr track.
+
+Fresh babble mixes at a UNIFORM SNR over SLURP's `devel` split -- the one real
+speech split babble_data.py never reads. An adapter trained here has heard
+neither the sentences its witnesses will be scored on (SLURP test, where the
+babble test rows come from) nor the ones the sent-4 labels are derived from
+(SLURP train), so the transcripts it produces during labeling are honest at
+both ends. See steps/ft-asr.html step 0 for the check that backs that claim.
+
+No GPU and no LLM calls: the transcript IS the ground truth, so there is
+nothing to probe and nothing to label. Runs on a CPU node in minutes.
+
+  python asr_data.py --config configs/ft-asr.yaml
+  python asr_data.py --config configs/ft-asr.yaml --n-rows 200 --no-push
+"""
+
+import argparse
+import hashlib
+import itertools
+import json
+import os
+import random
+import shutil
+from dataclasses import asdict, dataclass
+
+import numpy as np
+import soundfile as sf
+from datasets import Audio, Dataset, DatasetDict
+from tqdm import tqdm
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
+
+from babble_data import (
+    AUDIO_ROOT,
+    AUDIO_SAMPLING_RATE,
+    BABBLE_SPEAKERS,
+    MAX_AUDIO_SECONDS,
+    MIN_AUDIO_SECONDS,
+    SEED,
+    collect_babble_pool,
+    log,
+    slurp_ds_stream,
+)
+from util import load_config
+
+# The probe decodes with .lower().strip() and ASR_PROMPT asks for no
+# punctuation, so the target is normalized the same way the witness text will
+# be: training on cased, punctuated SLURP text would teach the adapter to emit
+# a string the labeler never sees.
+NORMALIZER = BasicTextNormalizer()
+ROW_ID = itertools.count(1)
+MIN_WORDS = 2
+
+
+@dataclass
+class Config:
+    """This stage's surface. The field names are the track YAML's key names."""
+
+    slurp_split: str = "devel"
+    # the ASR training set: built here, trained on by sft_qwen.py --task asr,
+    # which declares this same key as the dataset of its asr run
+    asr_ds_id: str = "keylazy/slurp-asr-bab-devel-v1"
+    n_rows: int = 8000  # TRAIN rows; the held-out rows come on top
+    snr_db: tuple = (0.0, 20.0)
+    clean_prob: float = 0.15
+    draws_per_utt: int = 1
+    test_every: int = 20  # hash(slurp_id) % test_every == 0 -> held out
+    no_push: bool = False
+
+
+def build_rows(cfg, audio_dir):
+    """Stream the split once, writing one wav per (utterance, draw)."""
+    pool = collect_babble_pool(cfg.slurp_split)
+
+    def mix(clean, rng, exclude_sid):
+        """clean + 3-speaker babble at a uniform SNR -> (samples, snr or None).
+
+        Same SNR math as babble_data.probe_by_kinds, minus the per-kind bands:
+        this set is meant to condition the model across the whole range, not to
+        land a given utterance in a given kind's band.
+        """
+        if rng.random() &lt; cfg.clean_prob:
+            return clean, None
+
+        length = len(clean)
+        babble = np.zeros(length, dtype=np.float32)
+        clips = [a for sid, a in pool if sid != exclude_sid]
+        for b in rng.sample(clips, BABBLE_SPEAKERS):
+            if len(b) &lt; length:
+                b = np.pad(b, (0, length - len(b)), "wrap")
+            else:
+                start = rng.randint(0, len(b) - length)
+                b = b[start : start + length]
+            babble += b
+        babble /= BABBLE_SPEAKERS
+
+        snr = round(rng.uniform(*cfg.snr_db), 1)
+        # SNR = 10*log10(clean_power / babble_power)
+        #   -> target_babble_power = clean_power / 10^(SNR/10)
+        target_power = float(np.mean(clean**2)) / (10 ** (snr / 10))
+        babble *= np.sqrt(target_power / float(np.mean(babble**2)))
+        noisy = clean + babble
+        peak = float(np.max(np.abs(noisy)))
+        if peak &gt; 1.0:
+            noisy = noisy / peak  # rescaling does not change the SNR
+        return noisy.astype(np.float32), snr
+
+    train, test = [], []
+    skipped = 0
+    pbar = tqdm(total=cfg.n_rows, unit="row", dynamic_ncols=True)
+    for row in slurp_ds_stream(cfg.slurp_split):
+        if len(train) &gt;= cfg.n_rows:
+            break
+
+        sentence = NORMALIZER(row["sentence"]).strip()
+        clean = row["audio"]["array"].astype(np.float32)
+        clean = clean[: MAX_AUDIO_SECONDS * AUDIO_SAMPLING_RATE]
+        if len(sentence.split()) &lt; MIN_WORDS or len(clean) &lt; MIN_AUDIO_SECONDS * AUDIO_SAMPLING_RATE:
+            skipped += 1
+            continue
+
+        sid = row["slurp_id"]
+        # Held out by a hash of the id, not by a tail slice: slurp streams every
+        # recording of one prompt back to back (up to ~10), so any positional
+        # boundary puts the same sentence on both sides of the split.
+        held = int(hashlib.md5(str(sid).encode()).hexdigest(), 16) % cfg.test_every == 0
+        rng = random.Random(f"{SEED}:asr:{sid}:{len(train) + len(test)}")
+
+        for _ in range(cfg.draws_per_utt):
+            rid = next(ROW_ID)
+            samples, snr = mix(clean, rng, sid)
+            path = os.path.join(audio_dir, f"{rid:06d}.wav")
+            sf.write(path, samples, AUDIO_SAMPLING_RATE)
+            rec = {
+                "id": rid,
+                # sft_qwen.py's SlurpDataset reads "target" and "kind"; writing
+                # the transcript there means --task asr only has to swap the
+                # prompt, not the dataset class
+                "target": sentence,
+                "kind": "asr",
+                "audio": path,
+                "snr_db": snr,
+                "sentence": sentence,
+                "slurp_id": sid,
+                "source": "asr-babble",
+            }
+            (test if held else train).append(rec)
+            if not held:
+                pbar.update(1)
+    pbar.close()
+    log(f"skipped {skipped} (too short / &lt;{MIN_WORDS} words)")
+    return train, test
+
+
+def main(cfg):
+    log(f"config: {cfg}")
+
+    audio_dir = os.path.join(AUDIO_ROOT, cfg.asr_ds_id.split("/")[-1])
+    shutil.rmtree(audio_dir, ignore_errors=True)
+    os.makedirs(audio_dir, exist_ok=True)
+    log(f"audio dir: {audio_dir}")
+
+    train_rows, test_rows = build_rows(cfg, audio_dir)
+
+    dump = os.path.join(audio_dir, "rows.json")
+    with open(dump, "w") as f:
+        # the resolved config rides along with the rows: the SNR range and the
+        # split are the only things that distinguish one ASR set from another,
+        # and a filename cannot carry them
+        json.dump(
+            {"config": asdict(cfg), "train": train_rows, "test": test_rows},
+            f,
+            indent=1,
+        )
+    log(f"wrote {dump}")
+
+    snrs = [r["snr_db"] for r in train_rows if r["snr_db"] is not None]
+    log(
+        f"train {len(train_rows)} / test {len(test_rows)} rows; "
+        f"clean {sum(1 for r in train_rows if r['snr_db'] is None)}; "
+        f"snr mean {np.mean(snrs):.1f} min {min(snrs):.1f} max {max(snrs):.1f}"
+    )
+
+    dsd = DatasetDict(
+        {
+            split: Dataset.from_list(rows).cast_column(
+                "audio", Audio(sampling_rate=AUDIO_SAMPLING_RATE)
+            )
+            for split, rows in (("train", train_rows), ("test", test_rows))
+        }
+    )
+    if cfg.no_push:
+        log(f"--no-push: built {cfg.asr_ds_id} locally, see {dump}")
+        return
+    dsd.push_to_hub(cfg.asr_ds_id)
+    log(f"pushed {len(train_rows)} train / {len(test_rows)} test rows to {cfg.asr_ds_id}")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config")
+    # all None: see steps/ft-asr.html step 1 -- the override loop below can only
+    # tell "absent" from "passed" if an absent flag is None
+    ap.add_argument("--slurp-split", default=None)
+    ap.add_argument("--asr-ds-id", default=None)
+    ap.add_argument("--n-rows", type=int, default=None, help="TRAIN rows to build")
+    ap.add_argument("--snr-db", type=float, nargs=2, default=None)
+    ap.add_argument("--clean-prob", type=float, default=None)
+    ap.add_argument("--draws-per-utt", type=int, default=None)
+    ap.add_argument("--test-every", type=int, default=None)
+    ap.add_argument("--no-push", action="store_true", default=None)
+    args = ap.parse_args()
+
+    cfg = load_config(args.config, Config) if args.config else Config()
+    for key, value in vars(args).items():
+        if value is not None and key != "config":
+            setattr(cfg, key, value)
+
+    main(cfg)</code></pre></div>
+
+<div class="risk"><b>One import does not exist yet.</b> <code>MIN_AUDIO_SECONDS</code> is not in
+<code>babble_data.py</code> &mdash; <code>collect_babble_pool</code> hardcodes the same 1-second floor
+inline (<code>if len(arr) &gt; AUDIO_SAMPLING_RATE</code>). Either add
+<code>MIN_AUDIO_SECONDS = 1</code> beside <code>MAX_AUDIO_SECONDS</code> in
+<a href="../babble_data.py#L55">babble_data.py:55</a> (two call sites then, which satisfies the
+style rule), or drop it from the import and write <code>len(clean) &lt; AUDIO_SAMPLING_RATE</code>.</div>
+
+<h3>Run it</h3>
+<p>CPU-only, so it does not need to queue behind a GPU. Do the 200-row version first &mdash; not as a
+smoke-test scaffold (there is no flag to build), just a short real run whose output you read.</p>
+
+<div class="cb"><pre><code>conda activate qwen25omni
+
+# short real run: 200 rows to a throwaway id, nothing pushed
+python -u asr_data.py --config configs/ft-asr.yaml \
+    --n-rows 200 --asr-ds-id keylazy/tmp-asr-check --no-push
+
+# listen to two of them and confirm the target matches what you hear
+python - &lt;&lt;'PY'
+import json
+d = json.load(open("babble_audio/tmp-asr-check/rows.json"))
+for r in d["train"][:3]:
+    print(r["snr_db"], r["audio"], "|", r["target"])
+PY
+
+# the real build
+sbatch --job-name=asr_data --account=sciencehub --partition=compute \
+  --nodes=1 --cpus-per-task=8 --mem=64G --time=4:00:00 \
+  --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt \
+  --output=logs/asr_data_%j.log --export=all \
+  --wrap='source ~/.bashrc; conda activate qwen25omni; \
+          python -u asr_data.py --config configs/ft-asr.yaml'</code></pre></div>
+
+<div class="card"><b>What good output looks like.</b> <code>train ~8250 / test ~440 rows</code>,
+<code>clean ~1240</code> (15%), <code>snr mean ~10.0 min ~0.0 max ~20.0</code>. If <code>test</code> is
+far off <code>n_rows/test_every</code>, the id hash is not spreading &mdash; check that
+<code>slurp_id</code> is not being stringified to something constant.</div>
+
+<h2 id="s4">Step 4 &mdash; <code>sft_qwen.py</code>: <code>--task asr</code> + <code>--config</code> <span class="tag edit">edit</span></h2>
+<p>Because <code>asr_data.py</code> writes the transcript into <code>target</code>, the only thing that
+has to change is <em>which prompt the collator renders</em>. Three edits.</p>
+
+<h3>4a. The collator learns a task</h3>
+<div class="diff">
+<div class="pane before"><div class="hd">sft_qwen.py:75 &mdash; before</div>
+<pre><code>class OmniSFTCollator:
+    def __init__(
+        self, processor, system_prompt=None, heard_reply=False, plain=False
+    ) -&gt; None:
+        self.processor = processor
+        self.system_prompt = system_prompt
+        # must match the prompt the dataset's targets were built under, and
+        # the one babble_eval_qwen.py evaluates with
+        self.task_prompt = task_prompt(heard_reply, plain)</code></pre></div>
+<div class="pane after"><div class="hd">sft_qwen.py:75 &mdash; after</div>
+<pre><code>class OmniSFTCollator:
+    def __init__(
+        self, processor, system_prompt=None, heard_reply=False, plain=False<ins>,
+        task="repair",</ins>
+    ) -&gt; None:
+        self.processor = processor
+        self.system_prompt = system_prompt
+        # must match the prompt the dataset's targets were built under, and
+        # the one babble_eval_qwen.py evaluates with
+        self.task_prompt = task_prompt(heard_reply, plain)
+<ins>        if task == "asr":
+            # the ASR adapter's only consumer is babble_data.py's probe pass,
+            # which decodes under this exact pair -- a different framing here
+            # is a train/probe mismatch, and the witness gets worse rather
+            # than better. ASR_SYSTEM_PROMPT replaces QWEN25_SYSTEM_PROMPT for
+            # the same reason: it is what the probe sends.
+            self.task_prompt = ASR_PROMPT
+            if self.system_prompt is not None:
+                self.system_prompt = ASR_SYSTEM_PROMPT</ins></code></pre></div>
+</div>
+<p class="muted" style="font-size:.9rem">Guarding on <code>is not None</code> keeps the family rule intact:
+qwen3 gets no system prompt at all, exactly as the probe does
+(<a href="../babble_data.py#L957">babble_data.py:957</a>,
+<code>asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None</code>).</p>
+
+<div class="cb"><pre><code># --- sft_qwen.py, the prompts import at line 25 ---
+-from prompts import task_prompt
++from prompts import ASR_PROMPT, ASR_SYSTEM_PROMPT, task_prompt</code></pre></div>
+
+<h3>4b. The flag, and both collator construction sites</h3>
+<div class="cb"><pre><code># --- sft_qwen.py main(), beside --heard-reply ---
+    ap.add_argument(
+        "--task",
+        choices=("repair", "asr"),
+        default="repair",
+        help="'asr' trains the transcription-only adapter of the ft-asr track: "
+        "same trainer and same target column, but rendered under "
+        "ASR_SYSTEM_PROMPT/ASR_PROMPT instead of the task prompt. Its dataset "
+        "(asr_data.py) writes the ground-truth transcript into `target`.",
+    )</code></pre></div>
+
+<p>Then pass <code>task=args.task</code> at both places a collator is built &mdash;
+<code>Trainer(data_collator=OmniSFTCollator(...))</code> and <code>run_smoke</code>'s. For
+<code>run_smoke</code> the simplest correct change is one more positional/keyword argument threaded
+through; if you would rather not touch it, skip <code>--smoke</code> for this run and read the first
+training loss instead.</p>
+
+<h3>4c. <code>--config</code></h3>
+<p><code>main()</code> becomes <code>main(cfg)</code> and the <code>args.</code> references inside it
+become <code>cfg.</code> &mdash; a mechanical rename over ~30 lines. The dataclass has to reproduce
+<em>every</em> current argparse default exactly; that is the whole risk of this edit, so transcribe it from
+the file rather than from memory (the <code>git show</code> one-liner in step&nbsp;1).</p>
+
+<div class="cb"><pre><code># --- sft_qwen.py, above main() ---
+@dataclass
+class Config:
+    """Every default sft_qwen.py has, in one block. Transcribed from the
+    argparse calls it replaces -- a value that drifts here silently changes an
+    existing track whose command line did not change."""
+
+    train_split: str = "train"
+    omni_path: str = "Qwen/Qwen2.5-Omni-3B"
+    batch_size: int = 16
+    grad_accum: int = 1
+    qlora: bool = False
+    answerable_token: bool = False
+    heard_reply: bool = False
+    # "restate" (TASK_PROMPT_TREE, the default) or "plain" (TASK_PROMPT). The
+    # --plain-prompt flag the .sh drivers pass still sets this; see __main__.
+    prompt: str = "restate"
+    smoke: bool = False
+    kinds: str = None
+    train_caps: str = None
+    out: str = None
+
+    # This script has two runs and one config file, so the four values that
+    # differ between them are spelled twice and --task picks a set. Nothing
+    # else in the file is duplicated, and each key still has exactly one flag.
+    task: str = "repair"
+    # --task repair
+    ds_id: str = "keylazy/slurp-babble-Qwen2.5-Omni-3B"
+    epochs: float = 3.0
+    lr: float = 2e-4
+    run_name: str = None
+    # --task asr
+    asr_ds_id: str = None
+    asr_epochs: float = 2.0
+    asr_lr: float = 1e-4
+    asr_batch_size: int = 16
+    asr_run_name: str = None</code></pre></div>
+
+<div class="cb"><pre><code># --- sft_qwen.py, replacing main()'s parser and `args = ap.parse_args()` ---
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config")
+    ap.add_argument("--ds-id", default=None)
+    ap.add_argument("--train-split", default=None)
+    ap.add_argument("--omni-path", default=None)
+    ap.add_argument("--epochs", type=float, default=None)
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--batch-size", type=int, default=None)
+    ap.add_argument("--grad-accum", type=int, default=None)
+    ap.add_argument("--qlora", action="store_true", default=None)
+    ap.add_argument("--answerable-token", action="store_true", default=None)
+    ap.add_argument("--heard-reply", action="store_true", default=None)
+    ap.add_argument("--prompt", choices=("restate", "plain"), default=None)
+    # sft.sh's BEAM and SENT4 tracks pass --plain-prompt, so the flag has to
+    # keep working byte-for-byte. store_const points it at the same field the
+    # YAML writes, which is why there is no second `plain_prompt` to reconcile:
+    # absent -> None -> no override, exactly like every other flag here.
+    ap.add_argument(
+        "--plain-prompt", dest="prompt", action="store_const", const="plain",
+        default=None,
+        help="Train under TASK_PROMPT, which does not ask the model to restate "
+        "what it heard. Restating is the default now that the answer targets "
+        "are written to do it; pass this to reproduce an older adapter.",
+    )
+    ap.add_argument("--task", choices=("repair", "asr"), default=None,
+                    help="'asr' trains the transcription-only adapter of the "
+                    "ft-asr track: same trainer and same target column, but "
+                    "rendered under ASR_SYSTEM_PROMPT/ASR_PROMPT, and reading "
+                    "the asr_* keys of the config instead of the bare ones.")
+    ap.add_argument("--smoke", action="store_true", default=None)
+    ap.add_argument("--kinds", default=None)
+    ap.add_argument("--train-caps", default=None)
+    ap.add_argument("--run-name", default=None)
+    ap.add_argument("--out", default=None)
+    # the asr run's four values; each key in the file has exactly one flag
+    ap.add_argument("--asr-ds-id", default=None)
+    ap.add_argument("--asr-epochs", type=float, default=None)
+    ap.add_argument("--asr-lr", type=float, default=None)
+    ap.add_argument("--asr-batch-size", type=int, default=None)
+    ap.add_argument("--asr-run-name", default=None)
+    args = ap.parse_args()
+
+    cfg = load_config(args.config, Config) if args.config else Config()
+    for key, value in vars(args).items():
+        if value is not None and key != "config":
+            setattr(cfg, key, value)
+
+    # Each key has exactly one flag, so the flags belonging to the run you are
+    # NOT doing would be read by nobody. Say so now rather than ignoring a
+    # hand-passed hyperparameter for twelve hours.
+    other = (
+        ("ds_id", "epochs", "lr", "run_name")
+        if cfg.task == "asr"
+        else ("asr_ds_id", "asr_epochs", "asr_lr", "asr_batch_size", "asr_run_name")
+    )
+    ignored = [k for k in other if getattr(args, k) is not None]
+    if ignored:
+        raise SystemExit(f"--task {cfg.task} does not read {ignored}")
+
+    main(cfg)</code></pre></div>
+
+
+
+<div class="cb"><pre><code># --- sft_qwen.py, the two remaining import lines ---
+-from util import QWEN25_SYSTEM_PROMPT, detect_model_family
++from dataclasses import dataclass
++from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_config
+
+# --- and at the top of main(cfg), where the two runs diverge ---
++    asr = cfg.task == "asr"
++    ds_id = cfg.asr_ds_id if asr else cfg.ds_id
++    epochs = cfg.asr_epochs if asr else cfg.epochs
++    lr = cfg.asr_lr if asr else cfg.lr
++    batch_size = cfg.asr_batch_size if asr else cfg.batch_size
++    run_name = cfg.asr_run_name if asr else cfg.run_name
++    # ...the rest of main() reads these five locals, not cfg, for these values
+-    plain = args.plain_prompt
++    plain = cfg.prompt == "plain"</code></pre></div>
+
+<h2 id="s5">Step 5 &mdash; train the ASR LoRA</h2>
+<p>~8K rows &times; 2 epochs at batch 16 is ~1,030 steps &mdash; roughly the same step count as a 3-epoch
+sent4 repair run, so expect a comparable wall clock on one A40.</p>
+
+<div class="cb"><pre><code>sbatch --job-name=asr_sft --account=sciencehub --partition=gpu-a40 \
+  --nodes=1 --cpus-per-task=8 --mem=128G --gpus=1 --time=12:00:00 \
+  --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt \
+  --output=logs/asr_sft_%j.log --mail-type=ALL --mail-user=zanqil@uw.edu \
+  --export=all \
+  --wrap='source ~/.bashrc; conda activate qwen25omni; \
+          export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH; \
+          python -u sft_qwen.py --task asr --config configs/ft-asr.yaml'</code></pre></div>
+
+<div class="card"><b>Check before you walk away.</b> The log's first lines must show
+<code>asr_ds_id=keylazy/slurp-asr-bab-devel-v1</code> resolved from the config, and the LoRA target list
+from <code>find_lm_linear_names</code> (<code>thinker.model.*</code> only). Loss should start around
+2&ndash;3 and fall below ~0.6; a transcript target is much easier than a repair reply, so a loss plateau
+above ~1.0 means the prompt swap did not take effect &mdash; check <code>--task asr</code> actually
+reached the collator.</div>
+
+<div class="nav">
+  <a href="ft-asr-2.html">Continue &rarr; part 2: attach the adapter, the gate, and the sent4-v2 build</a>
+</div>
+
+<footer>
+ft-asr track, part 1 of 2 &middot; sibling docs: <a href="sent.md">sent.md</a>,
+<a href="beam.html">beam.html</a>, <a href="mask.html">mask.html</a>.
+Nothing here is built yet &mdash; this is the plan.
+</footer>
+</div>
+
+<script>
+// copy buttons
+document.querySelectorAll('.cb').forEach(function(box){
+  var b = document.createElement('button');
+  b.className = 'copy'; b.textContent = 'copy';
+  b.onclick = function(){
+    navigator.clipboard.writeText(box.querySelector('code').innerText);
+    b.textContent = 'copied'; b.classList.add('done');
+    setTimeout(function(){ b.textContent = 'copy'; b.classList.remove('done'); }, 1400);
+  };
+  box.appendChild(b);
+});
+// shared progress across both parts
+(function(){
+  var KEY = 'ft-asr-progress';
+  var boxes = Array.from(document.querySelectorAll('#chk input'));
+  if (!boxes.length) return;
+  var state = {};
+  try { state = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch(e) {}
+  function paint(){
+    var n = 0;
+    boxes.forEach(function(b){
+      b.checked = !!state[b.id];
+      b.closest('li').classList.toggle('done', b.checked);
+      if (b.checked) n++;
+    });
+    document.getElementById('pbar').style.width = (100*n/boxes.length) + '%';
+    document.getElementById('pcount').textContent = n + ' / ' + boxes.length + ' steps done';
+  }
+  boxes.forEach(function(b){
+    b.onchange = function(){
+      state[b.id] = b.checked;
+      try { localStorage.setItem(KEY, JSON.stringify(state)); } catch(e) {}
+      paint();
+    };
+  });
+  paint();
+})();
+</script>
+</body>
+</html>

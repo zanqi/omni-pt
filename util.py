@@ -1,9 +1,10 @@
-"""Shared Qwen Omni model-family helpers for babble_data.py / babble_eval_qwen.py.
-
+"""
 Imports are done lazily per family inside load_model, so each conda env
 (qwen25omni / qwen3omni) only needs its own family's transformers classes.
 """
 
+import os
+import dataclasses
 import torch
 
 # Default system prompt from the Qwen2.5-Omni HF page.
@@ -123,3 +124,11 @@ def seq_logprobs(logits, labels):
     safe = labels.masked_fill(~mask, 0).unsqueeze(-1)
     token_logp = torch.log_softmax(logits.float(), dim=-1).gather(-1, safe).squeeze(-1)
     return (token_logp * mask).sum(dim=-1)
+
+def load_config(path, cls):
+    import yaml
+
+    with open(path) as f:
+        raw = yaml.safe_load(path) or {}
+    names = {f.name for f in dataclasses.fields(cls)}
+    return cls(**{k: v for k, v in raw.items() if k in names})
