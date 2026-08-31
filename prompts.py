@@ -1692,4 +1692,10 @@ KEY PIECES:
 3. restaurant
 REPLY: here are a few places nearby you might like.
 {"reason": "Recommending venues came through; the cuisine is never shown heard.", "lost": [2]}"""
+# ---
+# base model: ASR + task response
+# ---
+
+ASR_SYSTEM_PROMPT_QWEN2_5 = "You are a speech recognition model."
+ASR_PROMPT_QWEN2_5 = "Transcribe the English audio into text without any punctuation marks."
 

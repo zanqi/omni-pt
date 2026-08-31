@@ -24,6 +24,8 @@ from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 from prompts import (
     ANSWER_TARGET_SYSTEM,
     ASR_LOSS_SYSTEM,
+    ASR_PROMPT_QWEN2_5,
+    ASR_SYSTEM_PROMPT_QWEN2_5,
     BEAM_LOSS_SYSTEM,
     CLASSIFY_SYSTEM,
     HEARD_PREFILL,
@@ -143,14 +145,6 @@ base_family = None
 # the SNR bands, and how the SFT target is composed
 TRACK = "two-pass"
 IM_END_ID = None
-
-
-# ---
-# base model: ASR + task response
-# ---
-
-ASR_SYSTEM_PROMPT = "You are a speech recognition model."
-ASR_PROMPT = "Transcribe the English audio into text without any punctuation marks."  # from Qwen2.5-Omni github cookbooks
 
 
 def _conv(audio, system_prompt, user_prompt):
@@ -955,8 +949,8 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
         # only --beam-label fills this in; the others keep one transcript
         hyp_lists = [[] for _ in paths]
         if TRACK in ("beam", "sent-4"):
-            asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-            convs = [_conv(p, asr_sysp, ASR_PROMPT) for p in paths]
+            asr_sysp = ASR_SYSTEM_PROMPT_QWEN2_5 if base_family == "qwen2.5" else None
+            convs = [_conv(p, asr_sysp, ASR_PROMPT_QWEN2_5) for p in paths]
             hyp_lists = base_generate_batch(
                 convs, ASR_MAX_NEW_TOKENS, n_best=ASR_N_BEST
             )
@@ -990,8 +984,8 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                 labels = list(ex.map(lambda h: label_target(sentence, h), transcripts))
         else:  # 2-witness (sent-2) track goes here
             # get batch omni asr respond
-            asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None
-            convs = [_conv(p, asr_sysp, ASR_PROMPT) for p in paths]
+            asr_sysp = ASR_SYSTEM_PROMPT_QWEN2_5 if base_family == "qwen2.5" else None
+            convs = [_conv(p, asr_sysp, ASR_PROMPT_QWEN2_5) for p in paths]
             transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
 
             # get batch omni assistant respond. 

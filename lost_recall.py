@@ -29,6 +29,7 @@ from collections import Counter
 import numpy as np
 
 import babble_data as B
+import prompts
 from util import detect_model_family, load_model
 
 # "ten a m" / "ten am" / "10 a m" are one hypothesis as far as any labeler is
@@ -131,7 +132,7 @@ if __name__ == "__main__":
         args.omni_path, B.base_family, thinker_only=True
     )
     B.IM_END_ID = B.base_processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
-    asr_sysp = B.ASR_SYSTEM_PROMPT if B.base_family == "qwen2.5" else None
+    asr_sysp = prompts.ASR_SYSTEM_PROMPT_QWEN2_5 if B.base_family == "qwen2.5" else None
 
     CONTENT_SKIP = B.PIECE_STOPWORDS | B.WAKE_WORDS
     pool = B.collect_babble_pool(args.split)
@@ -164,7 +165,7 @@ if __name__ == "__main__":
             snrs = [round(rng.uniform(lo, hi), 1) for _ in chunk]
             audios = [mix(c, sid, s, pool, rng)
                       for (sid, _, c), s in zip(chunk, snrs)]
-            convs = [B._conv(a, asr_sysp, B.ASR_PROMPT) for a in audios]
+            convs = [B._conv(a, asr_sysp, prompts.ASR_PROMPT_QWEN2_5) for a in audios]
             hyp_lists = B.base_generate_batch(
                 convs, B.ASR_MAX_NEW_TOKENS, n_best=args.num_beams
             )
