@@ -131,11 +131,10 @@ KINDS = ("answer", "repair", "repeat")
 random.seed(SEED)
 np.random.seed(SEED)
 
-with open(VLLM_HOST_FILE) as _f:
-    _vllm_host = _f.read().strip()
-client = OpenAI(base_url=f"http://{_vllm_host}:8000/v1", api_key="EMPTY")
-TARGET_MODEL = client.models.list().data[0].id
-print(f"target model: {TARGET_MODEL} @ http://{_vllm_host}:8000/v1")
+# both connected on the first LLM call, see gpt_json
+client = None
+TARGET_MODEL = None
+_vllm_lock = threading.Lock()
 
 # set in __main__ from --omni-path before build_triplets runs
 base_model = None
@@ -235,6 +234,17 @@ def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
 
 
 def gpt_json(system, user, temperature, max_tokens):
+    global client, TARGET_MODEL
+
+    with _vllm_lock:
+        if client is None:
+            with open(VLLM_HOST_FILE) as f:
+                host = f.read().strip()
+            c = OpenAI(base_url=f"http://{host}:8000/v1", api_key="EMPTY")
+            TARGET_MODEL = c.models.list().data[0].id
+            log(f"target model: {TARGET_MODEL} @ http://{host}:8000/v1")
+            client = c  # assigned last: it is what the next thread checks
+
     raw = None
     try:
         resp = client.chat.completions.create(
