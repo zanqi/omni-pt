@@ -63,7 +63,6 @@ N_TRAIN_EXTRA_ANS = 1000
 
 # Classification + Target generation are served by the local vLLM judge
 # box. Its slurm job records the node it landed on in VLLM_HOST_FILE.
-TARGET_MODEL = "Qwen/Qwen3.5-122B-A10B-FP8"  # "Qwen/Qwen3.6-35B-A3B-FP8"
 VLLM_HOST_FILE = "/gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt"
 MASK_DS_ID = "keylazy/slurp-ear-sft"
 AUDIO_ROOT = "babble_audio"
@@ -135,6 +134,7 @@ np.random.seed(SEED)
 with open(VLLM_HOST_FILE) as _f:
     _vllm_host = _f.read().strip()
 client = OpenAI(base_url=f"http://{_vllm_host}:8000/v1", api_key="EMPTY")
+TARGET_MODEL = client.models.list().data[0].id
 print(f"target model: {TARGET_MODEL} @ http://{_vllm_host}:8000/v1")
 
 # set in __main__ from --omni-path before build_triplets runs

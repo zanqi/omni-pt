@@ -52,7 +52,6 @@ from transformers import (
     WhisperProcessor,
 )
 
-import babble_data
 from babble_data import (
     AUDIO_SAMPLING_RATE,
     BABBLE_SPEAKERS,
@@ -829,14 +828,6 @@ if __name__ == "__main__":
         .eval()
     )
     log(f"aligner + {args.asr_model} loaded")
-
-    # the vLLM box gets re-served with different models, so take the name from
-    # the server rather than trusting babble_data's constant -- a mismatch is a
-    # 404 on every target call, and the rows just quietly skip
-    served = babble_data.client.models.list().data[0].id
-    if served != babble_data.TARGET_MODEL:
-        log(f"target model: {babble_data.TARGET_MODEL} -> {served} (from the server)")
-        babble_data.TARGET_MODEL = served
 
     # test first, so it can claim the sentences it wants: it must avoid every
     # sentence the ear/babble adapters trained on (otherwise scoring them here
