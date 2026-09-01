@@ -35,8 +35,8 @@ import torch
 from datasets import Audio, load_dataset
 from openai import OpenAI
 
-from prompts import ANSWER_JUDGE_SYSTEM, REPAIR_JUDGE_SYSTEM, task_prompt
-from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
+from prompts import ANSWER_JUDGE_SYSTEM, QWEN25_SYSTEM_PROMPT, REPAIR_JUDGE_SYSTEM, task_prompt
+from util import detect_model_family, load_model
 
 AUDIO_SAMPLING_RATE = 16000
 KINDS = ("answer", "repair")

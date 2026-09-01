@@ -39,8 +39,8 @@ from datasets import Audio, load_dataset
 from tqdm import tqdm
 
 from mask_eval_qwen import JUDGE_BY_KIND, get_audio, judge_user, make_judge
-from prompts import task_prompt
-from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model, seq_logprobs
+from prompts import QWEN25_SYSTEM_PROMPT, task_prompt
+from util import detect_model_family, load_model, seq_logprobs
 
 AUDIO_SAMPLING_RATE = 16000
 MAX_AUDIO_SECONDS = 30

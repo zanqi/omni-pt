@@ -9,16 +9,6 @@ import dataclasses
 import numpy as np
 import torch
 
-# Default system prompt from the Qwen2.5-Omni HF page.
-# Qwen3-Omni's HF page says NO system prompt should be set for eval benchmarks,
-# so it is only used for the qwen2.5 family.
-QWEN25_SYSTEM_PROMPT = (
-    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
-    "capable of perceiving auditory and visual inputs, as well as generating "
-    "text and speech."
-)
-
-
 # speakers averaged together to make one babble background
 NUM_BAB_SPEAKERS = 3
 

@@ -1698,4 +1698,22 @@ REPLY: here are a few places nearby you might like.
 
 ASR_SYSTEM_PROMPT_QWEN2_5 = "You are a speech recognition model."
 ASR_PROMPT_QWEN2_5 = "Transcribe the English audio into text without any punctuation marks."
+# Default system prompt from the Qwen2.5-Omni HF page.
+# Qwen3-Omni's HF page says NO system prompt should be set for eval benchmarks,
+# so it is only used for the qwen2.5 family.
+QWEN25_SYSTEM_PROMPT = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+    "capable of perceiving auditory and visual inputs, as well as generating "
+    "text and speech."
+)
 
+
+
+def get_prompts(task, family="qwen2.5"):
+    if task == "asr":
+        sysp = ASR_SYSTEM_PROMPT_QWEN2_5 if family == "qwen2.5" else None
+        return sysp, ASR_PROMPT_QWEN2_5
+    if task == "repair":
+        sysp = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
+        return sysp, task_prompt(heard_reply=False, plain=False)
+    raise ValueError(f"unknown task {task!r}")

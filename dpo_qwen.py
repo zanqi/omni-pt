@@ -41,6 +41,7 @@ from datasets import Audio, load_dataset
 from peft import PeftModel
 from transformers import Trainer, TrainingArguments
 
+from prompts import QWEN25_SYSTEM_PROMPT
 from sft_qwen import (
     CHECKPOINT_DIR,
     OmniSFTCollator,
@@ -48,7 +49,7 @@ from sft_qwen import (
     get_sft_model_cls,
     load_processor,
 )
-from util import QWEN25_SYSTEM_PROMPT, detect_model_family, seq_logprobs
+from util import detect_model_family, seq_logprobs
 
 AUDIO_SAMPLING_RATE = 16000
 

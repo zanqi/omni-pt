@@ -20,8 +20,8 @@ from qwen_omni_utils import process_mm_info
 import torch.utils.data.dataset
 from transformers import Trainer, TrainingArguments
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from util import QWEN25_SYSTEM_PROMPT, detect_model_family
-from prompts import task_prompt
+from util import detect_model_family
+from prompts import get_prompts
 
 # every trained adapter lands under here, gitignored as one directory
 CHECKPOINT_DIR = "checkpoints"
@@ -75,16 +75,17 @@ def load_ds_split(ds_id, split, limit=None, kinds=None):
 
 
 class OmniSFTCollator:
+
     def __init__(
-        self, processor, system_prompt=None, heard_reply=False, plain=False
+        self,
+        processor,
+        family,
+        task="repair",
     ) -> None:
         self.processor = processor
-        # Qwen3-Omni's HF page says NO system prompt should be set; only
-        # qwen2.5 gets QWEN25_SYSTEM_PROMPT (see main()).
-        self.system_prompt = system_prompt
-        # must match the prompt the dataset's targets were built under, and
-        # the one babble_eval_qwen.py evaluates with
-        self.task_prompt = task_prompt(heard_reply, plain)
+        # must match the prompts the dataset's targets were built under, and
+        # the ones babble_eval_qwen.py evaluates with
+        self.system_prompt, self.task_prompt = get_prompts(task, family)
 
     def _conv(self, audio, answer=None):
         conv = []
@@ -264,14 +265,13 @@ def load_model(omni_path, family, use_qlora):
 
 
 def run_smoke(
-    model, processor, dataset, batch_size, system_prompt, heard_reply, plain
+    model, processor, dataset, batch_size, family, task
 ):
     print("\n=== SMOKE TEST ===")
     coll = OmniSFTCollator(
         processor,
-        system_prompt=system_prompt,
-        heard_reply=heard_reply,
-        plain=plain,
+        family,
+        task=task,
     )
     n = min(batch_size, len(dataset))
     exs = [dataset[i] for i in range(n)]
@@ -287,13 +287,7 @@ def run_smoke(
         n_sup = int((batch["labels"][i] != -100).sum())
         n_real = int(batch["attention_mask"][i].sum())
         print(f"  ex{i}: seq_len={total} real_tokens={n_real} supervised(label!=-100)={n_sup}")
-        if heard_reply and not processor.tokenizer.decode(sup_ids).lstrip().startswith(
-            "Heard:"
-        ):
-            print(
-                f"  ex{i}: WARNING supervised span does not start at 'Heard:' — "
-                "the label mask is off and the two-line format will train as garbage"
-            )
+
     batch = {k: v.to(model.device) for k, v in batch.items()}
     with torch.no_grad():
         out = model(**batch)
@@ -317,18 +311,12 @@ def main():
         help=f"Replace the target of kind=='answer' rows with {ANSWERABLE_TOKEN!r}.",
     )
     ap.add_argument(
-        "--heard-reply",
-        action="store_true",
-        help="Train under TASK_PROMPT_HR. Required for datasets built with "
-        "babble_data.py --heard-reply, whose targets are two-line "
-        "'Heard: ... / Reply: ...' strings.",
-    )
-    ap.add_argument(
-        "--plain-prompt",
-        action="store_true",
-        help="Train under TASK_PROMPT, which does not ask the model to restate "
-        "what it heard. Restating is the default now that the answer targets "
-        "are written to do it; pass this to reproduce an older adapter.",
+        "--task",
+        default="repair",
+        choices=("repair", "asr"),
+        help="Which prompt pair to train under (see prompts.get_prompts): "
+        "'repair' for the babble/ear assistant datasets, 'asr' for the "
+        "transcription dataset built by asr_data.py.",
     )
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument(
@@ -363,13 +351,9 @@ def main():
 
     model_name = args.omni_path.rstrip("/").split("/")[-1]
     # distinct default name so an hr run can't overwrite the baseline adapter
-    run_name = args.run_name or (
-        f"{model_name}-bab-hr-sft" if args.heard_reply else f"{model_name}-bab-sft"
-    )
+    run_name = args.run_name or (f"{model_name}-bab-sft")
     hub_id = f"keylazy/{run_name}"
     out = args.out or f"{CHECKPOINT_DIR}/{run_name}"
-
-    system_prompt = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
 
     print(f"Loading SFT dataset {args.ds_id} ...")
     kinds = [k.strip() for k in args.kinds.split(",")] if args.kinds else None
@@ -412,9 +396,8 @@ def main():
             processor,
             train_ds,
             args.batch_size,
-            system_prompt,
-            args.heard_reply,
-            args.plain_prompt,
+            family,
+            args.task,
         )
         return
 
@@ -446,9 +429,8 @@ def main():
         train_dataset=train_ds,
         data_collator=OmniSFTCollator(
             processor,
-            system_prompt=system_prompt,
-            heard_reply=args.heard_reply,
-            plain=args.plain_prompt,
+            family,
+            task=args.task,
         ),
     )
 
@@ -457,7 +439,6 @@ def main():
     trainer.save_model(out)
     processor.save_pretrained(out)
     print(f"saved adapter to {out}")
-
 
     model.push_to_hub(hub_id)
     processor.push_to_hub(hub_id)

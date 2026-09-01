@@ -31,6 +31,7 @@ from prompts import (
     HEARD_PREFILL,
     KEY_PIECES_SYSTEM,
     LABEL_TARGET_SYSTEM,
+    QWEN25_SYSTEM_PROMPT,
     REPAIR_TARGET_TREE_SYSTEM,
     REPEAT_TARGET_SYSTEM,
     RESP_LOSS_SYSTEM,
@@ -44,7 +45,6 @@ from prompts import (
 )
 from util import (
     NUM_BAB_SPEAKERS,
-    QWEN25_SYSTEM_PROMPT,
     add_noise,
     detect_model_family,
     load_model,

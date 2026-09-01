@@ -30,9 +30,10 @@ import soundfile as sf
 import torch
 from datasets import load_dataset, Audio
 from openai import OpenAI
-from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
+from util import detect_model_family, load_model
 from prompts import (
     ANSWER_JUDGE_SYSTEM,
+    QWEN25_SYSTEM_PROMPT,
     REPAIR_JUDGE_SYSTEM,
     REPAIR_ON_TARGET_SYSTEM,
     REPEAT_JUDGE_SYSTEM,

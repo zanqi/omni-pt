@@ -64,7 +64,12 @@ def build_splits(cfg: Config, audio_dir) -> tuple[list[Any], list[Any]]:
             break
 
         sentence = NORMALIZER(slurp_row["sentence"]).strip()
-        clean = slurp_row["audio"]["array"].astype(np.float32)[:max_len]
+        try:
+            clean = slurp_row["audio"]["array"].astype(np.float32)[:max_len]
+        except Exception as e:
+            log(f"undecodable audio at row {i} (slurp_id {slurp_row['slurp_id']}): {e}")
+            skipped += 1
+            continue
         if len(sentence.split()) < MIN_WORDS or len(clean) < min_len:
             skipped += 1
             continue
@@ -99,7 +104,7 @@ def build_splits(cfg: Config, audio_dir) -> tuple[list[Any], list[Any]]:
                 pbar.update(1)
 
     pbar.close()  # stream done
-    log(f"skipped {skipped} (too short / <{MIN_WORDS} words)")
+    log(f"skipped {skipped} (too short / <{MIN_WORDS} words / undecodable)")
 
     return train, test
 
