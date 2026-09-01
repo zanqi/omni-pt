@@ -47,6 +47,7 @@ from util import (
     add_noise,
     detect_model_family,
     load_model,
+    omni_generate,
     quiet_chat_template,
 )
 
@@ -209,17 +210,24 @@ def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
         }
     with GPU_LOCK:
         inputs = inputs.to(base_model.device, dtype=base_model.dtype)
-        out = base_model.generate(
-            **inputs,
-            return_audio=False,
+        # omni_generate, not base_model.generate: with --asr-adapter this is the
+        # FULL omni model (the adapter's keys are `thinker.`-prefixed), whose
+        # generate silently DROPS a bare max_new_tokens and decodes to its own
+        # 1024 default -- on 30s probe audio that is a thousand tokens of
+        # "dc dc dc ..." per hypothesis, four per probe. It also owns
+        # return_audio, which only exists on that path. The helper spells the
+        # kwargs for whichever shape is loaded and asserts the cap held.
+        # It returns the generated ids only, and gets them off the device
+        # before the lock is released so the decode below -- and the tensors it
+        # would otherwise pin -- are outside the critical section.
+        gen = omni_generate(
+            base_model,
+            inputs,
             max_new_tokens=max_new_tokens,
             eos_token_id=IM_END_ID,
             pad_token_id=IM_END_ID,
             **gen_kwargs,
-        )
-        # off the device before releasing, so the decode below -- and the
-        # tensors it would otherwise pin -- are outside the critical section
-        gen = out[:, inputs["input_ids"].shape[1] :].cpu()
+        ).cpu()
     decoded = [
         t.lower().strip()
         for t in base_processor.batch_decode(gen, skip_special_tokens=True)

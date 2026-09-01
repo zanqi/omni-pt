@@ -154,10 +154,66 @@ def load_model(
         # the order they were trained.
         for path in filter(None, adapter_path.split(",")):
             print(f"attaching LoRA adapter {path} ...")
-            model = PeftModel.from_pretrained(model, path).merge_and_unload()
+            peft_model = PeftModel.from_pretrained(model, path)
+            # PEFT matches target_modules by SUFFIX, so a `thinker.`-prefixed
+            # adapter (which is everything sft_qwen.py saves -- it trains a
+            # wrapper subclassing the full omni model) still builds its LoRA
+            # layers on a thinker-only model. It then finds no state for them
+            # and merges the zero-initialised lora_B, i.e. an exact identity:
+            # a UserWarning, no exception, and an eval whose numbers match the
+            # base model to the last digit. lora_B is zero only at init and
+            # never after training, so an all-zero lora_B catches this and any
+            # other silent key mismatch.
+            if all(
+                float(w.abs().max()) == 0.0
+                for name, w in peft_model.named_parameters()
+                if "lora_B" in name
+            ):
+                raise SystemExit(
+                    f"adapter {path} attached nothing: every lora_B is zero. "
+                    "Most likely the adapter is `thinker.`-prefixed and this "
+                    "model was loaded thinker_only=True -- load the full omni "
+                    "model instead (see steps/ft-asr-2.html step 6)."
+                )
+            model = peft_model.merge_and_unload()
 
     model.eval()
     return model, processor
+
+
+def omni_generate(model, inputs, **gen_kwargs):
+    """model.generate for either shape of omni model. -> the generated ids only.
+
+    Which shape is not cosmetic. A thinker-only model takes plain HF generate
+    kwargs. The full Qwen2_5OmniForConditionalGeneration.generate is a wrapper
+    that seeds its forwarding dict as {"max_new_tokens": thinker_max_new_tokens}
+    (default 1024) and then copies a bare kwarg across only `if key not in
+    thinker_kwargs` -- so `num_beams=4` reaches the thinker (nothing seeded it)
+    while `max_new_tokens=64` is DROPPED without a word. That cost a full eval:
+    4% of the 30s noisy probe rows decoded 1024 tokens of "dc dc dc ..." and
+    dragged corpus WER from 0.42 to 5.32. Prefixing only the kwargs that error
+    is not enough -- the dangerous ones are the ones that do not.
+
+    So: prefix everything on the full-model path, and check the returned length
+    against the cap on BOTH paths, so a future change to the wrapper's routing
+    fails loudly instead of quietly generating 16x too much.
+    """
+    prompt_len = inputs["input_ids"].shape[1]
+    cap = gen_kwargs["max_new_tokens"]
+    if hasattr(model, "thinker"):
+        gen_kwargs = {f"thinker_{k}": v for k, v in gen_kwargs.items()}
+        gen_kwargs["return_audio"] = False  # a real named param, not forwarded
+    out = model.generate(**inputs, **gen_kwargs)
+    ids = out[0] if isinstance(out, tuple) else out
+    gen = ids[:, prompt_len:]
+    if gen.shape[1] > cap:
+        raise SystemExit(
+            f"generate ignored max_new_tokens={cap}: {gen.shape[1]} tokens came "
+            "back. The kwargs are not reaching the thinker -- see "
+            "Qwen2_5OmniForConditionalGeneration.generate's thinker_kwargs "
+            "routing, and steps/ft-asr-2.html step 6b."
+        )
+    return gen
 
 
 def seq_logprobs(logits, labels):

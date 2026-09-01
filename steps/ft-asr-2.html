@@ -333,9 +333,9 @@ PY</code></pre></div>
 <tr><th>What you see</th><th>Read</th></tr>
 <tr><td>rows=8, and each group's four strings are variants of <em>its own</em> printed reference</td>
     <td class="ok"><b>B is live.</b> Take it: a 3-line diff in <code>babble_data.__main__</code> against
-    an unmodified <code>util.load_model</code>. Use whichever spelling worked &mdash; if the bare one
-    did, <code>base_generate_batch</code>'s <code>gen_kwargs</code> dict needs no change at all, only
-    <code>return_audio=False</code> added to the call. On to step 7.</td></tr>
+    an unmodified <code>util.load_model</code> &mdash; but prefix <em>every</em> generation kwarg with
+    <code>thinker_</code>, never just the ones that error. See the warning below: passing them bare
+    appears to work and silently is not.</td></tr>
 <tr><td>rows=2 &mdash; the beam kwargs were swallowed</td>
     <td>Silently one witness. <b>Take option A.</b> This is the failure the whole gate exists to
     catch, and here it is free.</td></tr>
@@ -349,6 +349,21 @@ PY</code></pre></div>
     <td><b>Take option A.</b></td></tr>
 </table>
 
+<div class="risk"><b>Passing the kwargs bare is not safe, even when 6b says both spellings agree.</b>
+The wrapper seeds its forwarding dict as <code>thinker_kwargs = {"max_new_tokens":
+thinker_max_new_tokens}</code> &mdash; default <b>1024</b> &mdash; and only then copies your bare kwargs
+across, guarded by <code>if key not in thinker_kwargs</code>. So a bare <code>num_beams=4</code> is
+forwarded (nothing seeded it) while a bare <code>max_new_tokens=64</code> is <b>silently dropped</b>
+and the model decodes to 1024 tokens. On the short clean clips 6b uses, both spellings hit
+<code>&lt;|im_end|&gt;</code> long before either cap, so the outputs match and the bug is invisible.
+On the 30&nbsp;s noisy probe audio it is not: 4% of the sent4-v1 rows degenerated into
+<code>dc dc dc dc &hellip;</code> for 1024 tokens and dragged corpus WER from 0.42 to <b>5.32</b>.
+The rule on the full-model path is <b>prefix everything</b>:
+<code>{f"thinker_{k}": v for k, v in gen_kwargs.items()}</code>, plus a bare
+<code>return_audio=False</code> (that one is a real named parameter of the wrapper). 6b cannot catch
+this &mdash; it is a check on beams and grouping only, and short prompts are exactly where a dropped
+length cap hides.</div>
+
 <p>Until 6b is run, A is the recommendation: it keeps the <code>generate</code> call byte-identical to
 the one that produced sent4-v1 and moves the risk into a place that raises <code>SystemExit</code>
 instead of quietly degrading. But 6b is cheap enough that not running it is the wrong call &mdash; a
@@ -361,13 +376,23 @@ and <b>distinct hypotheses per utterance</b> (is it still <em>four</em> witnesse
 standalone &mdash; it does not import <code>babble_data</code>, so the gate does not depend on the vLLM
 judge box being up.</p>
 
+<div class="why"><b>Count distinctness after normalizing, not before.</b> Beam search does return
+<code>n_best</code> distinct hypotheses, but distinct as <em>token-id sequences</em>, and the tokenizer
+is not injective onto text: the model can spell one string several ways (it is not held to canonical
+BPE, so <code>" monday"</code> and <code>" mon"+"day"</code> are two beams and one word), and
+<code>ten a m</code> / <code>ten am</code> / <code>10 a m</code> are three sequences that any substring
+test reads as the same evidence. <code>label_sent_beam</code> reads <em>text</em> &mdash; a piece counts
+as heard if any hypothesis contains it &mdash; so the honest witness count is over
+<code>NORMALIZER(h)</code>, and a raw <code>len(set(hyps))</code> would let a beam that has already
+collapsed sail through the step&nbsp;8 threshold. The script reports both, so the gap between them is
+visible rather than inferred.</div>
+
 <div class="cb"><pre><code>"""WER + beam-diversity diagnostic for the ft-asr adapter.
 
 The decision gate of the ft-asr track (steps/ft-asr-2.html step 8). Runs the
-probe's exact ASR call -- ASR_SYSTEM_PROMPT/ASR_PROMPT, 4 beams,
+probe's exact ASR call -- get_prompts("asr", family), 4 beams,
 ASR_MAX_NEW_TOKENS -- over the held-out split of the asr_data.py dataset (the
-rows whose slurp_id % test_every == 0), and
-reports two things per model:
+rows whose slurp_id % test_every == 0), and reports two things per model:
 
   wer                  top-1 word error rate, overall and per SNR band
   distinct_hyps        mean number of DISTINCT hypotheses among the K returned
@@ -376,18 +401,21 @@ The second is the one that can quietly invalidate --sent-4: its labeler marks a
 key piece lost only if EVERY hypothesis missed it, so if fine-tuning collapses
 the beam to one repeated string, the consensus rule silently becomes a
 one-witness rule and the label distribution shifts for a reason that has
-nothing to do with hearing better.
+nothing to do with hearing better. Distinctness is counted AFTER the Whisper
+normalizer, because the beam returns K distinct *token* sequences and the
+tokenizer is not injective onto text: the model can spell one string several
+ways (non-canonical BPE), and "ten a m" / "ten am" / "10 a m" are three
+sequences but one witness as far as the labeler's substring test is concerned.
 
 Standalone on purpose: no babble_data import (which would require the vLLM
 host file), no judge, no LLM calls.
 
   python asr_eval_qwen.py --config configs/ft-asr.yaml --tag base
-  python asr_eval_qwen.py --config configs/ft-asr.yaml \
-      --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft --tag ft
+  python asr_eval_qwen.py --config configs/ft-asr.yaml --tag ft \
+      --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft
   # the sampling fallback, if the beam collapses:
-  python asr_eval_qwen.py --config configs/ft-asr.yaml \
-      --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft \
-      --sample-temp 0.7 --tag ft-sampled
+  python asr_eval_qwen.py --config configs/ft-asr.yaml --tag ft-sampled \
+      --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft --sample-temp 0.7
 """
 
 import argparse
@@ -404,8 +432,8 @@ from qwen_omni_utils import process_mm_info
 from tqdm import tqdm
 from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 
-from prompts import ASR_PROMPT, ASR_SYSTEM_PROMPT
-from util import detect_model_family, load_model, load_config
+from prompts import get_prompts
+from util import detect_model_family, load_config, load_model
 
 AUDIO_SAMPLING_RATE = 16000
 # the probe's cap, so a truncation that hurts the witness hurts it here too
@@ -413,68 +441,12 @@ ASR_MAX_NEW_TOKENS = 64
 BATCH = 8
 NORMALIZER = BasicTextNormalizer()
 # the sent-4 kind bands, so a WER row maps onto the kind it will decide
-BANDS = (("clean", None, None), ("0-5", 0.0, 5.0), ("5-12", 5.0, 12.0), ("12-20", 12.0, 20.1))
-
-
-def word_edits(ref, hyp):
-    """(edit distance, len(ref)) over whitespace tokens -- WER's numerator and
-    denominator kept apart so a corpus rate is a ratio of sums, not a mean of
-    per-row rates (jiwer and evaluate are not installed in these envs)."""
-    r, h = ref.split(), hyp.split()
-    d = np.arange(len(h) + 1)
-    for i in range(1, len(r) + 1):
-        prev = d.copy()
-        d[0] = i
-        for j in range(1, len(h) + 1):
-            d[j] = min(prev[j] + 1, d[j - 1] + 1, prev[j - 1] + (r[i - 1] != h[j - 1]))
-    return int(d[len(h)]), len(r)
-
-
-@torch.inference_mode()
-def transcribe(model, processor, family, paths, n_best, temp):
-    """The probe's ASR call, batched. -> one list of n_best strings per path."""
-    convs = []
-    for p in paths:
-        conv = []
-        if family == "qwen2.5":
-            conv.append(
-                {"role": "system", "content": [{"type": "text", "text": ASR_SYSTEM_PROMPT}]}
-            )
-        conv.append(
-            {
-                "role": "user",
-                "content": [
-                    {"type": "audio", "audio": p},
-                    {"type": "text", "text": ASR_PROMPT},
-                ],
-            }
-        )
-        convs.append(conv)
-
-    texts = processor.apply_chat_template(convs, add_generation_prompt=True, tokenize=False)
-    audios, images, videos = process_mm_info(convs, use_audio_in_video=False)
-    inputs = processor(
-        text=texts, audio=audios, images=images, videos=videos,
-        return_tensors="pt", padding=True,
-    )
-    inputs = inputs.to(model.device, dtype=model.dtype)
-
-    if temp:
-        # the fallback witness scheme: K independent samples instead of K beams
-        gen_kwargs = dict(do_sample=True, temperature=temp, top_p=0.95,
-                          num_return_sequences=n_best)
-    else:
-        gen_kwargs = dict(do_sample=False, num_beams=n_best,
-                          num_return_sequences=n_best)
-
-    im_end = processor.tokenizer.convert_tokens_to_ids("&lt;|im_end|&gt;")
-    out = model.generate(
-        **inputs, max_new_tokens=ASR_MAX_NEW_TOKENS,
-        eos_token_id=im_end, pad_token_id=im_end, **gen_kwargs,
-    )
-    gen = out[:, inputs["input_ids"].shape[1] :].cpu()
-    dec = [t.lower().strip() for t in processor.batch_decode(gen, skip_special_tokens=True)]
-    return [dec[i : i + n_best] for i in range(0, len(dec), n_best)]
+BANDS = (
+    ("clean", None, None),
+    ("0-5", 0.0, 5.0),
+    ("5-12", 5.0, 12.0),
+    ("12-20", 12.0, 20.1),
+)
 
 
 @dataclass
@@ -482,7 +454,7 @@ class Config:
     """Field names are the track YAML's key names, as everywhere else."""
 
     omni_path: str = "Qwen/Qwen2.5-Omni-3B"
-    asr_ds_id: str = "keylazy/slurp-asr-bab-devel-v1"
+    asr_ds_id: str = "keylazy/slurp-asr-bab-v1"
     adapter_path: str = None
     split: str = "test"
     num_rows: int = -1
@@ -509,35 +481,112 @@ def main(cfg):
     model, processor = load_model(
         cfg.omni_path, family, adapter_path=cfg.adapter_path, thinker_only=True
     )
+    sysp, userp = get_prompts("asr", family)
+    im_end = processor.tokenizer.convert_tokens_to_ids("&lt;|im_end|&gt;")
+
+    @torch.inference_mode()
+    def transcribe(paths):
+        """The probe's ASR call, batched. -&gt; one list of n_best strings per path."""
+        convs = []
+        for path in paths:
+            conv = []
+            if sysp is not None:
+                conv.append(
+                    {"role": "system", "content": [{"type": "text", "text": sysp}]}
+                )
+            conv.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio", "audio": path},
+                        {"type": "text", "text": userp},
+                    ],
+                }
+            )
+            convs.append(conv)
+        texts = processor.apply_chat_template(
+            convs, add_generation_prompt=True, tokenize=False
+        )
+        audios, images, videos, *_ = process_mm_info(convs, use_audio_in_video=False)
+        inputs = processor(
+            text=texts,
+            audio=audios,
+            images=images,
+            videos=videos,
+            return_tensors="pt",
+            padding=True,
+        ).to(model.device, dtype=model.dtype)
+        if cfg.sample_temp:
+            # the fallback witness scheme: K independent samples instead of K beams
+            gen_kwargs = dict(
+                do_sample=True,
+                temperature=cfg.sample_temp,
+                top_p=0.95,
+                num_return_sequences=cfg.n_best,
+            )
+        else:
+            gen_kwargs = dict(
+                do_sample=False,
+                num_beams=cfg.n_best,
+                num_return_sequences=cfg.n_best,
+            )
+        gen_ids = model.generate(
+            **inputs,
+            max_new_tokens=ASR_MAX_NEW_TOKENS,
+            eos_token_id=im_end,
+            pad_token_id=im_end,
+            **gen_kwargs,
+        )
+        gen = gen_ids[:, inputs["input_ids"].shape[1] :].cpu()
+        dec = [
+            t.lower().strip()
+            for t in processor.batch_decode(gen, skip_special_tokens=True)
+        ]
+        return [dec[i : i + cfg.n_best] for i in range(0, len(dec), cfg.n_best)]
 
     edits = {b[0]: [0, 0] for b in BANDS}
     edits["all"] = [0, 0]
-    distinct, n_rows = [], 0
+    distinct, distinct_raw, n_rows = [], [], 0
     fout = open(out, "w")
-
     for start in tqdm(range(0, len(ds), BATCH), unit="batch", dynamic_ncols=True):
         batch = ds.select(range(start, min(start + BATCH, len(ds))))
-        paths, tmp = [], []
+        paths = []
         for row in batch:
-            fd, p = tempfile.mkstemp(suffix=".wav")
+            fd, path = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
-            sf.write(p, row["audio"]["array"].astype("float32"), AUDIO_SAMPLING_RATE)
-            paths.append(p)
-            tmp.append(p)
-        try:
-            hyp_lists = transcribe(
-                model, processor, family, paths, cfg.n_best, cfg.sample_temp
+            sf.write(
+                path, row["audio"]["array"].astype("float32"), AUDIO_SAMPLING_RATE
             )
+            paths.append(path)
+        try:
+            hyp_lists = transcribe(paths)
         finally:
-            for p in tmp:
-                os.remove(p)
+            for path in paths:
+                os.remove(path)
 
         for row, hyps in zip(batch, hyp_lists):
             ref = NORMALIZER(row[cfg.ref_column]).strip()
             if not ref.split():
                 continue
             top = NORMALIZER(hyps[0]).strip()
-            e, n = word_edits(ref, top)
+
+            # (edit distance, len(ref)) over whitespace tokens -- WER's
+            # numerator and denominator kept apart so the corpus rate is a
+            # ratio of sums, not a mean of per-row rates (jiwer and evaluate
+            # are not installed in these envs)
+            r, h = ref.split(), top.split()
+            d = np.arange(len(h) + 1)
+            for i in range(1, len(r) + 1):
+                prev = d.copy()
+                d[0] = i
+                for j in range(1, len(h) + 1):
+                    d[j] = min(
+                        prev[j] + 1,
+                        d[j - 1] + 1,
+                        prev[j - 1] + (r[i - 1] != h[j - 1]),
+                    )
+            e, n = int(d[len(h)]), len(r)
+
             edits["all"][0] += e
             edits["all"][1] += n
             snr = row["snr_db"]
@@ -548,20 +597,39 @@ def main(cfg):
                     edits[label][0] += e
                     edits[label][1] += n
                     break
-            # distinct AFTER normalization: two beams differing only in a
-            # trailing period are not two witnesses
-            uniq = len({NORMALIZER(h).strip() for h in hyps})
+
+            # distinct AFTER normalization: the beam returns K distinct token
+            # sequences, but two of them spelling one string ("ten am" vs
+            # "ten a m", or the same words under a different BPE split) are
+            # one witness to the labeler, which only ever does a substring
+            # test on the text. The raw count is kept alongside so a gap
+            # between them is visible rather than inferred.
+            uniq = len({NORMALIZER(hyp).strip() for hyp in hyps})
             distinct.append(uniq)
+            distinct_raw.append(len(set(hyps)))
             n_rows += 1
-            fout.write(json.dumps({
-                "id": row["id"], "snr_db": snr, "ref": ref,
-                "hyps": hyps, "edits": e, "n_ref": n, "distinct": uniq,
-            }) + "\n")
+            fout.write(
+                json.dumps(
+                    {
+                        "id": row["id"],
+                        "snr_db": snr,
+                        "ref": ref,
+                        "hyps": hyps,
+                        "edits": e,
+                        "n_ref": n,
+                        "distinct": uniq,
+                        "distinct_raw": distinct_raw[-1],
+                    }
+                )
+                + "\n"
+            )
 
     summary = {
         "type": "summary",
         "model": cfg.omni_path,
         "adapter": cfg.adapter_path,
+        "dataset": f"{cfg.asr_ds_id}:{cfg.split}",
+        "ref_column": cfg.ref_column,
         "sample_temp": cfg.sample_temp,
         "n_best": cfg.n_best,
         "rows": n_rows,
@@ -570,9 +638,15 @@ def main(cfg):
             b: (round(edits[b][0] / edits[b][1], 4) if edits[b][1] else None)
             for b, _, _ in BANDS
         },
+        # the gate reads distinct_hyps_mean; distinct_hyps_raw_mean is the
+        # same count before normalization, i.e. how much of the beam's
+        # apparent diversity is spelling
         "distinct_hyps_mean": round(float(np.mean(distinct)), 3) if distinct else None,
+        "distinct_hyps_raw_mean": (
+            round(float(np.mean(distinct_raw)), 3) if distinct_raw else None
+        ),
         "distinct_hyps_hist": {
-            str(k): int(sum(1 for d in distinct if d == k))
+            str(k): int(sum(1 for x in distinct if x == k))
             for k in range(1, cfg.n_best + 1)
         },
     }
@@ -603,7 +677,6 @@ if __name__ == "__main__":
     for key, value in vars(args).items():
         if value is not None and key != "config":
             setattr(cfg, key, value)
-
     main(cfg)</code></pre></div>
 
 <h3>Run both models</h3>
@@ -611,36 +684,111 @@ if __name__ == "__main__":
   --nodes=1 --cpus-per-task=8 --mem=128G --gpus=1 --time=4:00:00 \
   --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt \
   --output=logs/asr_diag_%j.log --export=all \
-  --wrap="bash -lc 'conda activate qwen25omni; \
+  --wrap="bash -lc 'source ~/.bashrc; conda activate qwen25omni; \
      python -u asr_eval_qwen.py --config configs/ft-asr.yaml --tag base &amp;&amp; \
      python -u asr_eval_qwen.py --config configs/ft-asr.yaml --tag ft \
        --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft'"</code></pre></div>
-<p>Then, for the same two models on the audio the labels are actually built from &mdash; optional but it
-is the honest generalization check, since the ASR set and the sent-4 probes come from different SLURP
-splits and different SNR draws:</p>
+
+<p>Then the same two models on the audio the labels are actually built from. Not optional decoration
+&mdash; the ASR set and the sent-4 probes come from different SLURP splits and different SNR draws, so
+this is the only place the gate's WER claim is measured on rows that resemble what
+<code>babble_data.py</code> will actually feed the labeler:</p>
 <div class="cb"><pre><code># the sent4-v1 test rows carry `sentence` and their own probe audio, so they
-# work as a second ASR test set with no new build
+# work as a second ASR test set with no new build. --ref-column is what makes
+# this work: that dataset's `target` is a repair reply, not a transcript.
+python -u asr_eval_qwen.py --config configs/ft-asr.yaml --tag base-on-sent4 \
+    --asr-ds-id keylazy/slurp-babble-Qwen2.5-Omni-3B-sent4-v1 --split test \
+    --ref-column sentence
+
 python -u asr_eval_qwen.py --config configs/ft-asr.yaml --tag ft-on-sent4 \
     --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft \
-    --asr-ds-id keylazy/slurp-babble-Qwen2.5-Omni-3B-sent4-v1 --split test</code></pre></div>
-<p class="muted" style="font-size:.9rem">That dataset's <code>target</code> column is a repair reply, not
-a transcript &mdash; so for this one run point the reference at <code>sentence</code> instead
-(one-line change in the row loop, or add a <code>--ref-column</code> flag while you are there).</p>
+    --asr-ds-id keylazy/slurp-babble-Qwen2.5-Omni-3B-sent4-v1 --split test \
+    --ref-column sentence</code></pre></div>
+<p class="muted" style="font-size:.9rem">Both write to
+<code>results/asr_&lt;model-or-adapter&gt;_&lt;tag&gt;.jsonl</code>, so the four runs land in four files and
+the base/ft pair on each dataset is what step 8 reads. Note the base runs name their file after
+<code>Qwen2.5-Omni-3B</code> and the ft runs after the adapter directory, so the tag is what keeps
+<code>base</code> and <code>base-on-sent4</code> apart.</p>
 
 <h2 id="s8">Step 8 &mdash; <span class="tag gate">gate</span> read the numbers before building anything</h2>
-<p>Type the two summary lines in. The verdict is arithmetic, not judgement &mdash; the thresholds are
-stated so that a marginal result does not get argued into a green light after the fact.</p>
+<p>The verdict is arithmetic, not judgement &mdash; the thresholds are stated so that a marginal result
+does not get argued into a green light after the fact. The numbers below are the measured ones, from the
+four runs of step&nbsp;7; the calculator is left live so a re-measure (a <code>--sample-temp</code>
+fallback, a retrained adapter) can be read against the same bars.</p>
 
+<h3>Measured &mdash; 2026-09-01</h3>
+<table class="matrix">
+<tr><th></th>
+    <th colspan="3"><code>slurp-asr-bab-v1:test</code> &middot; 364 rows</th>
+    <th colspan="3"><code>&hellip;-sent4-v1:test</code> &middot; 150 rows</th></tr>
+<tr><th></th><th>base</th><th>ft</th><th>&Delta;rel</th><th>base</th><th>ft</th><th>&Delta;rel</th></tr>
+<tr><td>WER, overall</td>
+    <td>0.4075</td><td>0.2370</td><td class="ok"><b>&minus;41.8%</b></td>
+    <td>0.5497</td><td>0.4688</td><td class="ok"><b>&minus;14.7%</b></td></tr>
+<tr><td>WER @ 0&ndash;5&nbsp;dB</td>
+    <td>0.8881</td><td>0.5672</td><td class="ok"><b>&minus;36.1%</b></td>
+    <td>0.7535</td><td>0.6673</td><td class="ok"><b>&minus;11.4%</b></td></tr>
+<tr><td>WER @ 5&ndash;12&nbsp;dB</td>
+    <td>0.3562</td><td>0.1986</td><td>&minus;44.2%</td>
+    <td>0.3879</td><td>0.2967</td><td>&minus;23.5%</td></tr>
+<tr><td>WER @ 12&ndash;20&nbsp;dB</td>
+    <td>0.2740</td><td>0.1370</td><td>&minus;50.0%</td>
+    <td>0.2500</td><td>0.2130</td><td>&minus;14.8%</td></tr>
+<tr><td>WER, clean</td>
+    <td>0.1533</td><td>0.1000</td><td>&minus;34.8%</td>
+    <td>0.1212</td><td>0.1212</td><td class="muted">n=4</td></tr>
+<tr><td><code>distinct_hyps_mean</code></td>
+    <td>3.758</td><td>3.926</td><td class="ok"><b>&ge;&nbsp;2.0 &#10003;</b></td>
+    <td>3.873</td><td>3.940</td><td class="ok"><b>&ge;&nbsp;2.0 &#10003;</b></td></tr>
+<tr><td><code>distinct_hyps_raw_mean</code></td>
+    <td>3.780</td><td>3.926</td><td class="muted">&minus;0.02 vs norm</td>
+    <td>3.873</td><td>3.940</td><td class="muted">0.00 vs norm</td></tr>
+<tr><td>rows with all 4 distinct</td>
+    <td>294/364</td><td>338/364</td><td>&mdash;</td>
+    <td>136/150</td><td>142/150</td><td>&mdash;</td></tr>
+</table>
+
+<div class="verdict go"><b>GO &mdash; all three bars cleared on both datasets.</b>
+Every criterion is met on the harder of the two measurements. Read the <b>sent4-v1 column</b> as the
+gate: that is the audio the labeler will actually see, and it is the honest number. The
+<code>&minus;41.8%</code> on the ASR test split is in-domain &mdash; same builder, same SNR draws, same
+SLURP split as training &mdash; and roughly <b>a third of it survives the domain shift</b>. Budget the
+downstream label change against &minus;14.7%, not against &minus;41.8%.</div>
+
+<div class="why"><b>Two things in the table worth not glossing over.</b>
+<b>(1)</b> The beam got <em>more</em> diverse under fine-tuning, not less (3.758&nbsp;&rarr;&nbsp;3.926),
+so the collapse this gate was built to catch did not happen and the <code>--sample-temp 0.7</code>
+fallback stays unused. <b>(2)</b> Normalization barely moves the count here
+(raw 3.780 vs normalized 3.758 on base; identical on the other three runs), which is a fact about
+<em>these</em> models, not a reason to drop the normalization &mdash; the check costs nothing and it is
+the collapse-mode where spelling variants would masquerade as witnesses.
+The clean-band cell on sent4-v1 is 4 rows; it is in the table for completeness and should not be read
+as &ldquo;no improvement on clean audio&rdquo; &mdash; the 44-row clean band on the ASR split says
+&minus;34.8%.</div>
+
+<div class="risk"><b>Two bugs were found producing this table, and both were silent.</b> The first
+<code>ft</code> run reported metrics <em>identical to base to the last digit</em>: a
+<code>thinker.</code>-prefixed adapter on a <code>thinker_only=True</code> model, where PEFT matches
+<code>target_modules</code> by suffix, builds every LoRA layer, loads no state into them, and merges the
+zero-initialised <code>lora_B</code> &mdash; an exact identity, with a <code>UserWarning</code> and no
+exception. <code>util.load_model</code> now raises <code>SystemExit</code> when every
+<code>lora_B</code> is zero. The second put <code>ft-on-sent4</code> at <b>WER 5.32</b>: a bare
+<code>max_new_tokens=64</code> dropped by the full model's generate wrapper (see step&nbsp;6b), letting
+4% of rows decode 1024 tokens of <code>dc dc dc &hellip;</code>. If a gate ever reports a delta of
+exactly zero, or a WER above 1, read it as a plumbing failure before reading it as a result.</div>
+
+<h3>Re-measure against the same bars</h3>
 <div class="gate">
 <div class="card">
-<b>From the two <code>results/asr_*.jsonl</code> summaries</b>
-<div class="num"><span>base <code>WER</code></span><input type="number" id="g_wb" step="0.001" value="0.42"></div>
-<div class="num"><span>ft <code>WER</code></span><input type="number" id="g_wf" step="0.001" value="0.31"></div>
-<div class="num"><span>base <code>WER</code> @ 0&ndash;5&nbsp;dB</span><input type="number" id="g_lb" step="0.001" value="0.78"></div>
-<div class="num"><span>ft <code>WER</code> @ 0&ndash;5&nbsp;dB</span><input type="number" id="g_lf" step="0.001" value="0.66"></div>
-<div class="num"><span>base <code>distinct_hyps_mean</code></span><input type="number" id="g_db" step="0.01" value="3.4"></div>
-<div class="num"><span>ft <code>distinct_hyps_mean</code></span><input type="number" id="g_df" step="0.01" value="1.8"></div>
-<p class="muted" style="font-size:.78rem;margin:.5rem 0 0">Values above are placeholders, not predictions.</p>
+<b>From two <code>results/asr_*.jsonl</code> summaries</b>
+<div class="num"><span>base <code>WER</code></span><input type="number" id="g_wb" step="0.001" value="0.5497"></div>
+<div class="num"><span>ft <code>WER</code></span><input type="number" id="g_wf" step="0.001" value="0.4688"></div>
+<div class="num"><span>base <code>WER</code> @ 0&ndash;5&nbsp;dB</span><input type="number" id="g_lb" step="0.001" value="0.7535"></div>
+<div class="num"><span>ft <code>WER</code> @ 0&ndash;5&nbsp;dB</span><input type="number" id="g_lf" step="0.001" value="0.6673"></div>
+<div class="num"><span>base <code>distinct_hyps_mean</code></span><input type="number" id="g_db" step="0.01" value="3.873"></div>
+<div class="num"><span>ft <code>distinct_hyps_mean</code></span><input type="number" id="g_df" step="0.01" value="3.94"></div>
+<p class="muted" style="font-size:.78rem;margin:.5rem 0 0">Pre-filled with the sent4-v1 column &mdash;
+the gate-deciding one.</p>
 </div>
 <div class="card">
 <b>Verdict</b>
@@ -657,7 +805,7 @@ from redrawn probes, not the adapter. Not worth a build.</td></tr>
 <tr><td>Relative WER reduction at 0&ndash;5&nbsp;dB</td><td>&ge;&nbsp;5%, and not <em>worse</em></td>
 <td>This is the band where <code>repair</code> and <code>repeat</code> labels are decided. An adapter that
 only helps at 15&nbsp;dB improves transcripts nobody was labeling wrong.</td></tr>
-<tr><td><code>distinct_hyps_mean</code>, ft</td><td>&ge;&nbsp;2.0</td>
+<tr><td><code>distinct_hyps_mean</code>, ft <span class="muted">(normalized)</span></td><td>&ge;&nbsp;2.0</td>
 <td>Below 2.0 the &ldquo;every witness missed it&rdquo; rule is mostly a one-witness rule, and the track
 stops being <code>--sent-4</code>. Fall back to <code>--sample-temp 0.7</code> and re-measure both
 numbers; sampling costs WER, so it has to clear the WER bars too.</td></tr>
@@ -715,10 +863,76 @@ probe, and attaching the adapter is a three-line change.</p>
     base_model, base_processor = load_model(
         <ins>cfg</ins>.omni_path, base_family,<ins>
         adapter_path=cfg.asr_adapter,</ins>
-        thinker_only=True,
+<del>        thinker_only=True,</del><ins>        # NOT True: a `thinker.`-prefixed adapter on a
+        # thinker-only model merges to an exact identity, in silence
+        thinker_only=not cfg.asr_adapter,</ins>
     )
 <ins>    if cfg.asr_adapter:
         log(f"probe ASR model: {cfg.omni_path} + {cfg.asr_adapter}")</ins></code></pre></div>
+
+<div class="risk"><b><code>thinker_only=True</code> here would be a silent no-op, and it happened.</b>
+The adapter's saved keys are <code>base_model.model.thinker.model.layers.*</code>. PEFT matches
+<code>target_modules</code> by <em>suffix</em>, so on a thinker-only model it builds all 504 LoRA layers,
+finds no state for them, and merges the zero-initialised <code>lora_B</code> &mdash; an exact identity,
+with a <code>UserWarning</code> and no exception. Step&nbsp;7's first <code>ft</code> run reported
+metrics identical to base <em>to the last digit</em> because of this. Hence
+<code>thinker_only=not cfg.asr_adapter</code> (option&nbsp;B of step&nbsp;6, verified in 6b), and hence
+<code>util.load_model</code> now raises when every <code>lora_B</code> is zero:</div>
+<div class="cb"><pre><code># --- util.py, inside the adapter loop ---
+            peft_model = PeftModel.from_pretrained(model, path)
+            # lora_B is zero only at init and never after training, so an
+            # all-zero lora_B is the signature of a silent key mismatch --
+            # whatever caused it.
+            if all(
+                float(w.abs().max()) == 0.0
+                for name, w in peft_model.named_parameters()
+                if "lora_B" in name
+            ):
+                raise SystemExit(
+                    f"adapter {path} attached nothing: every lora_B is zero. ..."
+                )
+            model = peft_model.merge_and_unload()</code></pre></div>
+
+<div class="risk"><b>Loading the full model changes what <code>base_generate_batch</code> must pass.</b>
+This is the second half of the trap and it does not announce itself either: the wrapper seeds
+<code>thinker_kwargs = {"max_new_tokens": thinker_max_new_tokens}</code> (default <b>1024</b>) and then
+copies bare kwargs across only <code>if key not in thinker_kwargs</code>. <code>num_beams</code>
+survives; <code>max_new_tokens</code> is <b>dropped</b>. On 30&nbsp;s probe audio that is ~1024 tokens
+of degenerate babble per hypothesis, four hypotheses per probe, across every probe of the build &mdash;
+wrong labels and a large GPU bill, with nothing in the log. So neither script spells the kwargs itself
+any more; both call one helper that knows the rule and <em>asserts the cap actually held</em>:</div>
+<div class="cb"><pre><code># --- util.py ---
+def omni_generate(model, inputs, **gen_kwargs):
+    """model.generate for either shape of omni model. -&gt; the generated ids only."""
+    prompt_len = inputs["input_ids"].shape[1]
+    cap = gen_kwargs["max_new_tokens"]
+    if hasattr(model, "thinker"):
+        gen_kwargs = {f"thinker_{k}": v for k, v in gen_kwargs.items()}
+        gen_kwargs["return_audio"] = False  # a real named param, not forwarded
+    out = model.generate(**inputs, **gen_kwargs)
+    ids = out[0] if isinstance(out, tuple) else out
+    gen = ids[:, prompt_len:]
+    if gen.shape[1] &gt; cap:
+        raise SystemExit(
+            f"generate ignored max_new_tokens={cap}: {gen.shape[1]} tokens came "
+            "back. The kwargs are not reaching the thinker -- see "
+            "Qwen2_5OmniForConditionalGeneration.generate's thinker_kwargs "
+            "routing, and steps/ft-asr-2.html step 6b."
+        )
+    return gen
+
+# --- babble_data.base_generate_batch, replacing the generate call ---
+        gen = omni_generate(
+            base_model, inputs,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=IM_END_ID, pad_token_id=IM_END_ID,
+            **gen_kwargs,
+        ).cpu()</code></pre></div>
+<p class="muted" style="font-size:.9rem">Two call sites (<code>babble_data.base_generate_batch</code>
+and <code>asr_eval_qwen.transcribe</code>), so it earns its place at module level. The length assert is
+the part that matters: it holds on the thinker path too, so if a future transformers release changes the
+forwarding, the run dies on its first batch instead of producing a plausible-looking dataset.</p>
+
 </div>
 
 <div class="cb"><pre><code># --- babble_data.py, beside --omni-path ---
@@ -902,6 +1116,9 @@ back is to rebuild sent4-v1's dataset id with today's code and no adapter, which
 import numpy as np
 from collections import Counter
 from datasets import load_dataset
+from transformers.models.whisper.english_normalizer import BasicTextNormalizer
+
+NORMALIZER = BasicTextNormalizer()
 
 DS = "keylazy/slurp-bab-Qwen2.5-Omni-3B-sent4-ftasr-v1"
 COLS = ["slurp_id", "kind", "snr_db", "lost", "key_pieces", "beam_hypotheses"]
@@ -920,7 +1137,10 @@ for split in ("train", "test"):
         d["lostfrac"].append(len(r["lost"]) / (len(r["key_pieces"]) or 1))
         hyps = r["beam_hypotheses"] or []
         if hyps:
-            d["distinct"].append(len({h.strip() for h in hyps}))
+            # normalized, like the step-7 gate: the beam returns distinct
+            # TOKEN sequences, and spelling variants of one string are one
+            # witness to a labeler that only does a substring test
+            d["distinct"].append(len({NORMALIZER(h).strip() for h in hyps}))
 
     print(f"{'kind':8s} {'n':&gt;5s} {'mean snr':&gt;9s} {'band':&gt;11s} "
           f"{'in-band pos':&gt;12s} {'lost-frac':&gt;10s} {'distinct':&gt;9s}")
@@ -996,13 +1216,14 @@ sbatch --job-name=ftasr_${PHASE} --account=sciencehub --partition=gpu-a40 \
   --mail-type=ALL --mail-user=zanqil@uw.edu \
   --export=all,PHASE=${PHASE} --wrap='./exp/ft-asr-run.sh'</code></pre></div>
 
-<div class="cb"><pre><code># exp/ft-asr-run.sh -- the body of exp/ft-asr.sh's job, in-band so the
+<div class="cb"><pre><code>#!/bin/bash
+
+# exp/ft-asr-run.sh -- the body of exp/ft-asr.sh's job, in-band so the
 # sbatch --wrap stays readable (same shape as exp/sent-common-run.sh).
 #
-# Every stage reads configs/ft-asr.yaml, so nothing here restates a dataset id,
-# an adapter name or a prompt flag. The only shell-level decisions left are
-# which conda env, which judge server, and which model each eval row runs.
-#!/bin/bash
+# It also has to be its own #!/bin/bash file: sbatch --wrap runs its script
+# under sh, where `source ~/.bashrc` dies in ~/.fzf.bash's process
+# substitution before conda is ever on PATH.
 source ~/.bashrc
 set -eo pipefail
 
@@ -1011,16 +1232,29 @@ conda activate qwen25omni
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 mkdir -p results logs
 
-if [[ "$PHASE" == "asr" ]]; then
-    # no vLLM judge needed: asr_data.py has no LLM calls and the diagnostic is
-    # WER, not a judged score
+if [[ "$PHASE" == "data" ]]; then
     python -u asr_data.py --config "$CFG"
-    # --task asr is `task: asr` in the file; passed here too so the log line
-    # says which of this script's two runs it is without opening the config
+
+    # --task asr must be passed: the config file serves both of this script's
+    # sft_qwen.py runs, and `task` is deliberately not spelled in it -- the flag
+    # is what picks which half of the repair_*/asr_* keys the script reads.
     python -u sft_qwen.py --task asr --config "$CFG"
+
+    # the gate (steps/ft-asr-2.html steps 7-8). Four runs: base and ft on the
+    # ASR test split, then both again on the sent4-v1 test rows -- different
+    # SLURP split and SNR draws, so that pair is the generalization check on
+    # audio resembling what babble_data.py will feed the labeler. Those rows
+    # keep the transcript in `sentence` (their `target` is a repair reply),
+    # hence --ref-column.
+    SENT4_DS=keylazy/slurp-babble-Qwen2.5-Omni-3B-sent4-v1
     python -u asr_eval_qwen.py --config "$CFG" --tag base
     python -u asr_eval_qwen.py --config "$CFG" --tag ft \
         --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft
+    python -u asr_eval_qwen.py --config "$CFG" --tag base-on-sent4 \
+        --asr-ds-id "$SENT4_DS" --split test --ref-column sentence
+    python -u asr_eval_qwen.py --config "$CFG" --tag ft-on-sent4 \
+        --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft \
+        --asr-ds-id "$SENT4_DS" --split test --ref-column sentence
     echo "=== gate: compare results/asr_*_base.jsonl and results/asr_*_ft.jsonl ==="
     exit 0
 fi
@@ -1042,10 +1276,10 @@ python -u babble_data.py --config "$CFG"
 python -u sft_qwen.py --config "$CFG"
 
 # Two judge passes off the one adapter, as on the sent tracks: the per-kind
-# judges (comparable with the beam rows) and the type judge + tree
-# matrix (comparable with the tree rows). Numbers are comparable within a judge
-# only. Base and adapter both run, so the delta is measured on this dataset
-# rather than read across from the v1 table.
+# judges (comparable with the beam rows) and the type judge + tree matrix
+# (comparable with the tree rows). Numbers are comparable within a judge only.
+# Base and adapter both run, so the delta is measured on this dataset rather
+# than read across from the v1 table.
 for adapter in "" "checkpoints/Qwen2.5-Omni-3B-bab-sent4ft-sft"; do
     name="${adapter:-Qwen/Qwen2.5-Omni-3B}"; name="${name##*/}"
     for pass in "per-kind|sent4-ftasr" "tree|sent4-ftasr-typejudge"; do

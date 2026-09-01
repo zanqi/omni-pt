@@ -22,13 +22,22 @@ if [[ "$PHASE" == "data" ]]; then
     # is what picks which half of the repair_*/asr_* keys the script reads.
     python -u sft_qwen.py --task asr --config "$CFG"
 
-    # asr_eval_qwen.py is the one remaining piece of stage 0
-    # (steps/ft-asr-2.html step 7); until it lands the gate below has nothing
-    # to read. Uncomment when it does.
-    # python -u asr_eval_qwen.py --config "$CFG" --tag base
-    # python -u asr_eval_qwen.py --config "$CFG" --tag ft \
-    #     --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft
-    # echo "=== gate: compare results/asr_*_base.jsonl and results/asr_*_ft.jsonl ==="
+    # the gate (steps/ft-asr-2.html steps 7-8). Four runs: base and ft on the
+    # ASR test split, then both again on the sent4-v1 test rows -- different
+    # SLURP split and SNR draws, so that pair is the generalization check on
+    # audio resembling what babble_data.py will feed the labeler. Those rows
+    # keep the transcript in `sentence` (their `target` is a repair reply),
+    # hence --ref-column.
+    SENT4_DS=keylazy/slurp-babble-Qwen2.5-Omni-3B-sent4-v1
+    python -u asr_eval_qwen.py --config "$CFG" --tag base
+    python -u asr_eval_qwen.py --config "$CFG" --tag ft \
+        --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft
+    python -u asr_eval_qwen.py --config "$CFG" --tag base-on-sent4 \
+        --asr-ds-id "$SENT4_DS" --split test --ref-column sentence
+    python -u asr_eval_qwen.py --config "$CFG" --tag ft-on-sent4 \
+        --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft \
+        --asr-ds-id "$SENT4_DS" --split test --ref-column sentence
+    echo "=== gate: compare results/asr_*_base.jsonl and results/asr_*_ft.jsonl ==="
     exit 0
 fi
 
