@@ -17,14 +17,14 @@ mkdir -p results logs
 if [[ "$PHASE" == "data" ]]; then
     python -u asr_data.py --config "$CFG"
 
-    # The rest of stage 0 is not written yet -- `sft_qwen.py --task asr` and
-    # asr_eval_qwen.py are the two remaining pieces (steps/ft-asr-2.html step
-    # 8). Uncomment as they land; until then this phase is the dataset build
-    # alone and the gate below has nothing to read.
-    #
-    # --task asr is `task: asr` in the file; passed here too so the log line
-    # says which of this script's two runs it is without opening the config
-    # python -u sft_qwen.py --task asr --config "$CFG"
+    # --task asr must be passed: the config file serves both of this script's
+    # sft_qwen.py runs, and `task` is deliberately not spelled in it -- the flag
+    # is what picks which half of the repair_*/asr_* keys the script reads.
+    python -u sft_qwen.py --task asr --config "$CFG"
+
+    # asr_eval_qwen.py is the one remaining piece of stage 0
+    # (steps/ft-asr-2.html step 7); until it lands the gate below has nothing
+    # to read. Uncomment when it does.
     # python -u asr_eval_qwen.py --config "$CFG" --tag base
     # python -u asr_eval_qwen.py --config "$CFG" --tag ft \
     #     --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft

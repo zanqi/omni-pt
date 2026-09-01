@@ -30,10 +30,6 @@ CHECKPOINT_DIR = "checkpoints"
 AUDIO_SAMPLING_RATE = 16000
 MAX_AUDIO_SECONDS = 30
 
-# --answerable-token experiment: answer rows are trained to emit this literal
-# string instead of a natural-language reply (eval side matches it exactly).
-ANSWERABLE_TOKEN = "<|answerable|>"
-
 def get_audio(field):
     samples = field.get_all_samples()
     arr = samples.data # (C, T), C=num chanels
@@ -44,21 +40,17 @@ def get_audio(field):
 
 
 class SlurpDataset(torch.utils.data.Dataset):
-    def __init__(self, hf_ds, answerable_token=False) -> None:
+    def __init__(self, hf_ds) -> None:
         self.ds = hf_ds
-        self.answerable_token = answerable_token
 
     def __len__(self):
         return len(self.ds)
 
     def __getitem__(self, i) -> Any:
         row = self.ds[i]
-        target = row["target"]
-        if self.answerable_token and row["kind"] == "answer":
-            target = ANSWERABLE_TOKEN
         return {
             "audio": get_audio(row["audio"]),
-            "target": target,
+            "target": row["target"],
             "kind": row["kind"],
         }
 
@@ -303,37 +295,49 @@ class Config:
     grad_accum: int = 1
     qlora: bool = False
     smoke: bool = False
-    kinds: str | None = None
+    train_kinds: str | None = None
     out: str | None = None
     task: str = "repair"
-    repo_name: str | None = None
 
+    # This script has two runs and one config file, so every value that differs
+    # between them is spelled twice and --task picks a set. Each key still has
+    # exactly one flag; nothing else in the file is duplicated.
     # --task repair
     repair_ds_id: str | None = None
-    repair_epoch: float = 3.0
+    repair_epochs: float = 3.0
     repair_lr: float = 2e-4
+    repair_repo_name: str | None = None
 
     # --task asr
     asr_ds_id: str | None = None
     asr_epochs: float = 2.0
     asr_lr: float = 1e-4
+    asr_repo_name: str | None = None
 
 def main(cfg: Config):
+    # A key this stage does not declare is dropped by load_config without a
+    # word, so a typo'd one leaves its field at the dataclass default. This
+    # line is where you see it.
+    print(f"config: {cfg}")
+
     family = detect_model_family(cfg.omni_path)
     print(f"model family: {family}")
 
     model_name = cfg.omni_path.rstrip("/").split("/")[-1]
     # distinct default per task, so an asr run can't overwrite the babble adapter
     suffix = "asr-sft" if cfg.task == "asr" else "bab-sft"
-    repo_name = cfg.repo_name or f"{model_name}-{suffix}"
+    repair = cfg.task == "repair"
+    repo_name = (cfg.repair_repo_name if repair else cfg.asr_repo_name) or (
+        f"{model_name}-{suffix}"
+    )
     hub_id = f"keylazy/{repo_name}"
     out = cfg.out or f"{CHECKPOINT_DIR}/{repo_name}"
-    ds_id = cfg.repair_ds_id if cfg.task == "repair" else cfg.asr_ds_id
-    epoch = cfg.repair_epoch if cfg.task == "repair" else cfg.asr_epochs
-    lr = cfg.repair_lr if cfg.task == "repair" else cfg.asr_lr
+    ds_id = cfg.repair_ds_id if repair else cfg.asr_ds_id
+    epoch = cfg.repair_epochs if repair else cfg.asr_epochs
+    lr = cfg.repair_lr if repair else cfg.asr_lr
 
     print(f"Loading SFT dataset {ds_id} ...")
-    kinds = [k.strip() for k in cfg.kinds.split(",")] if cfg.kinds else None
+    kinds = [k.strip() for k in cfg.train_kinds.split(",")] if cfg.train_kinds else None
     train_hf = load_ds_split(ds_id, cfg.train_split, kinds=kinds)
 
     train_ds = SlurpDataset(train_hf)
@@ -410,45 +414,40 @@ if __name__ == "__main__":
 
     ap.add_argument("--config", type=str)
     ap.add_argument("--train-split", type=str)
-    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--batch-size", type=int)
     ap.add_argument("--omni-path", type=str)
     ap.add_argument("--grad-accum", type=int)
     ap.add_argument("--qlora", action="store_true", default=None)  # TODO: what?
     ap.add_argument(
         "--task",
         type=str,
-        default="repair",
         choices=("repair", "asr"),
-        help="Which prompt pair to train under (see prompts.get_prompts): "
-        "'repair' for the babble/ear assistant datasets, 'asr' for the "
-        "transcription dataset built by asr_data.py.",
+        help="Which prompt pair to train under (see prompts.get_prompts), and "
+        "which half of the config's repair_*/asr_* keys to read: 'repair' for "
+        "the babble/ear assistant datasets, 'asr' for the transcription "
+        "dataset built by asr_data.py.",
     )
-    ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--smoke", action="store_true", default=None)
     ap.add_argument(
-        "--kinds",
-        default=None,
+        "--train-kinds",
         help="Keep only these row kinds of the train split, comma-separated, "
         "e.g. 'answer,repair' to train the C/R-only variant on a dataset that "
         "also carries repeat rows.",
     )
     ap.add_argument(
-        "--repo-name",
-        type=str,
-        help="Names both the output dir and the hub repo. "
-    )
-    ap.add_argument(
         "--out",
-        default=None,
-        help=f"Overrides the {CHECKPOINT_DIR}/<run-name> output dir.",
+        help=f"Overrides the {CHECKPOINT_DIR}/<repo-name> output dir.",
     )
 
     ap.add_argument("--repair-ds-id", type=str)
     ap.add_argument("--repair-epochs", type=float)
     ap.add_argument("--repair-lr", type=float)
+    ap.add_argument("--repair-repo-name", type=str)
 
     ap.add_argument("--asr-ds-id", type=str)
     ap.add_argument("--asr-epochs", type=float)
     ap.add_argument("--asr-lr", type=float)
+    ap.add_argument("--asr-repo-name", type=str)
 
     args = ap.parse_args()
 
@@ -457,5 +456,12 @@ if __name__ == "__main__":
     for key, val in vars(args).items():
         if val is not None and key != "config":
             setattr(cfg, key, val)
+
+    other = "repair_" if cfg.task == "asr" else "asr_"
+    ignored = [
+        k for k in vars(args) if k.startswith(other) and getattr(args, k) is not None
+    ]
+    if ignored:
+        raise SystemExit(f"--task {cfg.task} reads {cfg.task}_* keys, not {ignored}")
 
     main(cfg)

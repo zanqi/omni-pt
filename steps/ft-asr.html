@@ -330,9 +330,12 @@ reproduction broke because
 in this file stays right no matter what the default becomes.</p>
 <p>Every key has exactly one field and exactly one CLI flag that overrides it &mdash; no renaming, no
 merging, no prefix rules in the loader. The only structural wrinkle is that <code>sft_qwen.py</code> runs
-twice off the file (the ASR witness adapter, then the repair adapter), so the four values that differ
-between its two runs are spelled both ways &mdash; <code>asr_epochs</code> and <code>epochs</code> &mdash;
-and <code>--task</code> decides which set that script reads. That decision lives in
+twice off the file (the ASR witness adapter, then the repair adapter), so the values that differ
+between its two runs are spelled both ways &mdash; <code>asr_epochs</code> and
+<code>repair_epochs</code>, and likewise <code>*_ds_id</code>, <code>*_lr</code>,
+<code>*_repo_name</code> &mdash; and <code>--task</code> decides which set that script reads.
+<code>task</code> itself is deliberately <em>not</em> in the file, since one file cannot answer it for
+both runs; it is the one value that always comes from the command line. That decision lives in
 <code>sft_qwen.py</code>, where the two runs are, and nowhere else.</p>
 
 <div class="cb"><pre><code>mkdir -p configs</code></pre></div>
@@ -349,12 +352,10 @@ and <code>--task</code> decides which set that script reads. That decision lives
 # Model
 omni_path: Qwen/Qwen2.5-Omni-3B
 
-prompt: restate
-
 # --- the ASR witness ---
 
 # its dataset (asr_data.py)
-asr_ds_id: keylazy/slurp-asr-bab-devel-v1
+asr_ds_id: keylazy/slurp-asr-bab-v1
 slurp_split: devel
 # `asr_` prefixed like the rest of this stage's keys: babble_data.py's Config
 # declares its own n_train, and PyYAML keeps the LAST of two identical keys
@@ -366,11 +367,12 @@ draws_per_utt: 1
 test_every: 20       # slurp_id % 20 == 0 -&gt; held out for WER
 
 # its LoRA (sft_qwen.py --task asr)
-asr_run_name: Qwen2.5-Omni-3B-asr-sft
+asr_repo_name: Qwen2.5-Omni-3B-asr-sft
 asr_epochs: 2
 asr_lr: 1.0e-4       # half the repair lr: the target is a verbatim transcript,
                      # and 2e-4 on 8K rows overfits devel fast
-asr_batch_size: 16
+# batch_size is NOT spelled twice: both sft runs use the same 16.
+batch_size: 16
 asr_adapter: checkpoints/Qwen2.5-Omni-3B-asr-sft
 
 # its diagnostic, the gate (asr_eval_qwen.py) -- steps/ft-asr-2.html step 8
@@ -386,15 +388,21 @@ n_train: 1000
 n_test: 100          # -&gt; a 300-row test split; every eval pass judges all of it
 n_extra_ans: 1000
 
-# the repair LoRA (sft_qwen.py)
-run_name: Qwen2.5-Omni-3B-bab-sent4ft-sft
-epochs: 3
-lr: 2.0e-4
+# the repair LoRA (sft_qwen.py). Its dataset is spelled again under the
+# repair_ prefix: sft_qwen.py's two runs each read their own half of the
+# repair_*/asr_* keys, and `ds_id` above belongs to babble_data.py.
+repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent4-ftasr-v1
+repair_repo_name: Qwen2.5-Omni-3B-bab-sent4ft-sft
+repair_epochs: 3
+repair_lr: 2.0e-4
 
 # the eval (babble_eval_qwen.py). Per-kind judges, so C and R stay comparable
 # with the beam rows in results/viz.ipynb; the type judge + tree matrix is a
 # second pass with its own tag (see exp/ft-asr-run.sh).
 judge_mode: per-kind
+# the judge's list. sft_qwen.py's train-split filter is `train_kinds`, a
+# separate key on purpose -- sharing this one would hand the ASR run a filter
+# of answer/repair/repeat and select zero rows.
 kinds: answer,repair,repeat
 num_rows: -1
 tag: sent4-ftasr</code></pre></div>
@@ -512,6 +520,10 @@ MULTS= SENT2=1 ./sft.sh qwen25   # read the printed config against sft.sh's flag
 </div>
 
 <h2 id="s2">Step 2 &mdash; move the two ASR prompts into <code>prompts.py</code></h2>
+<p class="muted" style="font-size:.9rem"><b>As built:</b> the constants landed as
+<code>ASR_SYSTEM_PROMPT_QWEN2_5</code> / <code>ASR_PROMPT_QWEN2_5</code> behind
+<code>prompts.get_prompts(task, family)</code>, which also absorbed the family rule. Step&nbsp;4a reads
+against that, not against the two bare names in this section.</p>
 <p><code>sft_qwen.py</code> needs the exact prompt pair the probe uses, and it must not import
 <code>babble_data</code> to get it &mdash; that module opens <code>VLLM_HOST_FILE</code> and constructs an
 <code>OpenAI</code> client at import time, which would make every training job depend on the judge box
@@ -776,197 +788,128 @@ far off <code>asr_n_train/test_every</code>, the stride is landing on a structur
 <code>slurp_id</code> is an <code>int64</code>, so <code>sid % test_every</code> is a 5% stride sample, and
 every recording of one sentence lands on the same side of the split by construction.</div>
 
-<h2 id="s4">Step 4 &mdash; <code>sft_qwen.py</code>: <code>--task asr</code> + <code>--config</code> <span class="tag edit">edit</span></h2>
-<p>Because <code>asr_data.py</code> writes the transcript into <code>target</code>, the only thing that
-has to change is <em>which prompt the collator renders</em>. Three edits.</p>
+<h2 id="s4">Step 4 &mdash; <code>sft_qwen.py</code>: <code>--task asr</code> + <code>--config</code> <span class="tag edit">edit</span> <span class="tag new">built</span></h2>
+<p>Because <code>asr_data.py</code> writes the transcript into <code>target</code> and
+<code>SlurpDataset</code> already reads <code>row["target"]</code>, the only thing that has to change at
+train time is <em>which prompt pair the collator renders</em>. As built, that is one call.</p>
 
-<h3>4a. The collator learns a task</h3>
-<div class="diff">
-<div class="pane before"><div class="hd">sft_qwen.py:75 &mdash; before</div>
-<pre><code>class OmniSFTCollator:
-    def __init__(
-        self, processor, system_prompt=None, heard_reply=False, plain=False
-    ) -&gt; None:
+<h3>4a. The collator asks <code>prompts.get_prompts</code> for its pair</h3>
+<p>The plan drafted an <code>if task == "asr"</code> branch inside <code>OmniSFTCollator.__init__</code>
+that reassigned <code>self.task_prompt</code> and conditionally <code>self.system_prompt</code>. It landed
+as a lookup instead &mdash; <code>get_prompts(task, family)</code> in <code>prompts.py</code> returns the
+<code>(system, user)</code> pair, and owns both rules that branch was re-deriving: which family takes a
+system prompt at all (qwen3 takes none, per its model card) and which user prompt goes with the job. The
+collator therefore takes <code>family</code>, not a pre-resolved <code>system_prompt</code>:</p>
+
+<div class="cb"><pre><code>class OmniSFTCollator:
+    def __init__(self, processor, family, task="repair") -&gt; None:
         self.processor = processor
-        self.system_prompt = system_prompt
-        # must match the prompt the dataset's targets were built under, and
-        # the one babble_eval_qwen.py evaluates with
-        self.task_prompt = task_prompt(heard_reply, plain)</code></pre></div>
-<div class="pane after"><div class="hd">sft_qwen.py:75 &mdash; after</div>
-<pre><code>class OmniSFTCollator:
-    def __init__(
-        self, processor, system_prompt=None, heard_reply=False, plain=False<ins>,
-        task="repair",</ins>
-    ) -&gt; None:
-        self.processor = processor
-        self.system_prompt = system_prompt
-        # must match the prompt the dataset's targets were built under, and
-        # the one babble_eval_qwen.py evaluates with
-        self.task_prompt = task_prompt(heard_reply, plain)
-<ins>        if task == "asr":
-            # the ASR adapter's only consumer is babble_data.py's probe pass,
-            # which decodes under this exact pair -- a different framing here
-            # is a train/probe mismatch, and the witness gets worse rather
-            # than better. ASR_SYSTEM_PROMPT replaces QWEN25_SYSTEM_PROMPT for
-            # the same reason: it is what the probe sends.
-            self.task_prompt = ASR_PROMPT
-            if self.system_prompt is not None:
-                self.system_prompt = ASR_SYSTEM_PROMPT</ins></code></pre></div>
-</div>
-<p class="muted" style="font-size:.9rem">Guarding on <code>is not None</code> keeps the family rule intact:
-qwen3 gets no system prompt at all, exactly as the probe does
-(<a href="../babble_data.py#L957">babble_data.py:957</a>,
-<code>asr_sysp = ASR_SYSTEM_PROMPT if base_family == "qwen2.5" else None</code>).</p>
+        # must match the prompts the dataset's targets were built under, and
+        # the ones babble_eval_qwen.py evaluates with
+        self.system_prompt, self.task_prompt = get_prompts(task, family)</code></pre></div>
 
-<div class="cb"><pre><code># --- sft_qwen.py, the prompts import at line 25 ---
--from prompts import task_prompt
-+from prompts import ASR_PROMPT, ASR_SYSTEM_PROMPT, task_prompt</code></pre></div>
+<p>Same reasoning as the drafted comment, in one place instead of at every call site: the ASR adapter's
+only consumer is <code>babble_data.py</code>'s probe pass, which decodes under this exact pair, so a
+different framing here is a train/probe mismatch and the witness gets worse rather than better.
+<code>run_smoke</code> takes <code>family</code> and <code>task</code> and builds its collator the same
+way, so <code>--smoke</code> works on both tasks.</p>
 
-<h3>4b. The flag, and both collator construction sites</h3>
-<div class="cb"><pre><code># --- sft_qwen.py main(), beside --heard-reply ---
-    ap.add_argument(
-        "--task",
-        choices=("repair", "asr"),
-        default="repair",
-        help="'asr' trains the transcription-only adapter of the ft-asr track: "
-        "same trainer and same target column, but rendered under "
-        "ASR_SYSTEM_PROMPT/ASR_PROMPT instead of the task prompt. Its dataset "
-        "(asr_data.py) writes the ground-truth transcript into `target`.",
-    )</code></pre></div>
+<h3>4b. Config, flags, and the repair_*/asr_* pairs</h3>
+<p>Every value that differs between the two runs is a <code>repair_*</code>/<code>asr_*</code> pair, and
+<code>main()</code> picks a side off <code>cfg.task</code>. <b>Renames against the plan &mdash; the flag
+names are the field names are the YAML keys, so these three move together:</b></p>
 
-<p>Then pass <code>task=args.task</code> at both places a collator is built &mdash;
-<code>Trainer(data_collator=OmniSFTCollator(...))</code> and <code>run_smoke</code>'s. For
-<code>run_smoke</code> the simplest correct change is one more positional/keyword argument threaded
-through; if you would rather not touch it, skip <code>--smoke</code> for this run and read the first
-training loss instead.</p>
+<table>
+<tr><th>Plan</th><th>As built</th><th>Why</th></tr>
+<tr><td><code>ds_id</code> / <code>asr_ds_id</code></td><td><code>repair_ds_id</code> /
+<code>asr_ds_id</code></td><td>Bare <code>ds_id</code> in the track file is <em>babble_data.py's</em> output
+id. Leaving the repair run on the unprefixed key would have made one YAML key mean two things.</td></tr>
+<tr><td><code>epochs</code>, <code>lr</code></td><td><code>repair_epochs</code>,
+<code>repair_lr</code></td><td>Same reason, and the two halves then read symmetrically.</td></tr>
+<tr><td><code>run_name</code> / <code>asr_run_name</code></td><td><code>repair_repo_name</code> /
+<code>asr_repo_name</code></td><td>The value names the hub repo and the checkpoint dir, which is what
+<code>repo_name</code> says and <code>run_name</code> did not. It stays a <em>pair</em>: a single
+<code>repo_name</code> field cannot hold two adapters' names in one file.</td></tr>
+<tr><td><code>asr_batch_size</code></td><td>&mdash; (dropped)</td><td>Both runs train at 16. A key spelled
+twice with the same value in both halves is two places to change it.</td></tr>
+<tr><td><code>kinds</code></td><td><code>train_kinds</code></td><td><b>A real collision.</b>
+<code>babble_eval_qwen.py</code> reads <code>kinds</code> as the judge's kind list, and the track file sets
+it to <code>answer,repair,repeat</code>. Declaring the same name in <code>sft_qwen.py</code> silently hands
+the ASR run that filter &mdash; and ASR rows are <code>kind="asr"</code>, so it selects <b>zero rows</b>.
+Renaming the train-side one is the fix; <code>sft.sh</code>'s CR track and <code>exp/mask-sft.sh</code>
+pass <code>--train-kinds</code> now.</td></tr>
+<tr><td><code>prompt: restate</code></td><td>&mdash; (dropped)</td><td><code>--plain-prompt</code> and
+<code>--heard-reply</code> are gone from <code>sft_qwen.py</code>; <code>get_prompts</code> returns the
+restate prompt unconditionally for <code>repair</code>. The key had nothing left to set.</td></tr>
+<tr><td><code>task</code> in the YAML</td><td>CLI only</td><td>One file serves both runs, so the file
+cannot answer which one this is. The dataclass's <code>"repair"</code> is the only default;
+<code>--task</code> itself carries none.</td></tr>
+</table>
 
-<h3>4c. <code>--config</code></h3>
-<p><code>main()</code> becomes <code>main(cfg)</code> and the <code>args.</code> references inside it
-become <code>cfg.</code> &mdash; a mechanical rename over ~30 lines. The dataclass has to reproduce
-<em>every</em> current argparse default exactly; that is the whole risk of this edit, so transcribe it from
-the file rather than from memory (the <code>git show</code> one-liner in step&nbsp;1).</p>
+<div class="risk"><b>The bug the None-default discipline exists to catch, caught three times.</b> The first
+cut of this step kept <code>default=16</code> on <code>--batch-size</code>, <code>default="repair"</code>
+on <code>--task</code>, and a bare <code>action="store_true"</code> on <code>--smoke</code>. None of those
+is ever <code>None</code>, so the override loop reads every run as having passed the flag and the config
+file's value is overwritten on every single run &mdash; <code>task: asr</code> in a YAML would have been
+unreachable, and <code>batch_size</code> in the file inert. Every flag now carries no
+<code>default=</code> at all, or <code>default=None</code> for the two <code>store_true</code>s.</div>
 
-<div class="cb"><pre><code># --- sft_qwen.py, above main() ---
-@dataclass
-class Config:
-    """Every default sft_qwen.py has, in one block. Transcribed from the
-    argparse calls it replaces -- a value that drifts here silently changes an
-    existing track whose command line did not change."""
+<div class="risk"><b>And the rename bug.</b> The field was <code>repair_epoch</code> while the flag was
+<code>--repair-epochs</code>. <code>setattr</code> does not care: the flag quietly created a new attribute
+nobody read, and the run trained for the dataclass's 3 epochs no matter what was passed. Nothing raises on
+this class of typo &mdash; the <code>print(f"config: {cfg}")</code> now at the top of <code>main()</code> is
+what shows it, because the field sits at its default in a line you can read.</div>
 
-    train_split: str = "train"
-    omni_path: str = "Qwen/Qwen2.5-Omni-3B"
-    batch_size: int = 16
-    grad_accum: int = 1
-    qlora: bool = False
-    answerable_token: bool = False
-    heard_reply: bool = False
-    # "restate" (TASK_PROMPT_TREE, the default) or "plain" (TASK_PROMPT). The
-    # --plain-prompt flag the .sh drivers pass still sets this; see __main__.
-    prompt: str = "restate"
-    smoke: bool = False
-    kinds: str = None
-    train_caps: str = None
-    out: str = None
+<h3>4c. The guard: a flag for the run you are not doing</h3>
+<p>Each key has exactly one flag, so a hand-passed <code>--repair-lr</code> on a <code>--task asr</code>
+run would be read by nobody. Say so in the first second rather than twelve hours in:</p>
 
-    # This script has two runs and one config file, so the four values that
-    # differ between them are spelled twice and --task picks a set. Nothing
-    # else in the file is duplicated, and each key still has exactly one flag.
-    task: str = "repair"
-    # --task repair
-    ds_id: str = "keylazy/slurp-babble-Qwen2.5-Omni-3B"
-    epochs: float = 3.0
-    lr: float = 2e-4
-    run_name: str = None
-    # --task asr
-    asr_ds_id: str = None
-    asr_epochs: float = 2.0
-    asr_lr: float = 1e-4
-    asr_batch_size: int = 16
-    asr_run_name: str = None</code></pre></div>
-
-<div class="cb"><pre><code># --- sft_qwen.py, replacing main()'s parser and `args = ap.parse_args()` ---
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config")
-    ap.add_argument("--ds-id", default=None)
-    ap.add_argument("--train-split", default=None)
-    ap.add_argument("--omni-path", default=None)
-    ap.add_argument("--epochs", type=float, default=None)
-    ap.add_argument("--lr", type=float, default=None)
-    ap.add_argument("--batch-size", type=int, default=None)
-    ap.add_argument("--grad-accum", type=int, default=None)
-    ap.add_argument("--qlora", action="store_true", default=None)
-    ap.add_argument("--answerable-token", action="store_true", default=None)
-    ap.add_argument("--heard-reply", action="store_true", default=None)
-    ap.add_argument("--prompt", choices=("restate", "plain"), default=None)
-    # sft.sh's BEAM and SENT4 tracks pass --plain-prompt, so the flag has to
-    # keep working byte-for-byte. store_const points it at the same field the
-    # YAML writes, which is why there is no second `plain_prompt` to reconcile:
-    # absent -> None -> no override, exactly like every other flag here.
-    ap.add_argument(
-        "--plain-prompt", dest="prompt", action="store_const", const="plain",
-        default=None,
-        help="Train under TASK_PROMPT, which does not ask the model to restate "
-        "what it heard. Restating is the default now that the answer targets "
-        "are written to do it; pass this to reproduce an older adapter.",
-    )
-    ap.add_argument("--task", choices=("repair", "asr"), default=None,
-                    help="'asr' trains the transcription-only adapter of the "
-                    "ft-asr track: same trainer and same target column, but "
-                    "rendered under ASR_SYSTEM_PROMPT/ASR_PROMPT, and reading "
-                    "the asr_* keys of the config instead of the bare ones.")
-    ap.add_argument("--smoke", action="store_true", default=None)
-    ap.add_argument("--kinds", default=None)
-    ap.add_argument("--train-caps", default=None)
-    ap.add_argument("--run-name", default=None)
-    ap.add_argument("--out", default=None)
-    # the asr run's four values; each key in the file has exactly one flag
-    ap.add_argument("--asr-ds-id", default=None)
-    ap.add_argument("--asr-epochs", type=float, default=None)
-    ap.add_argument("--asr-lr", type=float, default=None)
-    ap.add_argument("--asr-batch-size", type=int, default=None)
-    ap.add_argument("--asr-run-name", default=None)
-    args = ap.parse_args()
-
-    cfg = load_config(args.config, Config) if args.config else Config()
-    for key, value in vars(args).items():
-        if value is not None and key != "config":
-            setattr(cfg, key, value)
-
-    # Each key has exactly one flag, so the flags belonging to the run you are
-    # NOT doing would be read by nobody. Say so now rather than ignoring a
-    # hand-passed hyperparameter for twelve hours.
-    other = (
-        ("ds_id", "epochs", "lr", "run_name")
-        if cfg.task == "asr"
-        else ("asr_ds_id", "asr_epochs", "asr_lr", "asr_batch_size", "asr_run_name")
-    )
-    ignored = [k for k in other if getattr(args, k) is not None]
+<div class="cb"><pre><code>    other = ("repair_", "asr_") if cfg.task == "asr" else ("asr_", "repair_")
+    ignored = [
+        k for k in vars(args) if k.startswith(other[0]) and getattr(args, k) is not None
+    ]
     if ignored:
-        raise SystemExit(f"--task {cfg.task} does not read {ignored}")
+        raise SystemExit(f"--task {cfg.task} reads {other[1]}* keys, not {ignored}")</code></pre></div>
 
-    main(cfg)</code></pre></div>
+<h3>4d. Fallout in the drivers</h3>
+<p>The plan promised &ldquo;every existing track keeps its exact argv&rdquo;. That promise did not survive
+the renames, and <code>sft.sh</code> was left passing <code>--ds-id --run-name --epochs</code>, none of
+which exist any more &mdash; an <code>unrecognized arguments</code> exit on <em>every</em> track, before the
+model loads. Fixed at both call sites:</p>
 
+<div class="diff">
+<div class="pane before"><div class="hd">sft.sh / exp/mask-sft.sh &mdash; before</div>
+<pre><code><del>    --ds-id "$ds_id"
+    --run-name "$run_name"
+    --epochs "$EPOCHS"
+    --kinds answer,repair</del></code></pre></div>
+<div class="pane after"><div class="hd">&mdash; after</div>
+<pre><code><ins>    --repair-ds-id "$ds_id"
+    --repair-repo-name "$run_name"
+    --repair-epochs "$EPOCHS"
+    --train-kinds answer,repair</ins></code></pre></div>
+</div>
 
+<p><code>exp/ft-asr-run.sh</code>'s <code>data</code> phase now runs the ASR SFT for real (it was commented
+out pending this step); only the <code>asr_eval_qwen.py</code> lines stay commented, since that script is
+part&nbsp;2 step&nbsp;7.</p>
 
-<div class="cb"><pre><code># --- sft_qwen.py, the two remaining import lines ---
--from util import QWEN25_SYSTEM_PROMPT, detect_model_family
-+from dataclasses import dataclass
-+from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_config
-
-# --- and at the top of main(cfg), where the two runs diverge ---
-+    asr = cfg.task == "asr"
-+    ds_id = cfg.asr_ds_id if asr else cfg.ds_id
-+    epochs = cfg.asr_epochs if asr else cfg.epochs
-+    lr = cfg.asr_lr if asr else cfg.lr
-+    batch_size = cfg.asr_batch_size if asr else cfg.batch_size
-+    run_name = cfg.asr_run_name if asr else cfg.run_name
-+    # ...the rest of main() reads these five locals, not cfg, for these values
--    plain = args.plain_prompt
-+    plain = cfg.prompt == "plain"</code></pre></div>
+<div class="cb"><pre><code># what the file actually resolves to, before any GPU
+python -c '
+import ast, dataclasses, yaml
+src = open("sft_qwen.py").read(); tree = ast.parse(src)
+cd = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Config")
+ns = {}; exec("from dataclasses import dataclass\n@dataclass\n" + ast.get_source_segment(src, cd), ns)
+fields = {f.name for f in dataclasses.fields(ns["Config"])}
+raw = yaml.safe_load(open("configs/ft-asr.yaml"))
+print("sft reads  :", sorted(set(raw) &amp; fields))
+print("sft ignores:", sorted(set(raw) - fields))
+'
+# and the drivers still parse
+bash -n sft.sh exp/mask-sft.sh exp/ft-asr-run.sh</code></pre></div>
 
 <h2 id="s5">Step 5 &mdash; train the ASR LoRA</h2>
-<p>~8K rows &times; 2 epochs at batch 16 is ~1,030 steps &mdash; roughly the same step count as a 3-epoch
+<p>~8K rows &times; 2 epochs at <code>batch_size</code> 16 is ~1,030 steps &mdash; roughly the same step count as a 3-epoch
 sent4 repair run, so expect a comparable wall clock on one A40.</p>
 
 <div class="cb"><pre><code>sbatch --job-name=asr_sft --account=sciencehub --partition=gpu-a40 \
@@ -979,7 +922,7 @@ sent4 repair run, so expect a comparable wall clock on one A40.</p>
           python -u sft_qwen.py --task asr --config configs/ft-asr.yaml'</code></pre></div>
 
 <div class="card"><b>Check before you walk away.</b> The log's first lines must show
-<code>asr_ds_id=keylazy/slurp-asr-bab-devel-v1</code> resolved from the config, and the LoRA target list
+<code>asr_ds_id='keylazy/slurp-asr-bab-v1'</code> in the <code>config: Config(...)</code> line resolved from the config, and the LoRA target list
 from <code>find_lm_linear_names</code> (<code>thinker.model.*</code> only). Loss should start around
 2&ndash;3 and fall below ~0.6; a transcript target is much easier than a repair reply, so a loss plateau
 above ~1.0 means the prompt swap did not take effect &mdash; check <code>--task asr</code> actually

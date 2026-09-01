@@ -11,8 +11,6 @@
 # Model
 omni_path: Qwen/Qwen2.5-Omni-3B
 
-prompt: restate
-
 # --- the ASR witness ---
 
 # its dataset (asr_data.py)
@@ -28,11 +26,12 @@ draws_per_utt: 1
 test_every: 20       # slurp_id % 20 == 0 -> held out for WER
 
 # its LoRA (sft_qwen.py --task asr)
-asr_run_name: Qwen2.5-Omni-3B-asr-sft
+asr_repo_name: Qwen2.5-Omni-3B-asr-sft
 asr_epochs: 2
 asr_lr: 1.0e-4       # half the repair lr: the target is a verbatim transcript,
                      # and 2e-4 on 8K rows overfits devel fast
-asr_batch_size: 16
+# batch_size is NOT spelled twice: both runs use sft_qwen.py's 16.
+batch_size: 16
 asr_adapter: checkpoints/Qwen2.5-Omni-3B-asr-sft
 
 # its diagnostic, the gate (asr_eval_qwen.py) -- steps/ft-asr-2.html step 8
@@ -48,10 +47,13 @@ n_train: 1000
 n_test: 100          # -> a 300-row test split; every eval pass judges all of it
 n_extra_ans: 1000
 
-# the repair LoRA (sft_qwen.py)
-run_name: Qwen2.5-Omni-3B-bab-sent4ft-sft
-epochs: 3
-lr: 2.0e-4
+# the repair LoRA (sft_qwen.py). repair_ds_id is the same dataset babble_data.py
+# writes above, spelled again because sft_qwen.py's two runs each read their own
+# half of the repair_*/asr_* keys.
+repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent4-ftasr-v1
+repair_repo_name: Qwen2.5-Omni-3B-bab-sent4ft-sft
+repair_epochs: 3
+repair_lr: 2.0e-4
 
 # the eval (babble_eval_qwen.py). Per-kind judges, so C and R stay comparable
 # with the beam rows in results/viz.ipynb; the type judge + tree matrix is a

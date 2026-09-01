@@ -76,7 +76,7 @@ elif [[ -n "${CR:-}" ]]; then
     # C/R only: the beam-v3 rows as built, minus every repeat row. Same audio
     # and targets as the beam track, so the only variable is the removed third
     # dimension.
-    EXTRA_FLAGS="--kinds answer,repair"
+    EXTRA_FLAGS="--train-kinds answer,repair"
     ADAPTER_KIND="bab-cr-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v3"
     DEFAULT_QWEN3=""  # no qwen3 beam dataset exists; pass DS_QWEN3 explicitly
@@ -103,9 +103,9 @@ run_sft() {
     echo "=== ${run_name}: train split as built, ${EPOCHS} epochs <- ${ds_id} ==="
     python -u sft_qwen.py $EXTRA_FLAGS \
         --omni-path "$omni_path" \
-        --ds-id "$ds_id" \
-        --run-name "$run_name" \
-        --epochs "$EPOCHS"
+        --repair-ds-id "$ds_id" \
+        --repair-repo-name "$run_name" \
+        --repair-epochs "$EPOCHS"
     echo "=== ${run_name} done ==="
 }
 

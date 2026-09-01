@@ -18,11 +18,11 @@
 #SBATCH --export=all
 
 # LoRA SFT on the mask dataset (steps/mask.html step 8). No code change was
-# needed -- sft_qwen.py already takes --ds-id and filters by --kinds.
+# needed -- sft_qwen.py already takes --repair-ds-id and filters by --train-kinds.
 #
 #   sbatch exp/mask-sft.sh
 #   DS_ID=me/my-ds RUN_NAME=my-sft sbatch exp/mask-sft.sh
-#   sbatch exp/mask-sft.sh --epochs 2 --lr 1e-4     # passthrough
+#   sbatch exp/mask-sft.sh --repair-epochs 2 --repair-lr 1e-4   # passthrough
 #
 # Adapter lands in checkpoints/$RUN_NAME and is pushed to keylazy/$RUN_NAME.
 
@@ -36,8 +36,8 @@ conda activate qwen25omni
 
 echo "=== SFT ${RUN_NAME} on ${DS_ID} $* ==="
 python -u sft_qwen.py \
-    --ds-id "$DS_ID" \
-    --run-name "$RUN_NAME" \
-    --kinds answer,repair \
+    --repair-ds-id "$DS_ID" \
+    --repair-repo-name "$RUN_NAME" \
+    --train-kinds answer,repair \
     "$@"
 echo "=== ${RUN_NAME} trained ==="
