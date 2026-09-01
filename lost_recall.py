@@ -91,14 +91,14 @@ def mix(clean, slurp_id, snr, pool, rng):
     """Babble-mix one utterance at one SNR -- the same math probe_by_kinds uses."""
     length = len(clean)
     babble = np.zeros(length, dtype=np.float32)
-    for b in rng.sample([a for sid, a in pool if sid != slurp_id], B.BABBLE_SPEAKERS):
+    for b in rng.sample([a for sid, a in pool if sid != slurp_id], B.NUM_BAB_SPEAKERS):
         if len(b) < length:
             b = np.pad(b, (0, length - len(b)), "wrap")
         else:
             start = rng.randint(0, len(b) - length)
             b = b[start:start + length]
         babble += b
-    babble /= B.BABBLE_SPEAKERS
+    babble /= B.NUM_BAB_SPEAKERS
     # SNR = 10*log10(clean_power / babble_power)
     target = float(np.mean(clean**2)) / (10 ** (snr / 10))
     babble *= np.sqrt(target / float(np.mean(babble**2)))

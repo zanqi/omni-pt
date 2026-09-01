@@ -54,7 +54,7 @@ from transformers import (
 
 from babble_data import (
     AUDIO_SAMPLING_RATE,
-    BABBLE_SPEAKERS,
+    NUM_BAB_SPEAKERS,
     MAX_AUDIO_SECONDS,
     NON_PIECE_WORDS,
     UTTERANCE_WORKERS,
@@ -433,14 +433,14 @@ def build_bed(clean, pool, plan, sentence, rng):
 
     def babble_mixture():
         mix = np.zeros(length, dtype=np.float32)
-        for clip in rng.sample(pool, BABBLE_SPEAKERS):
+        for clip in rng.sample(pool, NUM_BAB_SPEAKERS):
             if len(clip) < length:
                 clip = np.pad(clip, (0, length - len(clip)), "wrap")
             else:
                 start = rng.randint(0, len(clip) - length)
                 clip = clip[start : start + length]
             mix += clip
-        return mix / BABBLE_SPEAKERS
+        return mix / NUM_BAB_SPEAKERS
 
     clean_bg = rng.random() < CLEAN_BG_PROB
     base_snr = round(rng.uniform(*SNR_BAND), 1)

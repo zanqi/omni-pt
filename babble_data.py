@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import soundfile as sf
 import torch
-from datasets import Audio, Dataset, DatasetDict, load_dataset
+from datasets import Audio, Dataset, DatasetDict, IterableDataset, load_dataset
 from openai import OpenAI
 from qwen_omni_utils import process_mm_info
 from tqdm import tqdm
@@ -42,7 +42,13 @@ from prompts import (
     split_heard_reply,
     task_prompt,
 )
-from util import QWEN25_SYSTEM_PROMPT, detect_model_family, load_model
+from util import (
+    NUM_BAB_SPEAKERS,
+    QWEN25_SYSTEM_PROMPT,
+    add_noise,
+    detect_model_family,
+    load_model,
+)
 
 skip = Counter()
 
@@ -56,6 +62,7 @@ AUDIO_SAMPLING_RATE = 16000
 
 # defend against single long audio causing oom
 MAX_AUDIO_SECONDS = 30
+MIN_AUDIO_SECONDS = 1
 
 N_TRAIN_TRIPLETS = 1000
 N_TEST_TRIPLETS = 50
@@ -72,7 +79,6 @@ SEED = 42
 ROW_ID = itertools.count(1)
 
 BABBLE_POOL_SIZE = 300
-BABBLE_SPEAKERS = 3
 BABBLE_CLIP_MAX_SEC = 10  # trim pool clips to save memory
 
 PROBE_BATCH_SIZE = 16
@@ -840,8 +846,6 @@ def write_target(sentence, kind, probe):
 def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
     def make_probe_batch(kinds_need):
         """return a list of wav paths and a list of snr vals"""
-        length = len(clean)
-        clean_power = float(np.mean(clean**2))
         bands = SLOT_SNR if TRACK == "two-pass" else SLOT_SNR_DISJOINT
         paths, snrs = [], []
         n_draw = min(batch_size, PROBE_PER_SLOT * len(kinds_need))
@@ -858,33 +862,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                 # as "clean" everywhere downstream
                 noisy, snr = clean, None
             else:
-                # mix a babble
-                babble = np.zeros(length, dtype=np.float32)
-                for b in rng.sample(pool, BABBLE_SPEAKERS):
-                    if len(b) < length:
-                        b = np.pad(b, (0, length - len(b)), "wrap")
-                    else:
-                        start = rng.randint(0, len(b) - length)
-                        b = b[start : start + length]
-                    babble += b
-                babble /= BABBLE_SPEAKERS
-
-                # sample snr, round to 1 decimal digit
-                snr = round(rng.uniform(*bands[slot]), 1)
-
-                # synthesize noisy audio
-                # SNR = 10*log10(clean_power / babble_power)
-                #   -> target_babble_power = clean_power / 10^(SNR/10)
-                #   -> scale babble = sqrt(target_power / current_power)
-                current_babble_power = float(np.mean(babble**2))
-                target_babble_power = clean_power / (10 ** (snr / 10))
-                scale = np.sqrt(target_babble_power / current_babble_power)
-                noisy = clean + scale * babble
-                peak = float(np.max(np.abs(noisy)))
-                if peak > 1.0:
-                    # avoid clipping on save; rescaling do not change SNR
-                    noisy = noisy / peak
-                noisy = noisy.astype(np.float32)
+                noisy, snr = add_noise(clean, pool, bands[slot], rng)
 
             # the probe reads this file rather than the float32 array, so the
             # model that gets labeled hears the exact PCM_16 samples the row
@@ -1112,19 +1090,20 @@ def imap_ordered(items, work, workers):
                 fut.cancel()
 
 
-def slurp_ds_stream(split):
+def slurp_ds_stream(split) -> IterableDataset:
     stream = load_dataset("qmeeus/slurp", split=split, streaming=True)
+    assert isinstance(stream, IterableDataset)
     return stream.cast_column("audio", Audio(sampling_rate=AUDIO_SAMPLING_RATE))
 
 
 def collect_babble_pool(split):
     stream = slurp_ds_stream(split)
     max_len = BABBLE_CLIP_MAX_SEC * AUDIO_SAMPLING_RATE
+    min_len = MIN_AUDIO_SECONDS * AUDIO_SAMPLING_RATE
     pool = []
     for row in stream:
         arr = row["audio"]["array"].astype(np.float32)[:max_len]
-        if len(arr) > AUDIO_SAMPLING_RATE:
-            # only add clips longer than 1 sec
+        if len(arr) > min_len:
             pool.append((row["slurp_id"], arr))
         if len(pool) >= BABBLE_POOL_SIZE:
             break

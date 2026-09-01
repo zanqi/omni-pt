@@ -5,6 +5,8 @@ Imports are done lazily per family inside load_model, so each conda env
 
 import os
 import dataclasses
+
+import numpy as np
 import torch
 
 # Default system prompt from the Qwen2.5-Omni HF page.
@@ -15,6 +17,47 @@ QWEN25_SYSTEM_PROMPT = (
     "capable of perceiving auditory and visual inputs, as well as generating "
     "text and speech."
 )
+
+
+# speakers averaged together to make one babble background
+NUM_BAB_SPEAKERS = 3
+
+
+def add_noise(clean, pool, snr_band, rng):
+    """Mix babble into `clean` at an SNR drawn from `snr_band` -> (noisy, snr).
+
+    `pool` is a list of babble clips (bare float32 arrays -- the caller should drops
+    the utterance's own recording before passing it in, so a sentence is never
+    mixed with itself). Clips shorter than the utterance are wrapped, longer
+    ones cropped at a random offset.
+    """
+
+    length = len(clean)
+
+    babble = np.zeros(length, dtype=np.float32)
+    for b in rng.sample(pool, NUM_BAB_SPEAKERS):
+        if len(b) < length:
+            b = np.pad(b, (0, length - len(b)), "wrap")
+        else:
+            start = rng.randint(0, len(b) - length)
+            b = b[start : start + length]
+        babble += b
+    babble /= NUM_BAB_SPEAKERS
+
+    # sample snr, round to 1 decimal digit
+    snr = round(rng.uniform(*snr_band), 1)
+
+    # SNR = 10*log10(clean_power / babble_power)
+    #   -> target_babble_power = clean_power / 10^(SNR/10)
+    #   -> scale babble = sqrt(target_power / current_power)
+    target_babble_power = float(np.mean(clean**2)) / (10 ** (snr / 10))
+    scale = np.sqrt(target_babble_power / float(np.mean(babble**2)))
+    noisy = clean + scale * babble
+    peak = float(np.max(np.abs(noisy)))
+    if peak > 1.0:
+        # avoid clipping on save; rescaling do not change SNR
+        noisy = noisy / peak
+    return noisy.astype(np.float32), snr
 
 
 def detect_model_family(model_path: str) -> str:
@@ -129,6 +172,6 @@ def load_config(path, cls):
     import yaml
 
     with open(path) as f:
-        raw = yaml.safe_load(path) or {}
+        raw = yaml.safe_load(f) or {}
     names = {f.name for f in dataclasses.fields(cls)}
     return cls(**{k: v for k, v in raw.items() if k in names})

@@ -217,7 +217,9 @@ other stage is byte-identical to the sent4-v1 run.</p>
 <tr><td><code>exp/ft-asr.sh</code>, <code>exp/ft-asr-run.sh</code></td><td><span class="tag new">new</span></td>
 <td>Two sbatch drivers, split at the gate.</td></tr>
 <tr><td><code>util.py</code></td><td><span class="tag edit">edit</span></td>
-<td><code>load_config()</code>; and <code>load_model</code> learns to attach a
+<td><code>load_config()</code>; <code>add_noise()</code> + <code>NUM_BAB_SPEAKERS</code>, lifted out of
+<code>babble_data.probe_by_kinds</code> so both builders mix babble through one function; and
+<code>load_model</code> learns to attach a
 <code>thinker.</code>-prefixed adapter to a <code>thinker_only</code> model (part 2, step 6 &mdash; this is
 the one real trap).</td></tr>
 <tr><td><code>prompts.py</code></td><td><span class="tag edit">edit</span></td>
@@ -354,11 +356,14 @@ prompt: restate
 # its dataset (asr_data.py)
 asr_ds_id: keylazy/slurp-asr-bab-devel-v1
 slurp_split: devel
-n_rows: 8000
+# `asr_` prefixed like the rest of this stage's keys: babble_data.py's Config
+# declares its own n_train, and PyYAML keeps the LAST of two identical keys
+# without a word -- an unprefixed n_train here would silently become 1000.
+asr_n_train: 8000
 snr_db: [0.0, 20.0]
 clean_prob: 0.15
 draws_per_utt: 1
-test_every: 20       # hash(slurp_id) % 20 == 0 -&gt; held out for WER
+test_every: 20       # slurp_id % 20 == 0 -&gt; held out for WER
 
 # its LoRA (sft_qwen.py --task asr)
 asr_run_name: Qwen2.5-Omni-3B-asr-sft
@@ -409,6 +414,8 @@ table to drift out of sync.</p>
 <div class="pane after"><div class="hd">util.py &mdash; after</div>
 <pre><code><ins>import dataclasses
 import os
+
+import numpy as np
 </ins>import torch
 
 # Default system prompt from the Qwen2.5-Omni HF page.</code></pre></div>
@@ -453,13 +460,12 @@ class Config:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--config")
-    # EVERY flag defaults to None. That is not cosmetic: it is the only way
-    # argparse can tell "absent" from "passed a value that happens to equal the
-    # default", and the override loop below keys on exactly that distinction.
-    ap.add_argument("--ds-id", default=None)
-    ap.add_argument("--n-rows", type=int, default=None)
-    # a bare store_true would default to False, which reads as "passed" and
-    # would silently overwrite the file on every run
+    # No default= anywhere: argparse already stores None for an absent flag,
+    # and None-means-absent is the whole distinction the override loop keys on.
+    ap.add_argument("--ds-id")
+    ap.add_argument("--n-rows", type=int)
+    # the one exception -- store_true defaults to False, which would read as
+    # "passed" and overwrite the file's value on every run
     ap.add_argument("--no-push", action="store_true", default=None)
     args = ap.parse_args()
 
@@ -474,9 +480,9 @@ if __name__ == "__main__":
 in <code>util.py</code>: it reads the file, and the loop above applies the CLI on top. Defaults live in
 one typed block per stage instead of thirty <code>default=</code> kwargs scattered down a parser, and
 <code>main(cfg)</code> stays callable from a notebook or another script with a hand-built
-<code>Config</code>. The cost is the discipline above &mdash; every flag must say
-<code>default=None</code>, including the booleans, or the override loop treats an absent flag as a passed
-one.</div>
+<code>Config</code>. The cost is the discipline above &mdash; no flag may carry a
+<code>default=</code> other than <code>None</code>, and the <code>store_true</code> flags must say it
+explicitly, or the override loop reads an absent flag as a passed one.</div>
 
 <div class="risk"><b>The one sharp edge: booleans only turn on.</b> With
 <code>action="store_true", default=None</code>, a flag can override <code>False</code> in the file but
@@ -551,35 +557,23 @@ grep -n "ASR_PROMPT\|ASR_SYSTEM_PROMPT" babble_data.py prompts.py sft_qwen.py
 conda activate qwen25omni &amp;&amp; python -c "import prompts, babble_data; print('imports ok')"</code></pre></div>
 
 <h2 id="s3">Step 3 &mdash; <code>asr_data.py</code> <span class="tag new">new</span></h2>
-<p>Uniform-SNR babble mixes over <code>devel</code>. No GPU pass, no LLM call, no probing loop &mdash; the
+<p>Uniform-SNR babble mixes over <code>devel</code>, drawn by <code>util.add_noise</code> &mdash; the same
+function <code>babble_data.probe_by_kinds</code> mixes with, so the two datasets differ in their SNR
+<em>distribution</em> and in nothing else. No GPU pass, no LLM call, no probing loop &mdash; the
 transcript is the ground truth, so there is nothing to label. It writes the <code>target</code> column
 as the normalized sentence, which is what makes step&nbsp;4 a six-line change instead of a new
 <code>Dataset</code> class: <code>SlurpDataset</code> already reads <code>row["target"]</code>.</p>
 
-<div class="cb"><pre><code>"""Build the ASR-only training set for the ft-asr track.
-
-Fresh babble mixes at a UNIFORM SNR over SLURP's `devel` split -- the one real
-speech split babble_data.py never reads. An adapter trained here has heard
-neither the sentences its witnesses will be scored on (SLURP test, where the
-babble test rows come from) nor the ones the sent-4 labels are derived from
-(SLURP train), so the transcripts it produces during labeling are honest at
-both ends. See steps/ft-asr.html step 0 for the check that backs that claim.
-
-No GPU and no LLM calls: the transcript IS the ground truth, so there is
-nothing to probe and nothing to label. Runs on a CPU node in minutes.
-
-  python asr_data.py --config configs/ft-asr.yaml
-  python asr_data.py --config configs/ft-asr.yaml --n-rows 200 --no-push
-"""
-
+<div class="cb"><pre><code># asr_data.py -- as built. The plan drafted a nested mix() here; the
+# babble math now lives in util.add_noise, shared with babble_data.py.
 import argparse
-import hashlib
 import itertools
 import json
 import os
 import random
 import shutil
 from dataclasses import asdict, dataclass
+from typing import Any
 
 import numpy as np
 import soundfile as sf
@@ -590,7 +584,6 @@ from transformers.models.whisper.english_normalizer import BasicTextNormalizer
 from babble_data import (
     AUDIO_ROOT,
     AUDIO_SAMPLING_RATE,
-    BABBLE_SPEAKERS,
     MAX_AUDIO_SECONDS,
     MIN_AUDIO_SECONDS,
     SEED,
@@ -598,12 +591,8 @@ from babble_data import (
     log,
     slurp_ds_stream,
 )
-from util import load_config
+from util import add_noise, load_config
 
-# The probe decodes with .lower().strip() and ASR_PROMPT asks for no
-# punctuation, so the target is normalized the same way the witness text will
-# be: training on cased, punctuated SLURP text would teach the adapter to emit
-# a string the labeler never sees.
 NORMALIZER = BasicTextNormalizer()
 ROW_ID = itertools.count(1)
 MIN_WORDS = 2
@@ -611,176 +600,149 @@ MIN_WORDS = 2
 
 @dataclass
 class Config:
-    """This stage's surface. The field names are the track YAML's key names."""
-
-    slurp_split: str = "devel"
-    # the ASR training set: built here, trained on by sft_qwen.py --task asr,
-    # which declares this same key as the dataset of its asr run
-    asr_ds_id: str = "keylazy/slurp-asr-bab-devel-v1"
-    n_rows: int = 8000  # TRAIN rows; the held-out rows come on top
+    slurp_split: str = &quot;devel&quot;
+    asr_ds_id: str = &quot;keylazy/slurp-asr-bab-v1&quot;
+    asr_n_train: int = 8000
     snr_db: tuple = (0.0, 20.0)
     clean_prob: float = 0.15
     draws_per_utt: int = 1
-    test_every: int = 20  # hash(slurp_id) % test_every == 0 -> held out
+    # slurp_id % test_every == 0 -&gt; held out. Not a tail slice: slurp streams
+    # every recording of one prompt back to back, so a positional boundary puts
+    # the same sentence on both sides of the split.
+    test_every: int = 20
     no_push: bool = False
 
 
-def build_rows(cfg, audio_dir):
-    """Stream the split once, writing one wav per (utterance, draw)."""
-    pool = collect_babble_pool(cfg.slurp_split)
-
-    def mix(clean, rng, exclude_sid):
-        """clean + 3-speaker babble at a uniform SNR -> (samples, snr or None).
-
-        Same SNR math as babble_data.probe_by_kinds, minus the per-kind bands:
-        this set is meant to condition the model across the whole range, not to
-        land a given utterance in a given kind's band.
-        """
-        if rng.random() &lt; cfg.clean_prob:
-            return clean, None
-
-        length = len(clean)
-        babble = np.zeros(length, dtype=np.float32)
-        clips = [a for sid, a in pool if sid != exclude_sid]
-        for b in rng.sample(clips, BABBLE_SPEAKERS):
-            if len(b) &lt; length:
-                b = np.pad(b, (0, length - len(b)), "wrap")
-            else:
-                start = rng.randint(0, len(b) - length)
-                b = b[start : start + length]
-            babble += b
-        babble /= BABBLE_SPEAKERS
-
-        snr = round(rng.uniform(*cfg.snr_db), 1)
-        # SNR = 10*log10(clean_power / babble_power)
-        #   -> target_babble_power = clean_power / 10^(SNR/10)
-        target_power = float(np.mean(clean**2)) / (10 ** (snr / 10))
-        babble *= np.sqrt(target_power / float(np.mean(babble**2)))
-        noisy = clean + babble
-        peak = float(np.max(np.abs(noisy)))
-        if peak &gt; 1.0:
-            noisy = noisy / peak  # rescaling does not change the SNR
-        return noisy.astype(np.float32), snr
+def build_splits(cfg: Config, audio_dir) -&gt; tuple[list[Any], list[Any]]:
+    &quot;&quot;&quot;
+    Return train and test rows
+    &quot;&quot;&quot;
 
     train, test = [], []
+
+    bab_pool = collect_babble_pool(cfg.slurp_split)
+
     skipped = 0
-    pbar = tqdm(total=cfg.n_rows, unit="row", dynamic_ncols=True)
-    for row in slurp_ds_stream(cfg.slurp_split):
-        if len(train) &gt;= cfg.n_rows:
+    pbar = tqdm(total=cfg.asr_n_train, unit=&quot;row&quot;, dynamic_ncols=True)
+    max_len = MAX_AUDIO_SECONDS * AUDIO_SAMPLING_RATE
+    min_len = MIN_AUDIO_SECONDS * AUDIO_SAMPLING_RATE
+
+    for i, slurp_row in enumerate(slurp_ds_stream(cfg.slurp_split)):
+        if len(train) &gt;= cfg.asr_n_train:
             break
 
-        sentence = NORMALIZER(row["sentence"]).strip()
-        clean = row["audio"]["array"].astype(np.float32)
-        clean = clean[: MAX_AUDIO_SECONDS * AUDIO_SAMPLING_RATE]
-        if len(sentence.split()) &lt; MIN_WORDS or len(clean) &lt; MIN_AUDIO_SECONDS * AUDIO_SAMPLING_RATE:
+        sentence = NORMALIZER(slurp_row[&quot;sentence&quot;]).strip()
+        clean = slurp_row[&quot;audio&quot;][&quot;array&quot;].astype(np.float32)[:max_len]
+        if len(sentence.split()) &lt; MIN_WORDS or len(clean) &lt; min_len:
             skipped += 1
             continue
 
-        sid = row["slurp_id"]
-        # Held out by a hash of the id, not by a tail slice: slurp streams every
-        # recording of one prompt back to back (up to ~10), so any positional
-        # boundary puts the same sentence on both sides of the split.
-        held = int(hashlib.md5(str(sid).encode()).hexdigest(), 16) % cfg.test_every == 0
-        rng = random.Random(f"{SEED}:asr:{sid}:{len(train) + len(test)}")
+        sid = slurp_row[&quot;slurp_id&quot;]
+        pool = [aud for pool_sid, aud in bab_pool if pool_sid != sid]
+        is_test = sid % cfg.test_every == 0
+        bab_rng = random.Random(f&quot;{SEED}:asr:{i}&quot;)
 
         for _ in range(cfg.draws_per_utt):
             rid = next(ROW_ID)
-            samples, snr = mix(clean, rng, sid)
-            path = os.path.join(audio_dir, f"{rid:06d}.wav")
-            sf.write(path, samples, AUDIO_SAMPLING_RATE)
-            rec = {
-                "id": rid,
-                # sft_qwen.py's SlurpDataset reads "target" and "kind"; writing
-                # the transcript there means --task asr only has to swap the
-                # prompt, not the dataset class
-                "target": sentence,
-                "kind": "asr",
-                "audio": path,
-                "snr_db": snr,
-                "sentence": sentence,
-                "slurp_id": sid,
-                "source": "asr-babble",
+            path = os.path.join(audio_dir, f&quot;{rid:06d}.wav&quot;)
+            if bab_rng.random() &lt; cfg.clean_prob:
+                # keep noise-free audio in the mix, which is the common case in
+                # deployment; snr_db=None reads as &quot;clean&quot; everywhere downstream
+                audio, snr = clean, None
+            else:
+                audio, snr = add_noise(clean, pool, cfg.snr_db, bab_rng)
+            sf.write(path, audio, AUDIO_SAMPLING_RATE)
+            row = {
+                &quot;id&quot;: rid,
+                &quot;target&quot;: sentence,
+                &quot;kind&quot;: &quot;asr&quot;,
+                &quot;audio&quot;: path,
+                &quot;snr_db&quot;: snr,
+                &quot;sentence&quot;: sentence,
+                &quot;slurp_id&quot;: sid,
+                &quot;source&quot;: &quot;asr-babble&quot;,
             }
-            (test if held else train).append(rec)
-            if not held:
+            (test if is_test else train).append(row)
+            if not is_test:
                 pbar.update(1)
-    pbar.close()
-    log(f"skipped {skipped} (too short / &lt;{MIN_WORDS} words)")
+
+    pbar.close()  # stream done
+    log(f&quot;skipped {skipped} (too short / &lt;{MIN_WORDS} words)&quot;)
+
     return train, test
 
 
 def main(cfg):
-    log(f"config: {cfg}")
+    log(f&quot;config: {cfg}&quot;)
 
-    audio_dir = os.path.join(AUDIO_ROOT, cfg.asr_ds_id.split("/")[-1])
+    audio_dir = os.path.join(AUDIO_ROOT, cfg.asr_ds_id.split(&quot;/&quot;)[-1])
     shutil.rmtree(audio_dir, ignore_errors=True)
     os.makedirs(audio_dir, exist_ok=True)
-    log(f"audio dir: {audio_dir}")
+    log(f&quot;audio dir: {audio_dir}&quot;)
 
-    train_rows, test_rows = build_rows(cfg, audio_dir)
-
-    dump = os.path.join(audio_dir, "rows.json")
-    with open(dump, "w") as f:
-        # the resolved config rides along with the rows: the SNR range and the
-        # split are the only things that distinguish one ASR set from another,
-        # and a filename cannot carry them
+    train, test = build_splits(cfg, audio_dir)
+    rows_json = os.path.join(audio_dir, &quot;rows.json&quot;)
+    with open(rows_json, &quot;w&quot;) as f:
         json.dump(
-            {"config": asdict(cfg), "train": train_rows, "test": test_rows},
+            {&quot;config&quot;: asdict(cfg), &quot;train&quot;: train, &quot;test&quot;: test},
             f,
             indent=1,
         )
-    log(f"wrote {dump}")
+    log(f&quot;wrote {rows_json}&quot;)
 
-    snrs = [r["snr_db"] for r in train_rows if r["snr_db"] is not None]
+    snrs = [r[&quot;snr_db&quot;] for r in train if r[&quot;snr_db&quot;] is not None]
     log(
-        f"train {len(train_rows)} / test {len(test_rows)} rows; "
-        f"clean {sum(1 for r in train_rows if r['snr_db'] is None)}; "
-        f"snr mean {np.mean(snrs):.1f} min {min(snrs):.1f} max {max(snrs):.1f}"
+        f&quot;train {len(train)} / test {len(test)} rows; &quot;
+        f&quot;clean {sum(1 for r in train if r[&#x27;snr_db&#x27;] is None)}; &quot;
+        f&quot;snr mean {np.mean(snrs):.1f} min {min(snrs):.1f} max {max(snrs):.1f}&quot;
     )
 
+    # built either way, so --no-push still exercises the Audio cast and the
+    # schema inference a push would hit
     dsd = DatasetDict(
         {
             split: Dataset.from_list(rows).cast_column(
-                "audio", Audio(sampling_rate=AUDIO_SAMPLING_RATE)
+                &quot;audio&quot;, Audio(sampling_rate=AUDIO_SAMPLING_RATE)
             )
-            for split, rows in (("train", train_rows), ("test", test_rows))
+            for split, rows in ((&quot;train&quot;, train), (&quot;test&quot;, test))
         }
     )
     if cfg.no_push:
-        log(f"--no-push: built {cfg.asr_ds_id} locally, see {dump}")
+        log(f&quot;--no-push: built {cfg.asr_ds_id} locally, see {rows_json}&quot;)
         return
     dsd.push_to_hub(cfg.asr_ds_id)
-    log(f"pushed {len(train_rows)} train / {len(test_rows)} test rows to {cfg.asr_ds_id}")
+    log(f&quot;pushed {len(train)} train / {len(test)} test rows to {cfg.asr_ds_id}&quot;)
 
 
-if __name__ == "__main__":
+if __name__ == &quot;__main__&quot;:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config")
-    # all None: see steps/ft-asr.html step 1 -- the override loop below can only
-    # tell "absent" from "passed" if an absent flag is None
-    ap.add_argument("--slurp-split", default=None)
-    ap.add_argument("--asr-ds-id", default=None)
-    ap.add_argument("--n-rows", type=int, default=None, help="TRAIN rows to build")
-    ap.add_argument("--snr-db", type=float, nargs=2, default=None)
-    ap.add_argument("--clean-prob", type=float, default=None)
-    ap.add_argument("--draws-per-utt", type=int, default=None)
-    ap.add_argument("--test-every", type=int, default=None)
-    ap.add_argument("--no-push", action="store_true", default=None)
+    ap.add_argument(&quot;--config&quot;, type=str)
+    ap.add_argument(&quot;--slurp-split&quot;, type=str)
+    ap.add_argument(&quot;--asr-ds-id&quot;, type=str)
+    ap.add_argument(&quot;--asr-n-train&quot;, type=int)
+    ap.add_argument(&quot;--snr-db&quot;, type=float, nargs=2)
+    ap.add_argument(&quot;--clean-prob&quot;, type=float)
+    ap.add_argument(&quot;--draws-per-utt&quot;, type=int)
+    ap.add_argument(&quot;--test-every&quot;, type=int)
+    ap.add_argument(&quot;--no-push&quot;, action=&quot;store_true&quot;, default=None)
     args = ap.parse_args()
 
     cfg = load_config(args.config, Config) if args.config else Config()
+
+    # override with cli arguments
     for key, value in vars(args).items():
-        if value is not None and key != "config":
+        if value is not None and key != &quot;config&quot;:
             setattr(cfg, key, value)
 
     main(cfg)</code></pre></div>
 
-<div class="risk"><b>One import does not exist yet.</b> <code>MIN_AUDIO_SECONDS</code> is not in
-<code>babble_data.py</code> &mdash; <code>collect_babble_pool</code> hardcodes the same 1-second floor
-inline (<code>if len(arr) &gt; AUDIO_SAMPLING_RATE</code>). Either add
-<code>MIN_AUDIO_SECONDS = 1</code> beside <code>MAX_AUDIO_SECONDS</code> in
-<a href="../babble_data.py#L55">babble_data.py:55</a> (two call sites then, which satisfies the
-style rule), or drop it from the import and write <code>len(clean) &lt; AUDIO_SAMPLING_RATE</code>.</div>
+<div class="why"><b>The mixing math is not duplicated here.</b> <code>util.add_noise(clean, pool,
+snr_band, rng)</code> holds it and both builders call it: this one with a single 0&ndash;20&nbsp;dB band,
+<code>probe_by_kinds</code> with the per-kind band of the slot it is drawing for. <code>pool</code> is a
+plain list of clips, so each caller drops the utterance's own recording before passing it in &mdash;
+<code>[aud for pool_sid, aud in bab_pool if pool_sid != sid]</code>. The clean-audio draw stays with the
+caller, because what fraction is clean and which rows are eligible is each track's own policy
+(<code>clean_prob</code> here, <code>CLEAN_ANSWER_PROB</code> on the answer slot there).</div>
 
 <h3>Run it</h3>
 <p>CPU-only, so it does not need to queue behind a GPU. Do the 200-row version first &mdash; not as a
@@ -790,7 +752,7 @@ smoke-test scaffold (there is no flag to build), just a short real run whose out
 
 # short real run: 200 rows to a throwaway id, nothing pushed
 python -u asr_data.py --config configs/ft-asr.yaml \
-    --n-rows 200 --asr-ds-id keylazy/tmp-asr-check --no-push
+    --asr-n-train 200 --asr-ds-id keylazy/tmp-asr-check --no-push
 
 # listen to two of them and confirm the target matches what you hear
 python - &lt;&lt;'PY'
@@ -808,10 +770,11 @@ sbatch --job-name=asr_data --account=sciencehub --partition=compute \
   --wrap='source ~/.bashrc; conda activate qwen25omni; \
           python -u asr_data.py --config configs/ft-asr.yaml'</code></pre></div>
 
-<div class="card"><b>What good output looks like.</b> <code>train ~8250 / test ~440 rows</code>,
+<div class="card"><b>What good output looks like.</b> <code>train ~8000 / test ~420 rows</code>,
 <code>clean ~1240</code> (15%), <code>snr mean ~10.0 min ~0.0 max ~20.0</code>. If <code>test</code> is
-far off <code>n_rows/test_every</code>, the id hash is not spreading &mdash; check that
-<code>slurp_id</code> is not being stringified to something constant.</div>
+far off <code>asr_n_train/test_every</code>, the stride is landing on a structure in the ids.
+<code>slurp_id</code> is an <code>int64</code>, so <code>sid % test_every</code> is a 5% stride sample, and
+every recording of one sentence lands on the same side of the split by construction.</div>
 
 <h2 id="s4">Step 4 &mdash; <code>sft_qwen.py</code>: <code>--task asr</code> + <code>--config</code> <span class="tag edit">edit</span></h2>
 <p>Because <code>asr_data.py</code> writes the transcript into <code>target</code>, the only thing that

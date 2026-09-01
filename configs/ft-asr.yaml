@@ -18,11 +18,14 @@ prompt: restate
 # its dataset (asr_data.py)
 asr_ds_id: keylazy/slurp-asr-bab-devel-v1
 slurp_split: devel
-n_rows: 8000
+# `asr_` prefixed like the other keys of this stage: babble_data.py's Config
+# declares its own n_train, and PyYAML silently keeps the LAST of two identical
+# keys in one file -- the 1000 below would have become the ASR row count too.
+asr_n_train: 8000
 snr_db: [0.0, 20.0]
 clean_prob: 0.15
 draws_per_utt: 1
-test_every: 20       # hash(slurp_id) % 20 == 0 -> held out for WER
+test_every: 20       # slurp_id % 20 == 0 -> held out for WER
 
 # its LoRA (sft_qwen.py --task asr)
 asr_run_name: Qwen2.5-Omni-3B-asr-sft

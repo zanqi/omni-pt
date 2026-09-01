@@ -257,7 +257,8 @@ judge box being up.</p>
 
 The decision gate of the ft-asr track (steps/ft-asr-2.html step 8). Runs the
 probe's exact ASR call -- ASR_SYSTEM_PROMPT/ASR_PROMPT, 4 beams,
-ASR_MAX_NEW_TOKENS -- over the held-out split of the asr_data.py dataset, and
+ASR_MAX_NEW_TOKENS -- over the held-out split of the asr_data.py dataset (the
+rows whose slurp_id % test_every == 0), and
 reports two things per model:
 
   wer                  top-1 word error rate, overall and per SNR band
@@ -655,6 +656,8 @@ class Config:
 
     omni_path: str = "Qwen/Qwen2.5-Omni-3B"
     ds_id: str = "keylazy/slurp-babble-Qwen2.5-Omni-3B"
+    # this is the TRIPLET count; asr_data.py's row count is `asr_n_train` in
+    # the same file, because PyYAML keeps only the last of two identical keys
     n_train: int = N_TRAIN_TRIPLETS
     n_test: int = N_TEST_TRIPLETS
     n_extra_ans: int = N_TRAIN_EXTRA_ANS
