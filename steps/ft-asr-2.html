@@ -112,6 +112,7 @@
   .tabs button.on{color:var(--fg);background:var(--code-bg);font-weight:600}
   .tabpane{display:none} .tabpane.on{display:block}
   .matrix td{font-size:.85rem}
+  .matrix td.ok{color:var(--ok)}
   .matrix td:first-child{white-space:nowrap;font-family:ui-monospace,monospace;font-size:.8rem}
 </style>
 </head>
@@ -227,24 +228,131 @@ happen. Anything in the <code>1e-3</code>&ndash;<code>1e-1</code> range is a nor
 <div class="tabpane" id="t6b">
 <p>Load <code>thinker_only=False</code> when an ASR adapter is given, so the existing
 <code>PeftModel.from_pretrained</code> path matches the <code>thinker.</code> keys as-is and
-<code>util.load_model</code> needs no change at all. The cost is in
-<code>babble_data.base_generate_batch</code>: the full model's <code>generate</code> routes
-kwargs to the thinker under <code>thinker_*</code> names and needs
-<code>return_audio=False</code> (see <a href="../babble_eval_qwen.py#L157">babble_eval_qwen.py:157</a>),
-and how <code>num_beams</code>/<code>num_return_sequences</code> are forwarded on that path is
-<em>unverified here</em> &mdash; the eval only ever does greedy. Since this track's whole premise is
-4-way beam consensus, option&nbsp;A keeps the generate call byte-identical to the one that produced
-sent4-v1 and moves the risk into a place you can assert on.</p>
+<code>util.load_model</code> needs no change at all. The whole edit is three lines:</p>
 <div class="cb"><pre><code># --- babble_data.py __main__, if you take option B ---
     base_model, base_processor = load_model(
         args.omni_path,
         base_family,
         adapter_path=args.asr_adapter,
         thinker_only=not args.asr_adapter,   # full model only when attaching
-    )
-# ... and base_generate_batch's generate() call then needs
-#     return_audio=False and thinker_max_new_tokens=, plus a verified
-#     spelling for the beam kwargs.</code></pre></div>
+    )</code></pre></div>
+
+<p>The cost is all in <a href="../babble_data.py#L212">base_generate_batch</a>&rsquo;s
+<code>generate</code> call. The full model&rsquo;s <code>generate</code> is a wrapper that re-routes
+kwargs to the thinker under <code>thinker_*</code> names and needs <code>return_audio=False</code>
+(see <a href="../babble_eval_qwen.py#L157">babble_eval_qwen.py:157</a>) &mdash; and the eval that
+established that spelling only ever runs greedy, <code>B=1</code>. Whether
+<code>num_beams</code>/<code>num_return_sequences</code> reach the thinker at all on this path, and
+whether the result comes back with <code>B&nbsp;&times;&nbsp;n_best</code> rows grouped per input the way
+<code>base_generate_batch</code> unpacks them, is the open question &mdash; and it is the one that can
+silently gut <code>--sent-4</code>, whose labeler calls a key piece lost only if <em>every</em>
+hypothesis missed it.</p>
+
+<div class="why"><b>Step 6b &mdash; answer the question before choosing.</b> This is five minutes and no
+build. Two utterances through the full model at <code>n_best=4</code>. Two pass conditions, and the
+second is the one that is easy to fake: <b>8 rows out</b>, and those rows grouped
+<b>4-per-utterance in input order</b> &mdash; which is only observable if the two clips say
+<em>different things</em>. SLURP streams several recordings of the same prompt back to back under one
+<code>slurp_id</code>, so a plain <code>.take(2)</code> hands you the same sentence twice and grouped
+vs. interleaved become indistinguishable; the loop below dedupes on <code>slurp_id</code> and prints
+each reference so you can check group membership by eye. Kept free of <code>babble_data</code> imports
+on purpose &mdash; importing it wants the vLLM host file up.</div>
+<div class="cb"><pre><code>conda activate qwen25omni
+python - &lt;&lt;'PY'
+import os, tempfile
+import soundfile as sf
+from datasets import Audio, load_dataset
+from qwen_omni_utils import process_mm_info
+from prompts import ASR_PROMPT_QWEN2_5, ASR_SYSTEM_PROMPT_QWEN2_5
+from util import detect_model_family, load_model
+
+N_BEST = 4                      # babble_data.ASR_NUM_BEAMS / ASR_N_BEST
+P = "Qwen/Qwen2.5-Omni-3B"
+model, proc = load_model(P, detect_model_family(P), thinker_only=False)
+
+# two SLURP clips of DIFFERENT sentences. SLURP repeats a prompt across
+# consecutive rows under one slurp_id, and two takes of one sentence make
+# grouped-per-input and interleaved look identical -- which is the only
+# thing this test is really here to distinguish.
+stream = load_dataset("qmeeus/slurp", split="test", streaming=True)
+stream = stream.cast_column("audio", Audio(sampling_rate=16000))
+seen, paths, refs = set(), [], []
+for row in stream:
+    if row["slurp_id"] in seen:
+        continue
+    seen.add(row["slurp_id"])
+    fd, wav = tempfile.mkstemp(suffix=".wav"); os.close(fd)
+    sf.write(wav, row["audio"]["array"], 16000)
+    paths.append(wav)
+    refs.append(row["sentence"])
+    print(f"utt {len(paths) - 1}: slurp_id={row['slurp_id']} {row['sentence']!r}")
+    if len(paths) == 2:
+        break
+
+convs = [[{"role": "system",
+           "content": [{"type": "text", "text": ASR_SYSTEM_PROMPT_QWEN2_5}]},
+          {"role": "user",
+           "content": [{"type": "audio", "audio": p},
+                       {"type": "text", "text": ASR_PROMPT_QWEN2_5}]}]
+         for p in paths]
+texts = proc.apply_chat_template(convs, add_generation_prompt=True, tokenize=False)
+audios, images, videos, *_ = process_mm_info(convs, use_audio_in_video=False)
+inputs = proc(text=texts, audio=audios, images=images, videos=videos,
+              return_tensors="pt", padding=True).to(model.device, model.dtype)
+
+# the wrapper may want the kwargs bare (forwarded as-is) or `thinker_`-prefixed;
+# nobody has run beams through it, so try both and let the output say which
+SPELLINGS = [
+    dict(max_new_tokens=64, num_beams=N_BEST, num_return_sequences=N_BEST),
+    dict(thinker_max_new_tokens=64, thinker_num_beams=N_BEST,
+         thinker_num_return_sequences=N_BEST),
+]
+for kw in SPELLINGS:
+    tag = "bare" if "max_new_tokens" in kw else "thinker_-prefixed"
+    try:
+        out = model.generate(**inputs, return_audio=False, do_sample=False, **kw)
+    except Exception as e:
+        print(f"\n[{tag}] raised {type(e).__name__}: {e}")
+        continue
+    ids = out[0] if isinstance(out, tuple) else out
+    gen = ids[:, inputs["input_ids"].shape[1]:]
+    hyps = [t.lower().strip()
+            for t in proc.batch_decode(gen, skip_special_tokens=True)]
+    print(f"\n[{tag}] rows={ids.shape[0]} (want {len(paths) * N_BEST})")
+    for i in range(0, len(hyps), N_BEST):
+        grp = hyps[i:i + N_BEST]
+        print(f"  utt {i // N_BEST} ({refs[i // N_BEST]!r}): "
+              f"{len(set(grp))} distinct")
+        for h in grp:
+            print("     ", h)
+for p in paths:
+    os.remove(p)
+PY</code></pre></div>
+
+<table class="matrix">
+<tr><th>What you see</th><th>Read</th></tr>
+<tr><td>rows=8, and each group's four strings are variants of <em>its own</em> printed reference</td>
+    <td class="ok"><b>B is live.</b> Take it: a 3-line diff in <code>babble_data.__main__</code> against
+    an unmodified <code>util.load_model</code>. Use whichever spelling worked &mdash; if the bare one
+    did, <code>base_generate_batch</code>'s <code>gen_kwargs</code> dict needs no change at all, only
+    <code>return_audio=False</code> added to the call. On to step 7.</td></tr>
+<tr><td>rows=2 &mdash; the beam kwargs were swallowed</td>
+    <td>Silently one witness. <b>Take option A.</b> This is the failure the whole gate exists to
+    catch, and here it is free.</td></tr>
+<tr><td>rows=8 but a group mixes text from <em>both</em> references</td>
+    <td>The wrapper does not group per input the way <code>decoded[i:i+n_best]</code> assumes.
+    Fixable, but it is now a real diff against the beam unpacking too &mdash; <b>take A.</b></td></tr>
+<tr><td>rows=8, all 4 identical in both groups, but each group matches its own reference</td>
+    <td>Grouping is proven, diversity is not &mdash; clean test audio can genuinely have one dominant
+    hypothesis, and step 7 measures diversity properly on noisy rows anyway. Not a blocker for B.</td></tr>
+<tr><td>both spellings raise</td>
+    <td><b>Take option A.</b></td></tr>
+</table>
+
+<p>Until 6b is run, A is the recommendation: it keeps the <code>generate</code> call byte-identical to
+the one that produced sent4-v1 and moves the risk into a place that raises <code>SystemExit</code>
+instead of quietly degrading. But 6b is cheap enough that not running it is the wrong call &mdash; a
+pass makes B strictly the smaller change.</p>
 </div>
 
 <h2 id="s7">Step 7 &mdash; <code>asr_eval_qwen.py</code>: WER and beam diversity <span class="tag new">new</span></h2>

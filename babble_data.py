@@ -200,17 +200,18 @@ def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
         padding=True,
     )
 
-    gen_kwargs = dict(do_sample=False)
+    gen_kwargs = {"do_sample": False}
     if n_best > 1:
-        gen_kwargs = dict(
-            do_sample=False,
-            num_beams=ASR_NUM_BEAMS,
-            num_return_sequences=n_best,
-        )
+        gen_kwargs = {
+            "do_sample": False,
+            "num_beams": ASR_NUM_BEAMS,
+            "num_return_sequences": n_best,
+        }
     with GPU_LOCK:
         inputs = inputs.to(base_model.device, dtype=base_model.dtype)
         out = base_model.generate(
             **inputs,
+            return_audio=False,
             max_new_tokens=max_new_tokens,
             eos_token_id=IM_END_ID,
             pad_token_id=IM_END_ID,
@@ -1470,7 +1471,10 @@ if __name__ == "__main__":
     # init base omni model
     base_family = detect_model_family(args.omni_path)
     base_model, base_processor = load_model(
-        args.omni_path, base_family, thinker_only=True
+        args.omni_path,
+        base_family,
+        adapter_path=args.asr_adapter,
+        thinker_only=not args.asr_adapter,
     )
     IM_END_ID = base_processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
     print("base models loaded")
