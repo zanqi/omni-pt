@@ -130,7 +130,7 @@ def main():
         text = processor.apply_chat_template(
             conv, add_generation_prompt=True, tokenize=False
         )
-        audios, images, videos = process_mm_info(conv, use_audio_in_video=False)
+        audios, images, videos, *_ = process_mm_info(conv, use_audio_in_video=False)
         inputs = processor(
             text=text, audio=audios, images=images, videos=videos, return_tensors="pt"
         ).to(model.device).to(model.dtype)
@@ -169,7 +169,7 @@ def main():
         prompt_text_only = processor.apply_chat_template(
             conversation(wav_path), add_generation_prompt=True, tokenize=False
         )
-        audios, images, videos = process_mm_info(full_conv, use_audio_in_video=False)
+        audios, images, videos, *_ = process_mm_info(full_conv, use_audio_in_video=False)
         full = processor(
             text=full_text, audio=audios, images=images, videos=videos,
             return_tensors="pt",

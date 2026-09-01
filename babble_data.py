@@ -189,7 +189,7 @@ def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
         logging.disable(logging.NOTSET)
     if prefill is not None:
         texts = [t + prefill for t in texts]
-    mm_audios, images, videos = process_mm_info(convs, use_audio_in_video=False)
+    mm_audios, images, videos, *_ = process_mm_info(convs, use_audio_in_video=False)
 
     # inputs computed on CPU do not need to lock the GPU
     # Only the transfering of inputs from cpu to gpu

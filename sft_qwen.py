@@ -9,18 +9,20 @@ mirrors babble_data.py's use of util.py.
 """
 
 import argparse
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from typing import Any
+
 import torch
-import torch.nn as nn
 from datasets import Audio, load_dataset
-from qwen_omni_utils import process_mm_info
-import torch.utils.data.dataset
-from transformers import Trainer, TrainingArguments
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from util import detect_model_family
+from qwen_omni_utils import process_mm_info
+from torch import nn
+from transformers.trainer import Trainer
+from transformers.training_args import TrainingArguments
+
 from prompts import get_prompts
+from util import detect_model_family, load_config
 
 # every trained adapter lands under here, gitignored as one directory
 CHECKPOINT_DIR = "checkpoints"
@@ -131,7 +133,7 @@ class OmniSFTCollator:
 
         # full_convs contains the audio narrays; process_mm_info
         # passes them through unchanged.
-        audios, images, videos = process_mm_info(full_convs, use_audio_in_video=False)
+        audios, images, videos, *_ = process_mm_info(full_convs, use_audio_in_video=False)
 
         full = self.processor(
             text=full_texts,
@@ -215,10 +217,10 @@ def load_processor(omni_path, family):
 def load_model(omni_path, family, use_qlora):
     model_cls = get_sft_model_cls(family)
 
-    kwargs = dict(
-        attn_implementation="flash_attention_2",
-        device_map={"": 0},
-    )
+    kwargs: dict[str, Any] = {
+        "attn_implementation": "flash_attention_2",
+        "device_map": {"": 0},
+    }
     # qwen3's from_pretrained uses the newer `dtype` kwarg name; qwen2.5
     # (older transformers Qwen2_5Omni code) still expects `torch_dtype`.
     if family == "qwen3":
@@ -304,94 +306,49 @@ class Config:
     kinds: str | None = None
     out: str | None = None
     task: str = "repair"
+    repo_name: str | None = None
 
     # --task repair
-    repair_ds_id: str = "keylazy/slurp-babble-Qwen2.5-Omni-3B"
+    repair_ds_id: str | None = None
     repair_epoch: float = 3.0
     repair_lr: float = 2e-4
-    repair_run_name: str | None = None
 
     # --task asr
     asr_ds_id: str | None = None
     asr_epochs: float = 2.0
     asr_lr: float = 1e-4
-    asr_run_name: str | None = None
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str)
-    ap.add_argument("--repair-ds-id", type=str)
-    ap.add_argument("--train-split", default="train")
-    ap.add_argument("--omni-path", default="Qwen/Qwen2.5-Omni-3B")
-    ap.add_argument("--epochs", type=float, default=3.0)
-    ap.add_argument("--lr", type=float, default=2e-4)
-    ap.add_argument("--batch-size", type=int, default=16)
-    ap.add_argument("--grad-accum", type=int, default=1)
-    ap.add_argument("--qlora", action="store_true")  # TODO: what?
-    ap.add_argument(
-        "--answerable-token",
-        action="store_true",
-        help=f"Replace the target of kind=='answer' rows with {ANSWERABLE_TOKEN!r}.",
-    )
-    ap.add_argument(
-        "--task",
-        type=str,
-        default="repair",
-        choices=("repair", "asr"),
-        help="Which prompt pair to train under (see prompts.get_prompts): "
-        "'repair' for the babble/ear assistant datasets, 'asr' for the "
-        "transcription dataset built by asr_data.py.",
-    )
-    ap.add_argument("--smoke", action="store_true")
-    ap.add_argument(
-        "--kinds",
-        default=None,
-        help="Keep only these row kinds of the train split, comma-separated, "
-        "e.g. 'answer,repair' to train the C/R-only variant on a dataset that "
-        "also carries repeat rows.",
-    )
-    ap.add_argument(
-        "--run-name",
-        default=None,
-        help="Names both the output dir and the hub repo. "
-        "Defaults to <omni-path basename>-bab-sft.",
-    )
-    ap.add_argument(
-        "--out",
-        default=None,
-        help=f"Overrides the {CHECKPOINT_DIR}/<run-name> output dir.",
-    )
-    args = ap.parse_args()
-
-    family = detect_model_family(args.omni_path)
+def main(cfg: Config):
+    family = detect_model_family(cfg.omni_path)
     print(f"model family: {family}")
 
-    model_name = args.omni_path.rstrip("/").split("/")[-1]
+    model_name = cfg.omni_path.rstrip("/").split("/")[-1]
     # distinct default per task, so an asr run can't overwrite the babble adapter
-    suffix = "asr-sft" if args.task == "asr" else "bab-sft"
-    run_name = args.run_name or f"{model_name}-{suffix}"
-    hub_id = f"keylazy/{run_name}"
-    out = args.out or f"{CHECKPOINT_DIR}/{run_name}"
+    suffix = "asr-sft" if cfg.task == "asr" else "bab-sft"
+    repo_name = cfg.repo_name or f"{model_name}-{suffix}"
+    hub_id = f"keylazy/{repo_name}"
+    out = cfg.out or f"{CHECKPOINT_DIR}/{repo_name}"
+    ds_id = cfg.repair_ds_id if cfg.task == "repair" else cfg.asr_ds_id
+    epoch = cfg.repair_epoch if cfg.task == "repair" else cfg.asr_epochs
+    lr = cfg.repair_lr if cfg.task == "repair" else cfg.asr_lr
 
-    print(f"Loading SFT dataset {args.ds_id} ...")
-    kinds = [k.strip() for k in args.kinds.split(",")] if args.kinds else None
-    train_hf = load_ds_split(args.ds_id, args.train_split, kinds=kinds)
+    print(f"Loading SFT dataset {ds_id} ...")
+    kinds = [k.strip() for k in cfg.kinds.split(",")] if cfg.kinds else None
+    train_hf = load_ds_split(ds_id, cfg.train_split, kinds=kinds)
 
-    train_ds = SlurpDataset(train_hf, answerable_token=args.answerable_token)
-    if args.answerable_token:
-        print(f"answerable-token mode: answer targets -> {ANSWERABLE_TOKEN!r}")
+    train_ds = SlurpDataset(train_hf)
 
-    processor = load_processor(args.omni_path, family)
-    model = load_model(args.omni_path, family, args.qlora)
+    processor = load_processor(cfg.omni_path, family)
+    model = load_model(cfg.omni_path, family, cfg.qlora)
 
-    if args.smoke:
+    if cfg.smoke:
         run_smoke(
             model,
             processor,
             train_ds,
-            args.batch_size,
+            cfg.batch_size,
             family,
-            args.task,
+            cfg.task,
         )
         return
 
@@ -399,10 +356,10 @@ def main():
 
     training_args = TrainingArguments(
         output_dir=out,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        learning_rate=args.lr,
+        num_train_epochs=epoch,
+        per_device_train_batch_size=cfg.batch_size,
+        gradient_accumulation_steps=cfg.grad_accum,
+        learning_rate=lr,
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
         bf16=True,
@@ -424,7 +381,7 @@ def main():
         data_collator=OmniSFTCollator(
             processor,
             family,
-            task=args.task,
+            task=cfg.task,
         ),
     )
 
@@ -449,4 +406,56 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--config", type=str)
+    ap.add_argument("--train-split", type=str)
+    ap.add_argument("--batch-size", type=int, default=16)
+    ap.add_argument("--omni-path", type=str)
+    ap.add_argument("--grad-accum", type=int)
+    ap.add_argument("--qlora", action="store_true", default=None)  # TODO: what?
+    ap.add_argument(
+        "--task",
+        type=str,
+        default="repair",
+        choices=("repair", "asr"),
+        help="Which prompt pair to train under (see prompts.get_prompts): "
+        "'repair' for the babble/ear assistant datasets, 'asr' for the "
+        "transcription dataset built by asr_data.py.",
+    )
+    ap.add_argument("--smoke", action="store_true")
+    ap.add_argument(
+        "--kinds",
+        default=None,
+        help="Keep only these row kinds of the train split, comma-separated, "
+        "e.g. 'answer,repair' to train the C/R-only variant on a dataset that "
+        "also carries repeat rows.",
+    )
+    ap.add_argument(
+        "--repo-name",
+        type=str,
+        help="Names both the output dir and the hub repo. "
+    )
+    ap.add_argument(
+        "--out",
+        default=None,
+        help=f"Overrides the {CHECKPOINT_DIR}/<run-name> output dir.",
+    )
+
+    ap.add_argument("--repair-ds-id", type=str)
+    ap.add_argument("--repair-epochs", type=float)
+    ap.add_argument("--repair-lr", type=float)
+
+    ap.add_argument("--asr-ds-id", type=str)
+    ap.add_argument("--asr-epochs", type=float)
+    ap.add_argument("--asr-lr", type=float)
+
+    args = ap.parse_args()
+
+    cfg = load_config(args.config, Config) if args.config else Config()
+
+    for key, val in vars(args).items():
+        if val is not None and key != "config":
+            setattr(cfg, key, val)
+
+    main(cfg)

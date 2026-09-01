@@ -145,7 +145,7 @@ def run_model(
         text = processor.apply_chat_template(
             conversation, add_generation_prompt=True, tokenize=False
         )
-        audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
+        audios, images, videos, *_ = process_mm_info(conversation, use_audio_in_video=False)
         inputs = processor(
             text=text,
             audio=audios,
