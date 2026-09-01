@@ -9,8 +9,8 @@ mirrors babble_data.py's use of util.py.
 """
 
 import argparse
+from dataclasses import dataclass
 import os
-from collections import Counter
 from typing import Any
 import torch
 import torch.nn as nn
@@ -293,10 +293,34 @@ def run_smoke(
     print(f"  batch loss={float(out.loss):.4f}")
     print("Finite loss & supervised count ~ target length => ready.\n")
 
+@dataclass
+class Config:
+    train_split: str = "train"
+    omni_path: str = "Qwen/Qwen2.5-Omni-3B"
+    batch_size: int = 16
+    grad_accum: int = 1
+    qlora: bool = False
+    smoke: bool = False
+    kinds: str | None = None
+    out: str | None = None
+    task: str = "repair"
+
+    # --task repair
+    repair_ds_id: str = "keylazy/slurp-babble-Qwen2.5-Omni-3B"
+    repair_epoch: float = 3.0
+    repair_lr: float = 2e-4
+    repair_run_name: str | None = None
+
+    # --task asr
+    asr_ds_id: str | None = None
+    asr_epochs: float = 2.0
+    asr_lr: float = 1e-4
+    asr_run_name: str | None = None
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ds-id", default="keylazy/slurp-babble-Qwen2.5-Omni-3B")
+    ap.add_argument("--config", type=str)
+    ap.add_argument("--repair-ds-id", type=str)
     ap.add_argument("--train-split", default="train")
     ap.add_argument("--omni-path", default="Qwen/Qwen2.5-Omni-3B")
     ap.add_argument("--epochs", type=float, default=3.0)
@@ -311,6 +335,7 @@ def main():
     )
     ap.add_argument(
         "--task",
+        type=str,
         default="repair",
         choices=("repair", "asr"),
         help="Which prompt pair to train under (see prompts.get_prompts): "
@@ -324,13 +349,6 @@ def main():
         help="Keep only these row kinds of the train split, comma-separated, "
         "e.g. 'answer,repair' to train the C/R-only variant on a dataset that "
         "also carries repeat rows.",
-    )
-    ap.add_argument(
-        "--train-caps",
-        default=None,
-        help="Per-kind row budget for the train split, e.g. "
-        "'answer=2000,repair=1000,repeat=1000'. Keeps the first N rows of each "
-        "listed kind (in dataset order); unlisted kinds are kept in full.",
     )
     ap.add_argument(
         "--run-name",
@@ -358,30 +376,6 @@ def main():
     print(f"Loading SFT dataset {args.ds_id} ...")
     kinds = [k.strip() for k in args.kinds.split(",")] if args.kinds else None
     train_hf = load_ds_split(args.ds_id, args.train_split, kinds=kinds)
-
-    if args.train_caps:
-        # --- subsample the train split to a target answer:repair:repeat mix ---
-        # The babble datasets are laid out as N interleaved (answer, repair,
-        # repeat) triplets followed by extra answer-only rows, so capping each
-        # kind at its first N rows keeps every triplet intact and just varies
-        # how many of the surplus answer rows come along. Counting by kind
-        # rather than slicing a prefix keeps this correct if that layout changes.
-        caps = {}
-        for part in args.train_caps.split(","):
-            kind, _, n = part.partition("=")
-            caps[kind.strip()] = int(n)
-
-        kept, taken = [], Counter()
-        for i, kind in enumerate(train_hf["kind"]):
-            if taken[kind] < caps.get(kind, float("inf")):
-                kept.append(i)
-                taken[kind] += 1
-        train_hf = train_hf.select(kept)
-
-        missing = {k: n - taken[k] for k, n in caps.items() if taken[k] < n}
-        if missing:
-            print(f"warning: train split short of requested caps by {missing}")
-        print(f"train caps {caps} -> {len(train_hf)} rows {dict(taken)}")
 
     train_ds = SlurpDataset(train_hf, answerable_token=args.answerable_token)
     if args.answerable_token:

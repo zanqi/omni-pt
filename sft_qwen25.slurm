@@ -21,13 +21,12 @@
 #SBATCH --output=logs/qwen25_sft_%j.log
 #SBATCH --export=all
 
-# Thin wrapper: track and sweep shape are sft.sh env vars, carried in from the
-# submitting shell by --export=all. conda activate and LD_LIBRARY_PATH live in
-# sft.sh, so they stay in one place.
+# Thin wrapper: the track is an sft.sh env var, carried in from the submitting
+# shell by --export=all. conda activate and LD_LIBRARY_PATH live in sft.sh, so
+# they stay in one place. One adapter per submission, on the split as built.
 #
-#   MULTS= TREE=1 sbatch sft_qwen25.slurm    # ONE adapter on the full split
-#   TREE=1 sbatch sft_qwen25.slurm           # the 1x-4x answer-row sweep
-#   HR=1 sbatch sft_qwen25.slurm
+#   TREE=1 sbatch sft_qwen25.slurm
+#   CR=1 sbatch sft_qwen25.slurm
 #
 # Both the --chdir and the script name were stale before this: they pointed at
 # asr-calibration/qwen_omni/sft and ran slurp_sft_qwen25.py, which does not

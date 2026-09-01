@@ -1,40 +1,34 @@
 #!/bin/bash
-# LoRA SFT sweep: for each omni model, train four adapters that differ only in
-# how many `answer` rows the train split carries.
+# LoRA SFT: one adapter per omni model, trained on the track's train split
+# exactly as built -- the dataset's own answer:repair:repeat mix is what the
+# model sees. Epochs are fixed at 3 (188 optimizer steps/epoch at 3K rows).
 #
-#   1x -> 1K:1K:1K   2x -> 2K:1K:1K   3x -> 3K:1K:1K   4x -> 4K:1K:1K
-#          (answer : repair : repeat)
+# Adapters land in checkpoints/<model>-bab[-<track>]-sft and push to
+# keylazy/<model>-bab[-<track>]-sft.
 #
-# repair/repeat are capped at the 1K the datasets contain, so 1x is exactly the
-# 3K interleaved triplet block and 4x is the full 6K train split. Epochs are
-# fixed at 3, so optimizer steps grow with the data (188/epoch at 3K rows).
-#
-# Adapters land in ./<model>-bab-adapter-<n>x and push to
-# keylazy/<model>-bab-adapter-<n>x.
+# The answer-row composition sweep is gone with sft_qwen.py's --train-caps;
+# MULTS is no longer read here (eval.sh still reads it, to pick which of the
+# already-trained -<n>x adapters to score).
 #
 # Usage:
-#   ./sft.sh              # all 8 runs, qwen2.5 family first
-#   ./sft.sh qwen25       # only the Qwen2.5-Omni-3B sweep
-#   ./sft.sh qwen3        # only the Qwen3-Omni-30B-A3B-Instruct sweep
-#   MULTS="3 4" ./sft.sh  # only the 3x and 4x runs
-#   MULTS= ./sft.sh       # no sweep: ONE run on the whole train split, whatever
-#                         # its composition -> adapter <model>-bab[-<track>]-sft
+#   ./sft.sh              # both models, qwen2.5 family first
+#   ./sft.sh qwen25       # only Qwen2.5-Omni-3B
+#   ./sft.sh qwen3        # only Qwen3-Omni-30B-A3B-Instruct
 #   HR=1 ./sft.sh         # retired: needed TASK_PROMPT_HR, which sft_qwen.py
 #                         # no longer trains under
 #   TREE=1 ./sft.sh       # intersect-the-two-passes track — tree-v1 datasets,
 #                         # TASK_PROMPT_TREE (the restate prompt the data was
-#                         # probed under), <model>-bab-tree-adapter-<n>x
+#                         # probed under), <model>-bab-tree-sft
 #   BEAM=1 ./sft.sh       # retired: beam-v1 rows were probed under the plain
 #                         # TASK_PROMPT, which sft_qwen.py no longer trains under
 #   SENT2=1 ./sft.sh      # sent-loss, two witnesses — sent2-v1 datasets. Same
 #                         # two probe passes as TREE, so the same restate
-#                         # prompt, <model>-bab-sent2-adapter-<n>x
+#                         # prompt, <model>-bab-sent2-sft
 #   SENT4=1 ./sft.sh      # retired: sent4-v1 rows were probed under the plain
 #                         # TASK_PROMPT, same as BEAM
 #   CR=1 ./sft.sh         # C/R-only track — beam-v3 datasets with the repeat
-#                         # rows dropped and answer capped to match repair
-#                         # (1K:1K), adapters <model>-bab-cr[-adapter-<n>x]
-#   EPOCHS=6 ADAPTER_KIND=bab-cr6-adapter CR=1 MULTS= ./sft.sh qwen25
+#                         # rows dropped, adapter <model>-bab-cr-sft
+#   EPOCHS=6 ADAPTER_KIND=bab-cr6 CR=1 ./sft.sh qwen25
 #                         # step-matched CR: half the rows of a beam run, so
 #                         # twice the epochs to land on the same 750 steps.
 #                         # ADAPTER_KIND renames the output so it doesn't
@@ -46,7 +40,6 @@ source ~/.bashrc
 set -eo pipefail
 
 WHICH="${1:-both}"
-MULTS="${MULTS-1 2 3 4}"  # no colon: MULTS= means "single run", not "default"
 EPOCHS="${EPOCHS:-3}"
 # captured before the track case overwrites it, so a step-matched or otherwise
 # renamed run can keep a prior adapter of the same track intact (mirrors eval.sh)
@@ -56,10 +49,8 @@ ADAPTER_KIND_ENV="${ADAPTER_KIND:-}"
 # track whose rows were probed under TASK_PROMPT_HR / the plain TASK_PROMPT has
 # no way to match its data any more and stops here rather than training a
 # mismatched adapter.
-# extra per-track flags (currently only CR's kind filter) and the sweep's
-# non-answer caps, which CR shrinks to 'repair' alone
+# extra per-track flags -- currently only CR's kind filter
 EXTRA_FLAGS=""
-FIXED_CAPS="repair=1000,repeat=1000"
 if [[ -n "${HR:-}" ]]; then
     echo "HR track needs TASK_PROMPT_HR, which sft_qwen.py no longer trains under" >&2
     exit 1
@@ -82,12 +73,10 @@ elif [[ -n "${SENT4:-}" ]]; then
     echo "SENT4 track needs the plain TASK_PROMPT, which sft_qwen.py no longer trains under" >&2
     exit 1
 elif [[ -n "${CR:-}" ]]; then
-    # C/R only: the beam-v3 rows as built, minus every repeat row, with answer
-    # cut from 2K to the 1K that matches repair. Same audio and targets as the
-    # beam track, so the only variable is the removed third dimension.
+    # C/R only: the beam-v3 rows as built, minus every repeat row. Same audio
+    # and targets as the beam track, so the only variable is the removed third
+    # dimension.
     EXTRA_FLAGS="--kinds answer,repair"
-    FIXED_CAPS="repair=1000"
-    SINGLE_CAPS="answer=1000,repair=1000"
     ADAPTER_KIND="bab-cr-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v3"
     DEFAULT_QWEN3=""  # no qwen3 beam dataset exists; pass DS_QWEN3 explicitly
@@ -99,56 +88,35 @@ fi
 [[ -n "$ADAPTER_KIND_ENV" ]] && ADAPTER_KIND="$ADAPTER_KIND_ENV"
 DS_QWEN25="${DS_QWEN25:-$DEFAULT_QWEN25}"
 DS_QWEN3="${DS_QWEN3:-$DEFAULT_QWEN3}"
-# caps for the single-run path: empty for every track but CR, which must still
-# cut the surplus answer rows even when it isn't sweeping the mix
-SINGLE_CAPS="${SINGLE_CAPS:-}"
 
-run_sweep() {
+run_sft() {
     local omni_path="$1" ds_id="$2"
     local model_name="${omni_path##*/}"
-    local n run_name
+    local run_name
 
     if [[ -z "$ds_id" ]]; then
         echo "no dataset for ${model_name} on this track — set DS_QWEN25/DS_QWEN3" >&2
         exit 1
     fi
 
-    if [[ -z "$MULTS" ]]; then
-        # train on the split as built -- no --train-caps unless the track needs
-        # one, so the dataset's own answer:repair:repeat mix is what the model sees
-        run_name="${model_name}-${ADAPTER_KIND%-adapter}-sft"
-        echo "=== ${run_name}: train split ${SINGLE_CAPS:-as built}, ${EPOCHS} epochs <- ${ds_id} ==="
-        python -u sft_qwen.py $EXTRA_FLAGS \
-            --omni-path "$omni_path" \
-            --ds-id "$ds_id" \
-            ${SINGLE_CAPS:+--train-caps "$SINGLE_CAPS"} \
-            --run-name "$run_name" \
-            --epochs "$EPOCHS"
-        echo "=== ${run_name} done ==="
-        return
-    fi
-
-    for n in $MULTS; do
-        run_name="${model_name}-${ADAPTER_KIND}-${n}x"
-        echo "=== ${run_name}: answer=$((n * 1000)) ${FIXED_CAPS}, ${EPOCHS} epochs <- ${ds_id} ==="
-        python -u sft_qwen.py $EXTRA_FLAGS \
-            --omni-path "$omni_path" \
-            --ds-id "$ds_id" \
-            --train-caps "answer=$((n * 1000)),${FIXED_CAPS}" \
-            --run-name "$run_name" \
-            --epochs "$EPOCHS"
-        echo "=== ${run_name} done ==="
-    done
+    run_name="${model_name}-${ADAPTER_KIND%-adapter}-sft"
+    echo "=== ${run_name}: train split as built, ${EPOCHS} epochs <- ${ds_id} ==="
+    python -u sft_qwen.py $EXTRA_FLAGS \
+        --omni-path "$omni_path" \
+        --ds-id "$ds_id" \
+        --run-name "$run_name" \
+        --epochs "$EPOCHS"
+    echo "=== ${run_name} done ==="
 }
 
 if [[ "$WHICH" == "both" || "$WHICH" == "qwen25" ]]; then
     conda activate qwen25omni
     export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-    run_sweep Qwen/Qwen2.5-Omni-3B "$DS_QWEN25"
+    run_sft Qwen/Qwen2.5-Omni-3B "$DS_QWEN25"
 fi
 
 if [[ "$WHICH" == "both" || "$WHICH" == "qwen3" ]]; then
     conda activate qwen3omni
     export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-    run_sweep Qwen/Qwen3-Omni-30B-A3B-Instruct "$DS_QWEN3"
+    run_sft Qwen/Qwen3-Omni-30B-A3B-Instruct "$DS_QWEN3"
 fi
