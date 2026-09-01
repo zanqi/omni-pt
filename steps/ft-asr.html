@@ -756,6 +756,22 @@ plain list of clips, so each caller drops the utterance's own recording before p
 caller, because what fraction is clean and which rows are eligible is each track's own policy
 (<code>clean_prob</code> here, <code>CLEAN_ANSWER_PROB</code> on the answer slot there).</div>
 
+<div class="risk"><b><code>sbatch --wrap</code> runs its string under <code>sh</code>, not
+<code>bash</code>.</b> So <code>--wrap='source ~/.bashrc; conda activate ...'</code> dies before conda is
+ever on <code>PATH</code> &mdash; <code>~/.fzf.bash</code> uses process substitution, which
+<code>sh</code> cannot parse. Two forms work, and every <code>sbatch</code> in this doc and in
+<a href="ft-asr-2.html">part&nbsp;2</a> uses one of them:
+<ul style="margin:.4rem 0">
+<li><b>One-off from the shell</b> &mdash; <code>--wrap="bash -lc '&hellip;'"</code>. The login shell reads
+<code>~/.bashrc</code> itself, under bash, so <code>conda activate</code> works. Note the quote flip:
+double outside, single inside, and <code>$CONDA_PREFIX</code> escaped as <code>\$CONDA_PREFIX</code> so
+it expands in the job rather than in your submitting shell.</li>
+<li><b>Anything with more than one command</b> &mdash; put the body in a
+<code>#!/bin/bash</code> file that sources <code>~/.bashrc</code> itself and
+<code>--wrap='./exp/&lt;name&gt;-run.sh'</code>. That is what
+<code>exp/ft-asr.sh</code> / <code>exp/ft-asr-run.sh</code> do.</li>
+</ul></div>
+
 <h3>Run it</h3>
 <p>CPU-only, so it does not need to queue behind a GPU. Do the 200-row version first &mdash; not as a
 smoke-test scaffold (there is no flag to build), just a short real run whose output you read.</p>
@@ -779,8 +795,8 @@ sbatch --job-name=asr_data --account=sciencehub --partition=compute \
   --nodes=1 --cpus-per-task=8 --mem=64G --time=4:00:00 \
   --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt \
   --output=logs/asr_data_%j.log --export=all \
-  --wrap='source ~/.bashrc; conda activate qwen25omni; \
-          python -u asr_data.py --config configs/ft-asr.yaml'</code></pre></div>
+  --wrap="bash -lc 'conda activate qwen25omni; \
+           python -u asr_data.py --config configs/ft-asr.yaml'"</code></pre></div>
 
 <div class="card"><b>What good output looks like.</b> <code>train ~8000 / test ~420 rows</code>,
 <code>clean ~1240</code> (15%), <code>snr mean ~10.0 min ~0.0 max ~20.0</code>. If <code>test</code> is
@@ -917,9 +933,9 @@ sent4 repair run, so expect a comparable wall clock on one A40.</p>
   --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt \
   --output=logs/asr_sft_%j.log --mail-type=ALL --mail-user=zanqil@uw.edu \
   --export=all \
-  --wrap='source ~/.bashrc; conda activate qwen25omni; \
-          export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH; \
-          python -u sft_qwen.py --task asr --config configs/ft-asr.yaml'</code></pre></div>
+  --wrap="bash -lc 'conda activate qwen25omni; \
+           export LD_LIBRARY_PATH=\$CONDA_PREFIX/lib:\$LD_LIBRARY_PATH; \
+           python -u sft_qwen.py --task asr --config configs/ft-asr.yaml'"</code></pre></div>
 
 <div class="card"><b>Check before you walk away.</b> The log's first lines must show
 <code>asr_ds_id='keylazy/slurp-asr-bab-v1'</code> in the <code>config: Config(...)</code> line resolved from the config, and the LoRA target list

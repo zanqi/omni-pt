@@ -22,7 +22,7 @@ from transformers.trainer import Trainer
 from transformers.training_args import TrainingArguments
 
 from prompts import get_prompts
-from util import detect_model_family, load_config
+from util import detect_model_family, load_config, quiet_chat_template
 
 # every trained adapter lands under here, gitignored as one directory
 CHECKPOINT_DIR = "checkpoints"
@@ -68,7 +68,6 @@ def load_ds_split(ds_id, split, limit=None, kinds=None):
 
 
 class OmniSFTCollator:
-
     def __init__(
         self,
         processor,
@@ -104,24 +103,29 @@ class OmniSFTCollator:
         return conv
 
     def __call__(self, features: list[dict[str, Any]]) -> Any:
+        """Return label ids"""
+
         full_convs = [self._conv(ex["audio"], ex["target"]) for ex in features]
         prompt_convs = [self._conv(ex["audio"], None) for ex in features]
 
-        full_texts = self.processor.apply_chat_template(
-            full_convs,
-            add_generation_prompt=False,
-            tokenize=False,
-        )
+        # two renders per example, so at batch 16 this is where the
+        # "System prompt modified" warning would print 32 times a step
+        with quiet_chat_template():
+            full_texts = self.processor.apply_chat_template(
+                full_convs,
+                add_generation_prompt=False,
+                tokenize=False,
+            )
 
-        # add_generation_prompt adds <|im_start|>assistant\n
-        # at the end, which is the prefix of the assistant part of
-        # full_text. We want to ignore it in loss and only consider
-        # the response content.
-        prompt_texts = self.processor.apply_chat_template(
-            prompt_convs,
-            add_generation_prompt=True,
-            tokenize=False,
-        )
+            # add_generation_prompt adds <|im_start|>assistant\n
+            # at the end, which is the prefix of the assistant part of
+            # full_text. We want to ignore it in loss and only consider
+            # the response content.
+            prompt_texts = self.processor.apply_chat_template(
+                prompt_convs,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
 
         # full_convs contains the audio narrays; process_mm_info
         # passes them through unchanged.
@@ -150,8 +154,8 @@ class OmniSFTCollator:
         ans_lens = (full_lens - prompt_lens).tolist()
 
         labels = torch.full_like(full["input_ids"], -100)
-        for i, alen in enumerate(ans_lens):
-            labels[i, -alen:] = full["input_ids"][i, -alen:]
+        for i, ans_len in enumerate(ans_lens):
+            labels[i, -ans_len:] = full["input_ids"][i, -ans_len:]
         full["labels"] = labels
         return full
 

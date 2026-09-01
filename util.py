@@ -3,6 +3,8 @@ Imports are done lazily per family inside load_model, so each conda env
 (qwen25omni / qwen3omni) only needs its own family's transformers classes.
 """
 
+import contextlib
+import logging
 import os
 import dataclasses
 
@@ -11,6 +13,25 @@ import torch
 
 # speakers averaged together to make one babble background
 NUM_BAB_SPEAKERS = 3
+
+
+@contextlib.contextmanager
+def quiet_chat_template():
+    """Silence Qwen2.5-Omni's per-call "System prompt modified, audio output may
+    not work as expected" warning around apply_chat_template.
+
+    Every prompt in this repo sets its own system prompt and every script calls
+    disable_talker(), so the warning is telling us about an output mode nothing
+    here uses -- but it is logged once per conversation, which at batch 16 buries
+    the training loss under 32 copies of itself per step. Scoped to the one call
+    that emits it rather than set globally, so a real warning from anywhere else
+    still gets through.
+    """
+    logging.disable(logging.WARNING)
+    try:
+        yield
+    finally:
+        logging.disable(logging.NOTSET)
 
 
 def add_noise(clean, pool, snr_band, rng):

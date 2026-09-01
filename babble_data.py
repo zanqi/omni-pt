@@ -1,7 +1,6 @@
 import argparse
 import itertools
 import json
-import logging
 import os
 import random
 import re
@@ -48,6 +47,7 @@ from util import (
     add_noise,
     detect_model_family,
     load_model,
+    quiet_chat_template,
 )
 
 skip = Counter()
@@ -180,13 +180,10 @@ def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
     and generate hold the lock now, and the tensors stay on CPU until it is
     held, so a worker queued behind the lock keeps its features off the device.
     """
-    logging.disable(logging.WARNING)
-    try:
+    with quiet_chat_template():
         texts = base_processor.apply_chat_template(
             convs, add_generation_prompt=True, tokenize=False
         )
-    finally:
-        logging.disable(logging.NOTSET)
     if prefill is not None:
         texts = [t + prefill for t in texts]
     mm_audios, images, videos, *_ = process_mm_info(convs, use_audio_in_video=False)

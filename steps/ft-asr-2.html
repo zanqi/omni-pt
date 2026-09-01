@@ -503,10 +503,10 @@ if __name__ == "__main__":
   --nodes=1 --cpus-per-task=8 --mem=128G --gpus=1 --time=4:00:00 \
   --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt \
   --output=logs/asr_diag_%j.log --export=all \
-  --wrap='source ~/.bashrc; conda activate qwen25omni; \
-    python -u asr_eval_qwen.py --config configs/ft-asr.yaml --tag base &amp;&amp; \
-    python -u asr_eval_qwen.py --config configs/ft-asr.yaml --tag ft \
-      --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft'</code></pre></div>
+  --wrap="bash -lc 'conda activate qwen25omni; \
+     python -u asr_eval_qwen.py --config configs/ft-asr.yaml --tag base &amp;&amp; \
+     python -u asr_eval_qwen.py --config configs/ft-asr.yaml --tag ft \
+       --adapter-path checkpoints/Qwen2.5-Omni-3B-asr-sft'"</code></pre></div>
 <p>Then, for the same two models on the audio the labels are actually built from &mdash; optional but it
 is the honest generalization check, since the ASR set and the sent-4 probes come from different SLURP
 splits and different SNR draws:</p>
@@ -769,8 +769,8 @@ unusable (<a href="../exp/sent-common-run.sh#L32">exp/sent-common-run.sh:32</a>)
   --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt \
   --output=logs/sent4ft_data_%j.log --mail-type=ALL --mail-user=zanqil@uw.edu \
   --export=all \
-  --wrap='source ~/.bashrc; conda activate qwen25omni; \
-          python -u babble_data.py --config configs/ft-asr.yaml'</code></pre></div>
+  --wrap="bash -lc 'conda activate qwen25omni; \
+           python -u babble_data.py --config configs/ft-asr.yaml'"</code></pre></div>
 
 <div class="risk"><b>The kind histogram is not the observable.</b> <code>build_triplets</code> keeps an
 utterance only when it finds one probe of <em>every</em> kind, so the split comes out
