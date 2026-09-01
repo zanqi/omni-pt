@@ -41,7 +41,6 @@ from datasets import Audio, load_dataset
 from peft import PeftModel
 from transformers import Trainer, TrainingArguments
 
-from prompts import QWEN25_SYSTEM_PROMPT
 from sft_qwen import (
     CHECKPOINT_DIR,
     OmniSFTCollator,
@@ -152,7 +151,9 @@ class DPOTrainer(Trainer):
                 print(
                     "[dpo] WARNING: the policy does not start at the reference. "
                     "Check that --sft-adapter matches the checkpoint the pairs "
-                    "were sampled from and that --plain-prompt agrees with it."
+                    "were sampled from, and that they were sampled under the "
+                    "restate prompt this trains under (mask_dpo_data.py's "
+                    "default -- not --plain-prompt)."
                 )
 
         self._dpo_stats = {
@@ -202,11 +203,6 @@ def main():
     # left the whole run at 41 steps, most of them under a decayed LR
     ap.add_argument("--grad-accum", type=int, default=2)
     ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument(
-        "--plain-prompt",
-        action="store_true",
-        help="Train under TASK_PROMPT. Must match how the pairs were sampled.",
-    )
     ap.add_argument("--no-push", action="store_true")
     args = ap.parse_args()
 
@@ -315,11 +311,7 @@ def main():
             logging_dir=os.path.join(out, "runs"),
         ),
         train_dataset=PreferenceDataset(hf_ds, prefs),
-        data_collator=OmniDPOCollator(
-            processor,
-            system_prompt=QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None,
-            plain=args.plain_prompt,
-        ),
+        data_collator=OmniDPOCollator(processor, family),
     )
 
     print("starting DPO ...")

@@ -19,19 +19,18 @@
 #   MULTS="3 4" ./sft.sh  # only the 3x and 4x runs
 #   MULTS= ./sft.sh       # no sweep: ONE run on the whole train split, whatever
 #                         # its composition -> adapter <model>-bab[-<track>]-sft
-#   HR=1 ./sft.sh         # Heard:/Reply: track — hr-v1 datasets, TASK_PROMPT_HR,
-#                         # adapters named <model>-bab-hr-adapter-<n>x
+#   HR=1 ./sft.sh         # retired: needed TASK_PROMPT_HR, which sft_qwen.py
+#                         # no longer trains under
 #   TREE=1 ./sft.sh       # intersect-the-two-passes track — tree-v1 datasets,
 #                         # TASK_PROMPT_TREE (the restate prompt the data was
 #                         # probed under), <model>-bab-tree-adapter-<n>x
-#   BEAM=1 ./sft.sh       # beam-consensus track — beam-v1 datasets, plain
-#                         # TASK_PROMPT, adapters <model>-bab-beam-adapter-<n>x
+#   BEAM=1 ./sft.sh       # retired: beam-v1 rows were probed under the plain
+#                         # TASK_PROMPT, which sft_qwen.py no longer trains under
 #   SENT2=1 ./sft.sh      # sent-loss, two witnesses — sent2-v1 datasets. Same
 #                         # two probe passes as TREE, so the same restate
 #                         # prompt, <model>-bab-sent2-adapter-<n>x
-#   SENT4=1 ./sft.sh      # sent-loss, four hypotheses — sent4-v1 datasets. No
-#                         # reply pass, so plain TASK_PROMPT like BEAM,
-#                         # <model>-bab-sent4-adapter-<n>x
+#   SENT4=1 ./sft.sh      # retired: sent4-v1 rows were probed under the plain
+#                         # TASK_PROMPT, same as BEAM
 #   CR=1 ./sft.sh         # C/R-only track — beam-v3 datasets with the repeat
 #                         # rows dropped and answer capped to match repair
 #                         # (1K:1K), adapters <model>-bab-cr[-adapter-<n>x]
@@ -53,30 +52,25 @@ EPOCHS="${EPOCHS:-3}"
 # renamed run can keep a prior adapter of the same track intact (mirrors eval.sh)
 ADAPTER_KIND_ENV="${ADAPTER_KIND:-}"
 
-# which task prompt the adapter trains under -- it must match the one the
-# dataset's probes and targets were built under
-PROMPT_FLAG=""
+# sft_qwen.py trains under the restate prompt only (prompts.get_prompts), so a
+# track whose rows were probed under TASK_PROMPT_HR / the plain TASK_PROMPT has
+# no way to match its data any more and stops here rather than training a
+# mismatched adapter.
 # extra per-track flags (currently only CR's kind filter) and the sweep's
 # non-answer caps, which CR shrinks to 'repair' alone
 EXTRA_FLAGS=""
 FIXED_CAPS="repair=1000,repeat=1000"
 if [[ -n "${HR:-}" ]]; then
-    PROMPT_FLAG="--heard-reply"
-    ADAPTER_KIND="bab-hr-adapter"
-    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-hr-v1"
-    DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-hr-v1"
+    echo "HR track needs TASK_PROMPT_HR, which sft_qwen.py no longer trains under" >&2
+    exit 1
 elif [[ -n "${TREE:-}" ]]; then
     # restate prompt, which is sft_qwen.py's default -- no flag needed
     ADAPTER_KIND="bab-tree-adapter"
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-tree-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-tree-v1"
 elif [[ -n "${BEAM:-}" ]]; then
-    # beam rows were probed under the plain TASK_PROMPT, and restating is
-    # the default now, so it has to be turned off explicitly
-    PROMPT_FLAG="--plain-prompt"
-    ADAPTER_KIND="bab-beam-adapter"
-    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-beam-v1"
-    DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-beam-v1"
+    echo "BEAM track needs the plain TASK_PROMPT, which sft_qwen.py no longer trains under" >&2
+    exit 1
 elif [[ -n "${SENT2:-}" ]]; then
     # same two probe passes as the tree track, so the same restate prompt,
     # which is sft_qwen.py's default -- no flag needed
@@ -84,12 +78,9 @@ elif [[ -n "${SENT2:-}" ]]; then
     DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-sent2-v1"
     DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-sent2-v1"
 elif [[ -n "${SENT4:-}" ]]; then
-    # no task-response pass on this track, so its rows were probed under the
-    # plain TASK_PROMPT -- turned off explicitly, same as beam
-    PROMPT_FLAG="--plain-prompt"
-    ADAPTER_KIND="bab-sent4-adapter"
-    DEFAULT_QWEN25="keylazy/slurp-babble-Qwen2.5-Omni-3B-sent4-v1"
-    DEFAULT_QWEN3="keylazy/slurp-babble-Qwen3-Omni-30B-A3B-Instruct-sent4-v1"
+    # no task-response pass on this track, so its rows were probed plain
+    echo "SENT4 track needs the plain TASK_PROMPT, which sft_qwen.py no longer trains under" >&2
+    exit 1
 elif [[ -n "${CR:-}" ]]; then
     # C/R only: the beam-v3 rows as built, minus every repeat row, with answer
     # cut from 2K to the 1K that matches repair. Same audio and targets as the
@@ -127,7 +118,7 @@ run_sweep() {
         # one, so the dataset's own answer:repair:repeat mix is what the model sees
         run_name="${model_name}-${ADAPTER_KIND%-adapter}-sft"
         echo "=== ${run_name}: train split ${SINGLE_CAPS:-as built}, ${EPOCHS} epochs <- ${ds_id} ==="
-        python -u sft_qwen.py $PROMPT_FLAG $EXTRA_FLAGS \
+        python -u sft_qwen.py $EXTRA_FLAGS \
             --omni-path "$omni_path" \
             --ds-id "$ds_id" \
             ${SINGLE_CAPS:+--train-caps "$SINGLE_CAPS"} \
@@ -140,7 +131,7 @@ run_sweep() {
     for n in $MULTS; do
         run_name="${model_name}-${ADAPTER_KIND}-${n}x"
         echo "=== ${run_name}: answer=$((n * 1000)) ${FIXED_CAPS}, ${EPOCHS} epochs <- ${ds_id} ==="
-        python -u sft_qwen.py $PROMPT_FLAG $EXTRA_FLAGS \
+        python -u sft_qwen.py $EXTRA_FLAGS \
             --omni-path "$omni_path" \
             --ds-id "$ds_id" \
             --train-caps "answer=$((n * 1000)),${FIXED_CAPS}" \

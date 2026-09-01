@@ -2,9 +2,8 @@
 SFT for Qwen2.5-Omni / Qwen3-Omni on the slurp babble/ear datasets.
 
 Model family (qwen2.5 vs qwen3) is auto-detected from --omni-path (see
-util.detect_model_family); pass --model-family explicitly for fine-tuned
-checkpoint paths whose name doesn't contain either family string. Each
-conda env (qwen25omni / qwen3omni) only ships its own family's transformers
+util.detect_model_family), so a fine-tuned checkpoint path must keep its
+family string in the name. Each conda env (qwen25omni / qwen3omni) only ships its own family's transformers
 classes, so those classes are imported lazily once the family is known —
 mirrors babble_data.py's use of util.py.
 """
@@ -350,8 +349,9 @@ def main():
     print(f"model family: {family}")
 
     model_name = args.omni_path.rstrip("/").split("/")[-1]
-    # distinct default name so an hr run can't overwrite the baseline adapter
-    run_name = args.run_name or (f"{model_name}-bab-sft")
+    # distinct default per task, so an asr run can't overwrite the babble adapter
+    suffix = "asr-sft" if args.task == "asr" else "bab-sft"
+    run_name = args.run_name or f"{model_name}-{suffix}"
     hub_id = f"keylazy/{run_name}"
     out = args.out or f"{CHECKPOINT_DIR}/{run_name}"
 

@@ -302,7 +302,8 @@ def main():
         "--heard-reply",
         action="store_true",
         help="Prompt with TASK_PROMPT_HR and judge only the parsed 'Reply:' "
-        "half. Required for adapters trained with sft_qwen.py --heard-reply.",
+        "half. Required for the hr adapters, trained back when sft_qwen.py "
+        "still had --heard-reply.",
     )
     ap.add_argument(
         "--plain-prompt",

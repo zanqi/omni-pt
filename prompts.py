@@ -1710,6 +1710,13 @@ QWEN25_SYSTEM_PROMPT = (
 
 
 def get_prompts(task, family="qwen2.5"):
+    """(system_prompt, user_prompt) a run of `task` trains/generates under.
+
+    One place for the two rules every train/eval script was repeating: which
+    system prompt a family takes (Qwen3-Omni's model card says none should be
+    set, so only qwen2.5 gets one) and which user prompt goes with the job --
+    transcribing, or acting as the voice assistant.
+    """
     if task == "asr":
         sysp = ASR_SYSTEM_PROMPT_QWEN2_5 if family == "qwen2.5" else None
         return sysp, ASR_PROMPT_QWEN2_5

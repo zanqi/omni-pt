@@ -271,7 +271,8 @@ def main():
         "--plain-prompt",
         action="store_true",
         help="Generate under TASK_PROMPT instead of the restate prompt. Only "
-        "for scoring an adapter trained with sft_qwen.py --plain-prompt.",
+        "for scoring an adapter trained back when sft_qwen.py still had "
+        "--plain-prompt.",
     )
     args = ap.parse_args()
 
