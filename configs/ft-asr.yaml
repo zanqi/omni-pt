@@ -16,7 +16,7 @@ prompt: restate
 # --- the ASR witness ---
 
 # its dataset (asr_data.py)
-asr_ds_id: keylazy/slurp-asr-bab-devel-v1
+asr_ds_id: keylazy/slurp-asr-bab-v1
 slurp_split: devel
 # `asr_` prefixed like the other keys of this stage: babble_data.py's Config
 # declares its own n_train, and PyYAML silently keeps the LAST of two identical
