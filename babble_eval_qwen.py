@@ -25,12 +25,13 @@ import tempfile
 import threading
 import time
 from collections import Counter, deque
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import soundfile as sf
 import torch
 from datasets import load_dataset, Audio
 from openai import OpenAI
-from util import detect_model_family, load_model
+from util import detect_model_family, load_config, load_model
 from prompts import (
     ANSWER_JUDGE_SYSTEM,
     QWEN25_SYSTEM_PROMPT,
@@ -260,8 +261,31 @@ def harmonic(*vals):
     return len(vals) / sum(1.0 / v for v in vals)
 
 
+@dataclass
+class Config:
+    """The track YAML's own key names, which are not this script's older flag
+    names -- the file is shared with babble_data.py and sft_qwen.py, so it
+    spells the dataset `ds_id` and the model `omni_path`. __main__ maps the
+    pairs onto the parser as defaults, which is what leaves an explicit flag
+    winning over the file. `adapter_path` is deliberately absent: which model a
+    row evaluates is a driver decision (exp/ft-asr-run.sh runs base and adapter
+    off one config), not a property of the track."""
+
+    omni_path: str = "Qwen/Qwen2.5-Omni-3B"
+    ds_id: str = "keylazy/slurp-babble-Qwen2.5-Omni-3B-v3"
+    split: str = "test"
+    kinds: str = "answer,repair,repeat"
+    num_rows: int = 150
+    judge_mode: str = "type"
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--config",
+        help="Track YAML (configs/*.yaml). Its keys become parser defaults, so "
+        "any flag also given on the command line still wins.",
+    )
     ap.add_argument("--dataset", default="keylazy/slurp-babble-Qwen2.5-Omni-3B-v3")
     ap.add_argument("--split", default="test")
     ap.add_argument("--model-path", default="Qwen/Qwen2.5-Omni-3B")
@@ -342,6 +366,24 @@ def main():
         "instead of 1.0, so numbers are NOT comparable with 'type' runs. "
         "Independent of the data track, so it can be ablated on any dataset.",
     )
+    # --config has to be read before parse_args, because the file supplies
+    # defaults rather than overrides -- a flag on the command line has to stay
+    # able to beat it, and after parse_args an explicit flag is
+    # indistinguishable from the default it happens to equal.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    config_path = pre.parse_known_args()[0].config
+    if config_path:
+        cfg = load_config(config_path, Config)
+        print(f"config: {cfg}")
+        ap.set_defaults(
+            model_path=cfg.omni_path,
+            dataset=cfg.ds_id,
+            split=cfg.split,
+            kinds=cfg.kinds,
+            num_rows=cfg.num_rows,
+            judge_mode=cfg.judge_mode,
+        )
     args = ap.parse_args()
 
     # if not os.environ.get("OPENAI_API_KEY"):

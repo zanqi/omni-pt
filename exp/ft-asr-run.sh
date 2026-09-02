@@ -42,6 +42,8 @@ if [[ "$PHASE" == "data" ]]; then
 fi
 
 # --- sent4 phase: the labeler and the judge both need the vLLM box ---
+# PHASE=sft is the same phase minus the build, for when the dataset already
+# exists on the Hub (steps/ft-asr-2.html step 11 alone).
 JUDGE_HOST=$(cat /gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt)
 JUDGE_URL="http://${JUDGE_HOST}:8000/v1"
 if ! curl -sf --max-time 10 "${JUDGE_URL}/models" > /dev/null; then
@@ -54,7 +56,9 @@ JUDGE_MODEL=$(curl -sf --max-time 10 "${JUDGE_URL}/models" \
     | python -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')
 echo "judge OK at ${JUDGE_URL} serving ${JUDGE_MODEL}"
 
-python -u babble_data.py --config "$CFG"
+if [[ "$PHASE" != "sft" ]]; then
+    python -u babble_data.py --config "$CFG"
+fi
 python -u sft_qwen.py --config "$CFG"
 
 # Two judge passes off the one adapter, as on the sent tracks: the per-kind
@@ -66,8 +70,11 @@ for adapter in "" "checkpoints/Qwen2.5-Omni-3B-bab-sent4ft-sft"; do
     name="${adapter:-Qwen/Qwen2.5-Omni-3B}"; name="${name##*/}"
     for pass in "per-kind|sent4-ftasr" "tree|sent4-ftasr-typejudge"; do
         IFS='|' read -r mode tag <<< "$pass"
+        # both spelled out: the config supplies judge_mode as a parser
+        # default now, so the tree pass can no longer get the type judge by
+        # leaving --judge-mode off
         flags="--judge-mode per-kind"
-        [[ "$mode" == tree ]] && flags="--score-matrix tree"
+        [[ "$mode" == tree ]] && flags="--judge-mode type --score-matrix tree"
         echo "=== eval ${name} (${tag}) ==="
         python -u babble_eval_qwen.py --config "$CFG" $flags \
             ${adapter:+--adapter-path "$adapter"} \

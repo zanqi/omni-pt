@@ -5,11 +5,13 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass
 
 import numpy as np
 import soundfile as sf
@@ -46,6 +48,7 @@ from util import (
     NUM_BAB_SPEAKERS,
     add_noise,
     detect_model_family,
+    load_config,
     load_model,
     omni_generate,
     quiet_chat_template,
@@ -819,9 +822,7 @@ def write_target(sentence, kind, probe):
         # against one inventory, with no witness of a similar-sounding
         # substitute -- so the question always asks openly
         system = REPAIR_TARGET_TREE_SYSTEM
-        user = REPAIR_TARGET_TREE_USER.format(
-            sentence=sentence, lost_piece=lost_piece
-        )
+        user = REPAIR_TARGET_TREE_USER.format(sentence=sentence, lost_piece=lost_piece)
 
     leakable = (
         set(_normalize_text(lost_piece).split()) - NON_PIECE_WORDS
@@ -954,9 +955,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             # decoding it would be dead GPU time
             responses = ["" for _ in hyp_lists]
             with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
-                labels = list(
-                    ex.map(lambda h: label_sent_beam(pieces, h), hyp_lists)
-                )
+                labels = list(ex.map(lambda h: label_sent_beam(pieces, h), hyp_lists))
         elif TRACK == "heard-reply":
             convs = [_conv(p, sysp, task_prompt(True)) for p in paths]
             outs = base_generate_batch(
@@ -982,7 +981,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             convs = [_conv(p, asr_sysp, ASR_PROMPT_QWEN2_5) for p in paths]
             transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
 
-            # get batch omni assistant respond. 
+            # get batch omni assistant respond.
             # The lock is released between 2 base_generate_batch calls.
             # It allows others more chance to use the GPU
             task = TASK_PROMPT_TREE if TRACK in ("tree", "sent-2") else TASK_PROMPT
@@ -1207,9 +1206,7 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
                 targets = dict(
                     zip(
                         KINDS,
-                        ex.map(
-                            lambda k: write_target(sentence, k, triplet[k]), KINDS
-                        ),
+                        ex.map(lambda k: write_target(sentence, k, triplet[k]), KINDS),
                     )
                 )
 
@@ -1370,37 +1367,44 @@ def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
     return rows
 
 
+@dataclass
+class Config:
+    omni_path: str = "Qwen/Qwen2.5-Omni-3B"
+    ds_id: str = "keylazy/slurp-babble-Qwen2.5-Omni-3B"
+    n_train: int = N_TRAIN_TRIPLETS
+    n_test: int = N_TEST_TRIPLETS
+    n_extra_ans: int = N_TRAIN_EXTRA_ANS
+    no_push: bool = False
+    # the track, as one value instead of five mutually exclusive store_trues.
+    # The flags below still write it, so babble_data.sh is untouched.
+    label: str = "two-pass"
+    # the ft-asr track: the ASR LoRA attached to the probe model
+    asr_adapter: str = None
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--omni-path", default="Qwen/Qwen2.5-Omni-3B")
-    ap.add_argument(
-        "--ds-id",
-        required=True,
-    )
-    ap.add_argument(
-        "--n-extra-ans",
-        type=int,
-        default=N_TRAIN_EXTRA_ANS,
-    )
-    ap.add_argument(
-        "--n-test",
-        type=int,
-        default=N_TEST_TRIPLETS,
-        help="test triplets to build (default: N_TEST_TRIPLETS). Lower this "
-        "for a quick smoke run instead of hand-editing the module constant.",
-    )
-    ap.add_argument(
-        "--n-train",
-        type=int,
-        default=N_TRAIN_TRIPLETS,
-        help="train triplets to build (default: N_TRAIN_TRIPLETS).",
-    )
+    ap.add_argument("--config", type=str)
+    ap.add_argument("--omni-path", type=str)
+    ap.add_argument("--ds-id", type=str)
+    ap.add_argument("--n-train", type=int)
+    ap.add_argument("--n-test", type=int)
+    ap.add_argument("--n-extra-ans", type=int)
     ap.add_argument(
         "--no-push",
         action="store_true",
-        help="Build and write rows.json + the wavs, but skip push_to_hub. For "
-        "smoke runs, so a throwaway --ds-id doesn't create a Hub repo.",
+        default=None,
     )
+    ap.add_argument(
+        "--asr-adapter",
+        default=None,
+        help="LoRA attached to the probe model (the ft-asr track). Legal only "
+        "on --beam-label / --sent-4, whose probe pass is ASR and nothing "
+        "else: every other track writes the task response with this same "
+        "model, and an ASR-only adapter answers a spoken command by "
+        "transcribing it back.",
+    )
+
     # STALE TRACKS. The sent tracks dropped the probe dict's "swapped" and
     # "lost_piece" entries -- their labels report key-piece ids against one
     # inventory, so the single agreed piece IS probe["lost"][0] and no witness
@@ -1412,10 +1416,17 @@ if __name__ == "__main__":
     #     label_sent_beam now, so label_beam / BEAM_LOSS_SYSTEM are unused and
     #     the beam_losses column comes out empty.
     # --heard-reply and --tree-label are unaffected.
+    #
+    # All five write the one `label` field, so the YAML can say `label: sent-4`
+    # and the drivers keep passing --sent-4. store_const, not store_true: the
+    # override loop needs None when the flag is absent.
     track = ap.add_mutually_exclusive_group()
     track.add_argument(
         "--heard-reply",
-        action="store_true",
+        dest="label",
+        action="store_const",
+        const="heard-reply",
+        default=None,
         help="One probe pass emitting 'Heard: ... / Reply: ...'; label off the "
         "Heard line alone with the few-shot labeler, disjoint SNR bands, and "
         "two-line SFT targets.",
@@ -1423,7 +1434,10 @@ if __name__ == "__main__":
 
     track.add_argument(
         "--tree-label",
-        action="store_true",
+        dest="label",
+        action="store_const",
+        const="tree",
+        default=None,
         help="Two probe passes as usual, but each labeled independently "
         "against the command for what it lost; decide_kind() intersects the "
         "two loss lists to pick the kind and the piece to ask about.",
@@ -1431,43 +1445,47 @@ if __name__ == "__main__":
 
     track.add_argument(
         "--beam-label",
-        action="store_true",
+        dest="label",
+        action="store_const",
+        const="beam",
+        default=None,
         help="One beam-search ASR pass per probe; label off the K hypotheses' "
         "consensus alone, a piece counting as lost only if every hypothesis "
         "missed it. No task-response pass.",
     )
 
-    track.add_argument("--sent-2", action="store_true")
+    track.add_argument(
+        "--sent-2", dest="label", action="store_const", const="sent-2", default=None
+    )
 
-    track.add_argument("--sent-4", action="store_true")
+    track.add_argument(
+        "--sent-4", dest="label", action="store_const", const="sent-4", default=None
+    )
 
     args = ap.parse_args()
 
-    TRACK = (
-        "heard-reply"
-        if args.heard_reply
-        else (
-            "tree"
-            if args.tree_label
-            else (
-                "beam"
-                if args.beam_label
-                else (
-                    "sent-2"
-                    if args.sent_2
-                    else "sent-4" if args.sent_4 else "two-pass"
-                )
-            )
-        )
-    )
+    cfg = load_config(args.config, Config) if args.config else Config()
+    for key, value in vars(args).items():
+        if value is not None and key != "config":
+            setattr(cfg, key, value)
+
+    TRACK = cfg.label
+    log(f"config: {cfg}")
     log(f"track: {TRACK}")
+
+    if cfg.asr_adapter and TRACK not in ("beam", "sent-4"):
+        raise SystemExit(
+            f"--asr-adapter is not usable on track {TRACK}: its probe also "
+            "generates the task response from this model, which an ASR-only "
+            "adapter cannot do."
+        )
     if TRACK in ("beam", "sent-4"):
         log(f"probe batch size: {PROBE_BATCH_SIZE} (beams: {ASR_NUM_BEAMS})")
 
     # ---
     # point AUDIO_DIR at a fresh per-dataset subdir of AUDIO_ROOT.
     # ---
-    AUDIO_DIR = os.path.join(AUDIO_ROOT, args.ds_id.split("/")[-1])
+    AUDIO_DIR = os.path.join(AUDIO_ROOT, cfg.ds_id.split("/")[-1])
     shutil.rmtree(AUDIO_DIR, ignore_errors=True)
     os.makedirs(AUDIO_DIR, exist_ok=True)
     # kept probes are moved out of here into AUDIO_DIR; what stays behind
@@ -1477,12 +1495,12 @@ if __name__ == "__main__":
     log(f"audio dir: {AUDIO_DIR}")
 
     # init base omni model
-    base_family = detect_model_family(args.omni_path)
+    base_family = detect_model_family(cfg.omni_path)
     base_model, base_processor = load_model(
-        args.omni_path,
+        cfg.omni_path,
         base_family,
-        adapter_path=args.asr_adapter,
-        thinker_only=not args.asr_adapter,
+        adapter_path=cfg.asr_adapter,
+        thinker_only=not cfg.asr_adapter,
     )
     IM_END_ID = base_processor.tokenizer.convert_tokens_to_ids("<|im_end|>")
     print("base models loaded")
@@ -1496,14 +1514,14 @@ if __name__ == "__main__":
             seen_ids.add(r["slurp_id"])
 
     test_babble_pool = collect_babble_pool("test")
-    test_rows = build_triplets("test", args.n_test, seen_ids, test_babble_pool)
+    test_rows = build_triplets("test", cfg.n_test, seen_ids, test_babble_pool)
     train_babble_pool = collect_babble_pool("train")
-    train_rows = build_triplets("train", args.n_train, seen_ids, train_babble_pool)
+    train_rows = build_triplets("train", cfg.n_train, seen_ids, train_babble_pool)
 
-    if args.n_extra_ans:
+    if cfg.n_extra_ans:
         train_rows += build_answer_rows(
             "train",
-            args.n_extra_ans,
+            cfg.n_extra_ans,
             seen_ids,
             train_babble_pool,
         )
@@ -1515,7 +1533,23 @@ if __name__ == "__main__":
     # metadata stay together under one gitignored folder
     dump = os.path.join(AUDIO_DIR, "rows.json")
     with open(dump, "w") as f:
-        json.dump({"train": train_rows, "test": test_rows}, f, indent=1)
+        json.dump(
+            {
+                # the ASR adapter and the git sha are the only things that
+                # distinguish this build from an earlier one on the same
+                # track, and neither fits in a dataset id
+                "config": asdict(cfg),
+                "git": subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                "train": train_rows,
+                "test": test_rows,
+            },
+            f,
+            indent=1,
+        )
     log(f"wrote {dump} before pushing")
 
     log(f"train {len(train_rows)} rows {Counter(r['kind'] for r in train_rows)}")
@@ -1529,12 +1563,12 @@ if __name__ == "__main__":
     # built either way, so --no-push still exercises the Audio cast and the
     # schema inference that a push would hit
     dsd = DatasetDict({"train": list2ds(train_rows), "test": list2ds(test_rows)})
-    if args.no_push:
-        log(f"--no-push: built {args.ds_id} locally, see {dump}")
+    if cfg.no_push:
+        log(f"--no-push: built {cfg.ds_id} locally, see {dump}")
         raise SystemExit(0)
 
-    dsd.push_to_hub(args.ds_id)
+    dsd.push_to_hub(cfg.ds_id)
     log(
         f"Pushed {len(train_rows)} train / {len(test_rows)} test rows "
-        f"to {args.ds_id}."
+        f"to {cfg.ds_id}."
     )
