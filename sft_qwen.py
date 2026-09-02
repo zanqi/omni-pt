@@ -377,7 +377,7 @@ def main(cfg: Config):
         gradient_checkpointing=True,  # TODO: what?
         gradient_checkpointing_kwargs={"use_reentrant": False},
         remove_unused_columns=False,
-        dataloader_num_workers=4,
+        dataloader_num_workers=min(4, len(os.sched_getaffinity(0))),
         report_to="tensorboard",
         logging_dir=logging_dir,
     )
