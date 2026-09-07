@@ -91,3 +91,7 @@ done
 
 echo ""
 echo "=== done: results/mask_results_*_${TAG}.jsonl ==="
+
+# TODO: it haven't finished. continue by:
+# STAGES="dpo eval" sbatch exp/mask-all.sh
+
