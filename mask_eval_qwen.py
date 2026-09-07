@@ -3,18 +3,21 @@ Evaluate a Qwen Omni model on the mask track (steps/mask.html).
 
   C   = mean task-competence over the kind="answer" rows
   R   = mean conversational-repair over the kind="repair" rows
-  EAR = 2*C*R / (C+R)
+  F   = mean repeat quality over the kind="repeat" rows
+  EAR = 3*C*R*F / (C*R + C*F + R*F)
 
-A third near-duplicate of babble_eval_qwen.py, deliberately: this track has
-only two kinds, no probe columns and no reply parsing, so the type judge, the
-score matrices and the heard-reply path are all gone. What is left is the
+A third near-duplicate of babble_eval_qwen.py, deliberately: this track has no
+probe columns and no reply parsing, so the type judge, the score matrices and
+the heard-reply path are all gone. What is left is the
 per-kind judge -- the row's own label picks the rubric and the rubric returns
 the score, so no cell can hand a repair row 1.0 for a confident answer.
 
 What it adds is the breakdown the four masks exist for: by_mask (silence /
 white / splice / burst), by_bg (clean vs babble, split on snr_db) and by_snr in
 5 dB bins. The summary line keeps `model`, `C`, `R` and `EAR` at the top level
-and last in the file, so results/viz.ipynb reads these runs unchanged.
+and last in the file, so results/viz.ipynb reads these runs unchanged; `F`
+sits beside them and a two-kind dataset simply has none, which is what keeps
+the v1 result files readable next to these.
 
   python mask_eval_qwen.py --dataset keylazy/slurp-mask-v1 \
       --adapter-path checkpoints/Qwen2.5-Omni-3B-mask-sft \
@@ -35,13 +38,23 @@ import torch
 from datasets import Audio, load_dataset
 from openai import OpenAI
 
-from prompts import ANSWER_JUDGE_SYSTEM, QWEN25_SYSTEM_PROMPT, REPAIR_JUDGE_SYSTEM, task_prompt
+from prompts import (
+    ANSWER_JUDGE_SYSTEM,
+    QWEN25_SYSTEM_PROMPT,
+    REPAIR_JUDGE_SYSTEM,
+    REPEAT_JUDGE_SYSTEM,
+    task_prompt,
+)
 from util import detect_model_family, load_model
 
 AUDIO_SAMPLING_RATE = 16000
-KINDS = ("answer", "repair")
-JUDGE_BY_KIND = {"answer": ANSWER_JUDGE_SYSTEM, "repair": REPAIR_JUDGE_SYSTEM}
-METRIC_NAME = {"answer": "C", "repair": "R"}
+KINDS = ("answer", "repair", "repeat")
+JUDGE_BY_KIND = {
+    "answer": ANSWER_JUDGE_SYSTEM,
+    "repair": REPAIR_JUDGE_SYSTEM,
+    "repeat": REPEAT_JUDGE_SYSTEM,
+}
+METRIC_NAME = {"answer": "C", "repair": "R", "repeat": "F"}
 VALID_SCORES = (0.0, 0.5, 1.0)
 PARSE_FAIL_REASON = "Error parsing judge output"
 SNR_BIN = 5.0
@@ -186,7 +199,8 @@ def judge_user(row, reply):
 
 
 def harmonic(*vals):
-    """2*C*R/(C+R), and 0.0 if either is 0."""
+    """Harmonic mean of the per-kind scores, 0.0 if any of them is 0.
+    n=3 is 3*C*R*F/(C*R + C*F + R*F); n=2 is 2*C*R/(C+R)."""
     if any(v == 0 for v in vals):
         return 0.0
     return len(vals) / sum(1.0 / v for v in vals)
@@ -214,7 +228,7 @@ def imap_ordered(items, work, workers):
 
 
 def breakdown(bucket_scores):
-    """{bucket: {kind: [scores]}} -> {bucket: {C, R, EAR, n}}"""
+    """{bucket: {kind: [scores]}} -> {bucket: {C, R, F, EAR, n}}"""
     out = {}
     for name, by_kind in sorted(bucket_scores.items()):
         means = {}
@@ -370,8 +384,12 @@ def main():
         means = {
             k: (sum(scores[k]) / len(scores[k]) if scores[k] else None) for k in KINDS
         }
-        C, R = means["answer"], means["repair"]
-        EAR = harmonic(*[v for v in (C, R) if v is not None]) if C and R else 0.0
+        C, R, F = means["answer"], means["repair"], means["repeat"]
+        # a kind the split does not carry (a v1 dataset has no repeat rows)
+        # drops out of the mean rather than zeroing it; a kind that IS present
+        # and scored 0 still takes EAR to 0, which is the point of a harmonic
+        scored = [v for v in (C, R, F) if v is not None]
+        EAR = harmonic(*scored) if scored and all(scored) else 0.0
 
         summary = {
             "type": "summary",
@@ -392,13 +410,18 @@ def main():
             # last, and named as viz.ipynb's load_summary expects
             "C": C,
             "R": R,
+            "F": F,
             "EAR": EAR,
         }
         fout.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
     print(f"\n=== {name} on {args.dataset}:{args.split} ===")
-    print(f"C (answer): {C if C is None else round(C, 3)}  n={len(scores['answer'])}")
-    print(f"R (repair): {R if R is None else round(R, 3)}  n={len(scores['repair'])}")
+    for label, kind, val in (
+        ("C (answer)", "answer", C),
+        ("R (repair)", "repair", R),
+        ("F (repeat)", "repeat", F),
+    ):
+        print(f"{label}: {val if val is None else round(val, 3)}  n={len(scores[kind])}")
     print(f"EAR:        {EAR:.3f}")
     for title, block in (
         ("by mask", summary["by_mask"]),
@@ -407,10 +430,11 @@ def main():
     ):
         print(f"\n{title}:")
         for bucket, v in block.items():
-            c = "  n/a" if v["C"] is None else f"{v['C']:.3f}"
-            r = "  n/a" if v["R"] is None else f"{v['R']:.3f}"
-            e = "  n/a" if v["EAR"] is None else f"{v['EAR']:.3f}"
-            print(f"  {bucket:>10}  C={c}  R={r}  EAR={e}  n={v['n']}")
+            cells = "  ".join(
+                f"{m}=" + ("  n/a" if v[m] is None else f"{v[m]:.3f}")
+                for m in ("C", "R", "F", "EAR")
+            )
+            print(f"  {bucket:>10}  {cells}  n={v['n']}")
     if judge_failures:
         print(f"\njudge parse failures: {judge_failures} (scored 0)")
     print(f"\nper-row results + summary -> {out_path}")

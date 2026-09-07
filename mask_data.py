@@ -1,13 +1,22 @@
 """
 Build the mask-track dataset (steps/mask.html).
 
-Every row carries exactly one masked span, and the mask is the only thing that
-removes information:
+Every row carries one masked span (two on a repeat row), and the mask is the
+only thing that removes information:
 
   kind="repair"  the top-priority SLURP slot is masked -> ask about it
   kind="answer"  a non-critical span (stopword, or a rank-5 slot) is masked -> just act
+  kind="repeat"  that slot AND one more key piece are masked -> ask for the
+                 whole command again
 
-Both rows of an utterance share a background, drawn once per utterance:
+The repeat row's second span comes from babble_data.key_pieces(), the same LLM
+inventory the sent tracks label against -- not from the SLURP annotation, which
+tags entities and not the action, so "set", "play" and "how many" are invisible
+to it and those are exactly the pieces a repeat has to take out. Two
+independently-chosen things are gone, which is the >=2-lost rule the babble
+track calls a repeat, enforced here by construction instead of by a classifier.
+
+All rows of an utterance share a background, drawn once per utterance:
 3-speaker babble at 0-20 dB SNR, or (CLEAN_BG_PROB of the time) the raw clean
 recording. There is no probe loop and no classifier -- the mask is placed by us
 over a span we chose, so the kind is true by construction. What replaces the
@@ -60,6 +69,7 @@ from babble_data import (
     UTTERANCE_WORKERS,
     collect_babble_pool,
     imap_ordered,
+    key_pieces,
     log,
     skip,
     slurp_ds_stream,
@@ -354,6 +364,20 @@ def align_words(audio, sentence):
 # ---
 
 
+def locate_phrase(tokens, phrase):
+    """Word-index range of `phrase` in `tokens`, or None if it isn't a
+    contiguous subsequence. `tokens` is plan_spans' positional list, so the
+    range addresses the aligner's word list directly."""
+    phrase_toks = norm_tokens(phrase)
+    n = len(phrase_toks)
+    if not n:
+        return None
+    for i in range(len(tokens) - n + 1):
+        if tokens[i : i + n] == phrase_toks:
+            return (i, i + n)
+    return None
+
+
 def plan_spans(sentence, annotation):
     """Text-only: which span each kind masks. None if the sentence can't work.
 
@@ -362,23 +386,20 @@ def plan_spans(sentence, annotation):
     always a contiguous token subsequence and matching needs no audio.
     """
     # positional, unlike norm_tokens(): a token that normalizes to nothing has
-    # to keep its slot, because these indices address the aligner's word list
-    tokens = [re.sub(r"[^a-z0-9']", "", w.lower()) for w in sentence.split()]
-
-    def indices(phrase):
-        phrase_toks = norm_tokens(phrase)
-        n = len(phrase_toks)
-        if not n:
-            return None
-        for i in range(len(tokens) - n + 1):
-            if tokens[i : i + n] == phrase_toks:
-                return (i, i + n)
-        return None
+    # to keep its slot, because these indices address the aligner's word list.
+    # The NUM_WORDS mapping still has to match norm_tokens', or locate_phrase
+    # can never find a phrase containing a number -- "seven am" normalizes to
+    # ["7", "am"] on the phrase side and stayed ["seven", "am"] here, which
+    # silently dropped every date/time slot (rank 2) out of `slots`.
+    tokens = [
+        NUM_WORDS.get(t, t)
+        for t in (re.sub(r"[^a-z0-9']", "", w.lower()) for w in sentence.split())
+    ]
 
     slots = []
     for slot_type, phrase in re.findall(r"\[(.*?) : (.*?)\]", annotation):
         slot_type, phrase = slot_type.strip().lower(), phrase.strip()
-        span = indices(phrase)
+        span = locate_phrase(tokens, phrase)
         if span:
             slots.append({"range": span, "phrase": phrase, "slot": slot_type})
 
@@ -418,7 +439,7 @@ def plan_spans(sentence, annotation):
     ans += [s for s in slots if s["rank"] >= LOWEST_RANK and s is not crit]
     if not ans:
         return None
-    return {"crit": crit, "ans": ans}
+    return {"crit": crit, "ans": ans, "tokens": tokens}
 
 
 def build_bed(clean, pool, plan, sentence, rng):
@@ -498,125 +519,166 @@ def build_bed(clean, pool, plan, sentence, rng):
     return None, f"bed-clean-{reason}" if clean_bg else f"bed-{reason}"
 
 
-def apply_mask(parts, span, variant, rng):
-    """Replace `span` (t_start, t_end) of the background in place.
+def apply_mask(parts, spans, variant, rng):
+    """Replace each of `spans` [(t_start, t_end), ...] of the background in place.
 
-    All four masks keep the total duration, so nothing after the span shifts
-    and the alignment stays valid for the rest of the utterance.
+    All four masks keep the total duration, so nothing after a span shifts and
+    the alignment stays valid for the rest of the utterance -- which is also
+    what lets a repeat row's two spans be applied one after the other.
     """
     sr = AUDIO_SAMPLING_RATE
     bed = parts["bed"]
-    start = int((span[0] - MASK_PAD) * sr)
-    end = int((span[1] + MASK_PAD) * sr)
-    # aligner timestamps sit on a coarse (~0.08s) grid; short words can come
-    # back with zero width. Enforce a minimum, centered on the span.
-    if end - start < int(MIN_MASK_SEC * sr):
-        center = (start + end) // 2
-        start = center - int(MIN_MASK_SEC * sr) // 2
-        end = start + int(MIN_MASK_SEC * sr)
-    start, end = max(0, start), min(len(bed), end)
-    if start >= end:
-        return None, {}
+
+    # --- sample ranges, padded, clamped, and merged ---
+    # MASK_PAD widens every span by 50ms on each side, so a repeat row whose
+    # two pieces are adjacent words comes out with overlapping ranges. Masking
+    # them in sequence would then read the already-masked `out` back through
+    # `bed` for the second span and leave a seam, so overlaps are merged into
+    # one range before anything is written.
+    ranges = []
+    for span in spans:
+        start = int((span[0] - MASK_PAD) * sr)
+        end = int((span[1] + MASK_PAD) * sr)
+        # aligner timestamps sit on a coarse (~0.08s) grid; short words can
+        # come back with zero width. Enforce a minimum, centered on the span.
+        if end - start < int(MIN_MASK_SEC * sr):
+            center = (start + end) // 2
+            start = center - int(MIN_MASK_SEC * sr) // 2
+            end = start + int(MIN_MASK_SEC * sr)
+        start, end = max(0, start), min(len(bed), end)
+        if start >= end:
+            return None, {}
+        ranges.append((start, end))
+
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
 
     out = bed.copy()
-    n = end - start
+    # splice is the one mask that works on the speaker alone (shredding the
+    # mixture would chop the babble into the same 40ms pieces and leave a
+    # stutter exactly where the word went, which is a cue on its own), so it
+    # accumulates here and the bed goes back on after every span is done
+    speech_out = parts["speech"].copy()
     meta = {
         "mask_snr_db": None,
         "splice_n": None,
-        "mask_start": round(start / sr, 3),
-        "mask_end": round(end / sr, 3),
+        # the first range, kept scalar so v1 readers of these two columns are
+        # unaffected; mask_spans is the whole truth on a repeat row
+        "mask_start": round(merged[0][0] / sr, 3),
+        "mask_end": round(merged[0][1] / sr, 3),
+        "mask_spans": [[round(a / sr, 3), round(b / sr, 3)] for a, b in merged],
     }
 
-    if variant == "silence":
-        # the speaker stops, the room does not: the span keeps the bed alone at
-        # its existing level. --silence-hard zeroes the mixed signal outright.
-        target = (
-            np.zeros(n, dtype=np.float32) if SILENCE_HARD else parts["bg_only"][start:end]
-        )
-        # weight of the ORIGINAL audio: 1 at the two edges so the transition
-        # has no click, 0 through the middle so the word is actually gone
-        edge = min(int(SILENCE_RAMP_SEC * sr), n // 2)
-        blend = np.zeros(n, dtype=np.float32)
-        blend[:edge] = 1 - ramp(edge)
-        blend[n - edge :] = 1 - ramp(edge)[::-1]
-        out[start:end] = blend * bed[start:end] + (1 - blend) * target
+    for start, end in merged:
+        n = end - start
 
-    elif variant == "white":
-        # EAR track's mask, but the amplitude is read off the mixed signal so
-        # the burst matches the bed's level rather than the clean speech's
-        amp = max(float(np.mean(np.abs(bed[start:end]))), 0.01)
-        out[start:end] = np.random.default_rng(rng.getrandbits(64)).normal(
-            0, amp, n
-        ).astype(np.float32)
+        if variant == "silence":
+            # the speaker stops, the room does not: the span keeps the bed alone at
+            # its existing level. --silence-hard zeroes the mixed signal outright.
+            target = (
+                np.zeros(n, dtype=np.float32) if SILENCE_HARD else parts["bg_only"][start:end]
+            )
+            # weight of the ORIGINAL audio: 1 at the two edges so the transition
+            # has no click, 0 through the middle so the word is actually gone
+            edge = min(int(SILENCE_RAMP_SEC * sr), n // 2)
+            blend = np.zeros(n, dtype=np.float32)
+            blend[:edge] = 1 - ramp(edge)
+            blend[n - edge :] = 1 - ramp(edge)[::-1]
+            out[start:end] = blend * bed[start:end] + (1 - blend) * target
 
-    elif variant == "splice":
-        # Built on the main speaker alone, then the babble goes back on top:
-        # shred the clean signal, drop it in place of the key span, and add
-        # bg_only afterwards. Cutting the mixture instead would chop the babble
-        # into the same 40 ms pieces, and a bed that stutters exactly where the
-        # word went is a cue the model could key on without hearing anything.
-        src = parts["speech"]
-        chunk = max(int(SPLICE_CHUNK_SEC * sr), 1)
-        count = max(SPLICE_MIN_CHUNKS, round(n / chunk))
-        chunk = n // count
-        if chunk < 2:
-            return None, {}
-        xfade = min(int(SPLICE_XFADE_SEC * sr), chunk // 4)
-        # offsets come from this utterance's own speech, outside the span, so
-        # the fragments carry the same voice and room as the rest of the row
-        pool = [i for i in range(0, len(src) - chunk) if i + chunk <= start or i >= end]
-        if not pool:
-            return None, {}
-        picks, prev = [], None
-        for _ in range(count):
-            # two consecutive chunks lifted from adjacent offsets would rebuild
-            # a real word, which is the one thing this mask must not do
-            off = rng.choice(pool)
-            for _ in range(4):
-                if prev is None or abs(off - (prev + chunk)) >= chunk:
-                    break
+        elif variant == "white":
+            # EAR track's mask, but the amplitude is read off the mixed signal so
+            # the burst matches the bed's level rather than the clean speech's
+            amp = max(float(np.mean(np.abs(bed[start:end]))), 0.01)
+            out[start:end] = np.random.default_rng(rng.getrandbits(64)).normal(
+                0, amp, n
+            ).astype(np.float32)
+
+        elif variant == "splice":
+            # Built on the main speaker alone, then the babble goes back on top:
+            # shred the clean signal, drop it in place of the key span, and add
+            # bg_only afterwards. Cutting the mixture instead would chop the babble
+            # into the same 40 ms pieces, and a bed that stutters exactly where the
+            # word went is a cue the model could key on without hearing anything.
+            src = parts["speech"]
+            chunk = max(int(SPLICE_CHUNK_SEC * sr), 1)
+            count = max(SPLICE_MIN_CHUNKS, round(n / chunk))
+            chunk = n // count
+            if chunk < 2:
+                return None, {}
+            xfade = min(int(SPLICE_XFADE_SEC * sr), chunk // 4)
+            # offsets come from this utterance's own speech, outside every
+            # masked range, so the fragments carry the same voice and room as
+            # the rest of the row. All ranges, not just this one: on a repeat
+            # row the other masked piece is still intact in `src`, and lifting
+            # fragments out of it would put the audio this row exists to remove
+            # back into the span
+            pool = [
+                i
+                for i in range(0, len(src) - chunk)
+                if all(i + chunk <= a or i >= b for a, b in merged)
+            ]
+            if not pool:
+                return None, {}
+            picks, prev = [], None
+            for _ in range(count):
+                # two consecutive chunks lifted from adjacent offsets would rebuild
+                # a real word, which is the one thing this mask must not do
                 off = rng.choice(pool)
-            picks.append(off)
-            prev = off
-        shred = np.concatenate([src[o : o + chunk] for o in picks])
-        if xfade:
-            fade = ramp(xfade)
-            for i in range(1, count):
-                edge = i * chunk
-                shred[edge : edge + xfade] = (
-                    shred[edge : edge + xfade] * fade
-                    + src[picks[i - 1] + chunk - xfade : picks[i - 1] + chunk] * (1 - fade)
-                )
-        shred = np.pad(shred, (0, n - len(shred)), "wrap")[:n]
-        rms = float(np.sqrt(np.mean(src[start:end] ** 2)))
-        shred_rms = max(float(np.sqrt(np.mean(shred**2))), 1e-6)
-        shred = shred * (rms / shred_rms)
-        edge = min(xfade * 4, n // 2)
-        blend = np.ones(n, dtype=np.float32)
-        blend[:edge] = ramp(edge)
-        blend[n - edge :] = ramp(edge)[::-1]
-        spliced = src.copy()
-        spliced[start:end] = blend * shred + (1 - blend) * src[start:end]
-        # the babble bed is untouched and continuous across the span
-        out = spliced + parts["bg_only"]
-        meta["splice_n"] = count
+                for _ in range(4):
+                    if prev is None or abs(off - (prev + chunk)) >= chunk:
+                        break
+                    off = rng.choice(pool)
+                picks.append(off)
+                prev = off
+            shred = np.concatenate([src[o : o + chunk] for o in picks])
+            if xfade:
+                fade = ramp(xfade)
+                for i in range(1, count):
+                    edge = i * chunk
+                    shred[edge : edge + xfade] = (
+                        shred[edge : edge + xfade] * fade
+                        + src[picks[i - 1] + chunk - xfade : picks[i - 1] + chunk] * (1 - fade)
+                    )
+            shred = np.pad(shred, (0, n - len(shred)), "wrap")[:n]
+            rms = float(np.sqrt(np.mean(src[start:end] ** 2)))
+            shred_rms = max(float(np.sqrt(np.mean(shred**2))), 1e-6)
+            shred = shred * (rms / shred_rms)
+            edge = min(xfade * 4, n // 2)
+            blend = np.ones(n, dtype=np.float32)
+            blend[:edge] = ramp(edge)
+            blend[n - edge :] = ramp(edge)[::-1]
+            # written into the shared speaker-only accumulator, not into a
+            # fresh copy: a repeat row masks two spans, and rebuilding `out`
+            # from `src` here would discard the span masked on the last pass.
+            # The babble bed is untouched and continuous across the span, so it
+            # goes back on once, after the loop.
+            speech_out[start:end] = blend * shred + (1 - blend) * src[start:end]
+            meta["splice_n"] = (meta["splice_n"] or 0) + count
 
-    elif variant == "burst":
-        # the real word is still there, buried: raise the babble inside the
-        # span until the local SNR hits BURST_SNR_DB. On a clean background
-        # there is no bed to raise, so the burst is mixed in locally -- which
-        # is the same event, just one that starts at the span.
-        speech = parts["speech"][start:end]
-        source = parts["bg_only"] if float(np.mean(parts["bg_only"] ** 2)) > 0 else parts["babble"]
-        span_power = max(float(np.mean(source[start:end] ** 2)), 1e-12)
-        target_power = max(float(np.mean(speech**2)), 1e-12) / (10 ** (BURST_SNR_DB / 10))
-        gain = np.sqrt(target_power / span_power)
-        edge = min(int(BURST_RAMP_SEC * sr), n // 2)
-        env = np.full(n, gain, dtype=np.float32)
-        env[:edge] = 1 + (gain - 1) * ramp(edge)
-        env[n - edge :] = 1 + (gain - 1) * ramp(edge)[::-1]
-        out[start:end] = speech + env * source[start:end]
-        meta["mask_snr_db"] = BURST_SNR_DB
+        elif variant == "burst":
+            # the real word is still there, buried: raise the babble inside the
+            # span until the local SNR hits BURST_SNR_DB. On a clean background
+            # there is no bed to raise, so the burst is mixed in locally -- which
+            # is the same event, just one that starts at the span.
+            speech = parts["speech"][start:end]
+            source = parts["bg_only"] if float(np.mean(parts["bg_only"] ** 2)) > 0 else parts["babble"]
+            span_power = max(float(np.mean(source[start:end] ** 2)), 1e-12)
+            target_power = max(float(np.mean(speech**2)), 1e-12) / (10 ** (BURST_SNR_DB / 10))
+            gain = np.sqrt(target_power / span_power)
+            edge = min(int(BURST_RAMP_SEC * sr), n // 2)
+            env = np.full(n, gain, dtype=np.float32)
+            env[:edge] = 1 + (gain - 1) * ramp(edge)
+            env[n - edge :] = 1 + (gain - 1) * ramp(edge)[::-1]
+            out[start:end] = speech + env * source[start:end]
+            meta["mask_snr_db"] = BURST_SNR_DB
+
+    if variant == "splice":
+        out = speech_out + parts["bg_only"]
 
     peak = float(np.max(np.abs(out)))
     if peak > 1.0:
@@ -630,7 +692,10 @@ def apply_mask(parts, span, variant, rng):
 
 
 def build_rows(split, n_utts, seen_slurp_ids, babble_pool):
-    """One pass over a SLURP split: one answer row and one repair row per utterance."""
+    """One pass over a SLURP split: an answer, a repair and a repeat row per
+    utterance. An utterance that cannot produce all three is skipped rather
+    than contributing to two kinds, so the split stays balanced by
+    construction."""
     rows, scanned, done = [], 0, 0
     skip.clear()
     pbar = tqdm(total=n_utts, desc=f"[{split}]", unit="utt", dynamic_ncols=True)
@@ -681,16 +746,47 @@ def build_rows(split, n_utts, seen_slurp_ids, babble_pool):
         if bg is None:
             return {"skip": reason}
 
+        # --- the repeat row's second piece ---
+        # The SLURP annotation only tags entities, so `crit` can never be the
+        # verb or the question word. key_pieces is the sent tracks' LLM
+        # inventory of everything the command cannot be carried out without,
+        # which is where "set", "play" and "how many" come from. Run after the
+        # bed, not in plan_spans: an utterance that fails alignment or the bed
+        # gate never reaches here, so it costs no LLM call.
+        pieces = key_pieces(sentence) or []
+        crit_lo, crit_hi = crit["range"]
+        rep = None
+        for phrase in sorted(pieces, key=lambda x: -len(x.split())):
+            span = locate_phrase(plan["tokens"], phrase)
+            if span is None or (span[0] < crit_hi and crit_lo < span[1]):
+                # not quoted verbatim from the command, or it IS the critical
+                # slot -- a repeat has to lose two independent things
+                continue
+            if gate(bg["hyp"], sentence, must_hear=[phrase]):
+                # whisper could not hear it in the bed either, so masking it
+                # removes nothing this row can be held to
+                continue
+            rep = {"range": span, "phrase": phrase, "slot": "", "rank": 0}
+            break
+        if rep is None:
+            return {"skip": "no-rep-piece"}
+
         def to_span(idx_range):
             return (words[idx_range[0]]["start"], words[idx_range[1] - 1]["end"])
 
         pending = []
-        for kind, chosen in (("repair", crit), ("answer", bg["ans"])):
-            span = to_span(chosen["range"])
-            # test pairs both spans against all four masks; train draws one per
+        for kind, chosen in (
+            ("repair", [crit]),
+            ("answer", [bg["ans"]]),
+            # both, so two independent pieces are gone -- the >=2-lost rule the
+            # babble track's classifier decides, true here by construction
+            ("repeat", [crit, rep]),
+        ):
+            spans = [to_span(c["range"]) for c in chosen]
+            # test pairs every kind against all four masks; train draws one per
             # row, so a sentence never repeats as audio
             for variant in VARIANTS if split == "test" else (rng.choice(VARIANTS),):
-                audio, meta = apply_mask(bg, span, variant, rng)
+                audio, meta = apply_mask(bg, spans, variant, rng)
                 if audio is None:
                     skip[f"mask-{variant}"] += 1
                     continue
@@ -701,14 +797,22 @@ def build_rows(split, n_utts, seen_slurp_ids, babble_pool):
                 pending.append(
                     {
                         "kind": kind,
-                        "span": span,
-                        "piece": chosen,
+                        "span": spans[0],
+                        "pieces": chosen,
                         "variant": variant,
                         "path": path,
                         "meta": meta,
                     }
                 )
-        if not pending:
+        # all three kinds, and on test all four masks of each: a partial
+        # utterance would tilt the per-kind counts the split is supposed to
+        # hold equal, and one dropped mask variant would tilt by_mask too
+        want = len(("answer", "repair", "repeat")) * (
+            len(VARIANTS) if split == "test" else 1
+        )
+        if len(pending) != want:
+            for p in pending:
+                os.remove(p["path"])
             return {"skip": "mask"}
 
         kinds = {p["kind"] for p in pending}
@@ -716,14 +820,17 @@ def build_rows(split, n_utts, seen_slurp_ids, babble_pool):
             # the answer target reads the sentence alone, so one call covers
             # every answer row this utterance produced
             with ThreadPoolExecutor(max_workers=len(kinds)) as ex:
+                lost_by_kind = {
+                    "repair": [crit["phrase"]],
+                    "answer": [],
+                    "repeat": [crit["phrase"], rep["phrase"]],
+                }
                 targets = dict(
                     zip(
                         kinds,
                         ex.map(
                             lambda k: write_target(
-                                sentence,
-                                k,
-                                {"lost": [crit["phrase"]] if k == "repair" else []},
+                                sentence, k, {"lost": lost_by_kind[k]}
                             ),
                             kinds,
                         ),
@@ -746,11 +853,14 @@ def build_rows(split, n_utts, seen_slurp_ids, babble_pool):
                     "snr_db": bg["snr"],
                     "mask_snr_db": p["meta"]["mask_snr_db"],
                     "splice_n": p["meta"]["splice_n"],
-                    "slot_type": p["piece"]["slot"],
-                    "slot_rank": p["piece"]["rank"],
-                    "lost": [p["piece"]["phrase"]],
+                    # the row's own critical span: crit on repair and repeat,
+                    # the harmless one on answer
+                    "slot_type": p["pieces"][0]["slot"],
+                    "slot_rank": p["pieces"][0]["rank"],
+                    "lost": [c["phrase"] for c in p["pieces"]],
                     "mask_start": p["meta"]["mask_start"],
                     "mask_end": p["meta"]["mask_end"],
+                    "mask_spans": p["meta"]["mask_spans"],
                     "bed_asr": bg["hyp"],
                     "slurp_id": slurp_id,
                     "sentence": sentence,

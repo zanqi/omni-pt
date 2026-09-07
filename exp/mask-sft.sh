@@ -31,6 +31,9 @@ set -eo pipefail
 
 DS_ID="${DS_ID:-keylazy/slurp-mask-v1}"
 RUN_NAME="${RUN_NAME:-Qwen2.5-Omni-3B-mask-sft}"
+# every kind the dataset carries. A v1 build has no repeat rows, so naming the
+# kind here is harmless there and is what trains F on a v2 build.
+TRAIN_KINDS="${TRAIN_KINDS:-answer,repair,repeat}"
 
 conda activate qwen25omni
 
@@ -38,6 +41,6 @@ echo "=== SFT ${RUN_NAME} on ${DS_ID} $* ==="
 python -u sft_qwen.py \
     --repair-ds-id "$DS_ID" \
     --repair-repo-name "$RUN_NAME" \
-    --train-kinds answer,repair \
+    --train-kinds "$TRAIN_KINDS" \
     "$@"
 echo "=== ${RUN_NAME} trained ==="

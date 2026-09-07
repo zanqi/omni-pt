@@ -135,7 +135,7 @@ class DPOTrainer(Trainer):
         # the implicit reward is how much the policy moved from the reference
         # on each side; DPO only ever compares their difference
         margin = (pi_c - ref_c) - (pi_r - ref_r)
-        # weighted so the two kinds contribute equally; see main()
+        # weighted so every kind contributes equally; see main()
         loss = -(weights * F.logsigmoid(self.beta * margin)).sum() / weights.sum()
 
         if not self._ref_gap_checked:
