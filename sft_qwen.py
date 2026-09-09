@@ -328,9 +328,12 @@ def main(cfg: Config):
     print(f"model family: {family}")
 
     model_name = cfg.omni_path.rstrip("/").split("/")[-1]
-    # distinct default per task, so an asr run can't overwrite the babble adapter
-    suffix = "asr-sft" if cfg.task == "asr" else "bab-sft"
-    repair = cfg.task == "repair"
+    # distinct default per task, so an asr run can't overwrite the babble
+    # adapter, and an hr run can't overwrite a restate-prompt one
+    suffix = {"asr": "asr-sft", "hr": "bab-hr-sft"}.get(cfg.task, "bab-sft")
+    # "hr" is the repair task under the two-line output contract: same weights,
+    # same dataset, same repair_* keys, only get_prompts differs
+    repair = cfg.task in ("repair", "hr")
     repo_name = (cfg.repair_repo_name if repair else cfg.asr_repo_name) or (
         f"{model_name}-{suffix}"
     )
@@ -425,11 +428,13 @@ if __name__ == "__main__":
     ap.add_argument(
         "--task",
         type=str,
-        choices=("repair", "asr"),
+        choices=("repair", "asr", "hr"),
         help="Which prompt pair to train under (see prompts.get_prompts), and "
         "which half of the config's repair_*/asr_* keys to read: 'repair' for "
         "the babble/ear assistant datasets, 'asr' for the transcription "
-        "dataset built by asr_data.py.",
+        "dataset built by asr_data.py, 'hr' for a --heard-reply dataset, whose "
+        "targets are a 'Heard: ... / Reply: ...' pair (repair_* keys, HR "
+        "prompt).",
     )
     ap.add_argument("--smoke", action="store_true", default=None)
     ap.add_argument(

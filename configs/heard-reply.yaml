@@ -1,0 +1,41 @@
+# heard-reply v2 -- a re-creation of the original hr dataset on the current
+# vLLM judge box, with no prompt edits: the same LABEL_TARGET_SYSTEM few-shot
+# call still does label + target off the Heard line alone, and the SFT target
+# is still the two-line "Heard: ... / Reply: ..." pair.
+# See steps/bab-ds.html.
+#
+#   ./exp/bab-hr.slurm
+#   sbatch exp/bab-hr.slurm
+#
+# Keys not declared by a stage's Config dataclass are dropped SILENTLY -- read
+# the "config: ..." line each script prints on start.
+
+# Model
+omni_path: Qwen/Qwen2.5-Omni-3B
+
+# the build (babble_data.py). One probe pass (TASK_PROMPT_HR + the "Heard:"
+# prefill, 256 tokens), no key-piece inventory.
+label: heard-reply
+ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-hr-v2
+n_train: 1000
+n_test: 100
+n_extra_ans: 1000
+
+# the repair LoRA (sft_qwen.py). --task hr is the repair task under the
+# two-line output contract: same repair_* keys, TASK_PROMPT_HR instead of the
+# restate prompt, because these rows' targets ARE two-line.
+task: hr
+repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-hr-v2
+repair_repo_name: Qwen2.5-Omni-3B-bab-hr2-sft
+repair_epochs: 3
+repair_lr: 2.0e-4
+
+# the eval (babble_eval_qwen.py). heard_reply prompts with TASK_PROMPT_HR and
+# judges only the parsed "Reply:" half. Per-kind judges like the two sent
+# tracks -- the few-shot judge the v1 hr runs used no longer exists, and this
+# is what keeps the three new datasets comparable with each other.
+heard_reply: true
+judge_mode: per-kind
+kinds: answer,repair,repeat
+num_rows: -1
+tag: hr-v2

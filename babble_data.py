@@ -153,6 +153,12 @@ base_family = None
 # set in __main__ from the track flags; switches the probe pass, the labeler,
 # the SNR bands, and how the SFT target is composed
 TRACK = "two-pass"
+# tracks whose label reads key-piece ids off one shared inventory
+PIECE_TRACKS = frozenset({"sent-1-asr", "sent-1-resp", "sent-2", "sent-4"})
+# tracks whose SFT target is a second, separate call at temperature 0.7.
+# --heard-reply writes it inline with the label; two-pass writes one call per
+# utterance covering all three kinds.
+TARGET_TRACKS = PIECE_TRACKS | {"tree", "beam"}
 IM_END_ID = None
 
 
@@ -506,24 +512,33 @@ def key_pieces(sentence: str):
     return pieces or None
 
 
-def decide_kind_ids(pieces, sides: list[set[int]]):
-    """Used only for the 2-witness classifer.
-    sides: [asr_lost_ids, resp_lost_ids]
+def decide_kind_ids(pieces, names: list[str], sides: list[set[int]]):
+    """A piece counts as lost only if EVERY witness lost it -> label dict.
+
+    `names` says what each side is ("asr" or "resp"), one per side, so the
+    buckets report only witnesses this track actually ran: a 1-witness track
+    would otherwise read `sides[-1]` and claim a pass it never generated.
     """
     agreed = sorted(set.intersection(*sides)) if sides else []
     kind = "answer" if not agreed else "repair" if len(agreed) == 1 else "repeat"
     lost = [pieces[i - 1] for i in agreed]
     if kind == "repair" and len(pieces) == 1:
+        # nothing survives to anchor a question on: the one piece IS the command
         kind = "repeat"
+
+    def bucket(letter, want):
+        # one count per witness of this kind, "" when the track has none
+        counts = [len(s) for n, s in zip(names, sides) if n == want]
+        return letter + ",".join(str(c) for c in counts) if counts else ""
 
     return {
         "kind": kind,
         "lost": lost,
-        "asr_bucket": f"a{len(sides[0])}",
-        "resp_bucket": f"r{len(sides[-1])}",
+        "asr_bucket": bucket("a", "asr"),
+        "resp_bucket": bucket("r", "resp"),
         "reason": (
             f"{len(pieces)} pieces | "
-            + " x ".join(str(sorted(s)) for s in sides)
+            + " x ".join(f"{n}{sorted(s)}" for n, s in zip(names, sides))
             + f" -> agreed {agreed}"
         ),
         "pieces": pieces,
@@ -625,20 +640,38 @@ def label_tree(sentence, transcript, response):
     return decide_kind(sentence, asr_lost, resp_lost)
 
 
-def label_sent(pieces, transcript, resp):
-    if not transcript or not resp:
+WITNESS_SYSTEM = {"asr": SENT_ASR_LOSS_SYSTEM, "resp": SENT_RESP_LOSS_SYSTEM}
+WITNESS_LINE = {"asr": "HEARD: {}", "resp": "REPLY: {}"}
+
+
+def label_sent_ids(pieces, witnesses: list[tuple[str, str]]):
+    """[(witness kind, text), ...] -> label dict | None.
+
+    One labeler call per witness, in parallel, all against the same key-piece
+    inventory. Every sent track is this function with a different witness list:
+    one transcript (sent-1-asr), one reply (sent-1-resp), both (sent-2), or the
+    K beam hypotheses (sent-4). A witness that came back empty, or a call that
+    never returned valid JSON, leaves nothing to intersect -- the probe is
+    dropped and probe_by_kinds redraws.
+    """
+    witnesses = [(n, t) for n, t in witnesses if t and t.strip()]
+    if not witnesses:
         return None
-    asr_ids = lost_pieces(
-        SENT_ASR_LOSS_SYSTEM, pieces, f"HEARD: {_normalize_text(transcript)}"
-    )
-    resp_ids = lost_pieces(
-        SENT_RESP_LOSS_SYSTEM, pieces, f"REPLY: {_normalize_text(resp)}"
-    )
-    if asr_ids is None or resp_ids is None:
+    with ThreadPoolExecutor(max_workers=len(witnesses)) as ex:
+        sides = list(
+            ex.map(
+                lambda w: lost_pieces(
+                    WITNESS_SYSTEM[w[0]],
+                    pieces,
+                    WITNESS_LINE[w[0]].format(_normalize_text(w[1])),
+                ),
+                witnesses,
+            )
+        )
+    if any(s is None for s in sides):
         # bad json
         return None
-
-    return decide_kind_ids(pieces, [asr_ids, resp_ids])
+    return decide_kind_ids(pieces, [n for n, _ in witnesses], sides)
 
 
 # ---
@@ -690,25 +723,6 @@ NON_PIECE_WORDS = (
         "would",
     }
 )
-
-
-def label_sent_beam(pieces, hyps):
-    hyps = [h for h in hyps if h and h.strip()]
-    if not hyps:
-        return None
-
-    with ThreadPoolExecutor(max_workers=len(hyps)) as ex:
-        sides = list(
-            ex.map(
-                lambda h: lost_pieces(
-                    SENT_ASR_LOSS_SYSTEM, pieces, f"HEARD: {_normalize_text(h)}"
-                ),
-                hyps,
-            )
-        )
-    if any(s is None for s in sides):
-        return None
-    return decide_kind_ids(pieces, sides)
 
 
 def label_beam(sentence, hyps):
@@ -928,7 +942,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
     results: dict[str, dict | None] = {k: None for k in kinds_need}
 
     pieces = None
-    if TRACK in ("sent-2", "sent-4"):
+    if TRACK in PIECE_TRACKS:
         pieces = key_pieces(sentence)
         if pieces is None:
             skip["pieces"] += 1
@@ -955,7 +969,33 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             # decoding it would be dead GPU time
             responses = ["" for _ in hyp_lists]
             with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
-                labels = list(ex.map(lambda h: label_sent_beam(pieces, h), hyp_lists))
+                labels = list(
+                    ex.map(
+                        lambda h: label_sent_ids(pieces, [("asr", x) for x in h]),
+                        hyp_lists,
+                    )
+                )
+        elif TRACK in ("sent-1-asr", "sent-1-resp"):
+            # one witness, so one decode: the other pass would be GPU time
+            # spent on a witness no labeler on this track reads
+            if TRACK == "sent-1-asr":
+                asr_sysp = (
+                    ASR_SYSTEM_PROMPT_QWEN2_5 if base_family == "qwen2.5" else None
+                )
+                convs = [_conv(p, asr_sysp, ASR_PROMPT_QWEN2_5) for p in paths]
+                transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
+                responses = ["" for _ in paths]
+                witnesses = [[("asr", t)] for t in transcripts]
+            else:
+                # the restate prompt, not the plain one: a reply is only a
+                # witness if it names back what it caught, which is the clause
+                # TASK_PROMPT_TREE adds
+                convs = [_conv(p, sysp, TASK_PROMPT_TREE) for p in paths]
+                responses = base_generate_batch(convs, PROBE_RESP_MAX_NEW_TOKENS)
+                transcripts = ["" for _ in paths]
+                witnesses = [[("resp", r)] for r in responses]
+            with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
+                labels = list(ex.map(lambda w: label_sent_ids(pieces, w), witnesses))
         elif TRACK == "heard-reply":
             convs = [_conv(p, sysp, task_prompt(True)) for p in paths]
             outs = base_generate_batch(
@@ -991,7 +1031,9 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             if TRACK == "two-pass":
                 label_one = classify
             elif TRACK == "sent-2":
-                label_one = lambda t, r: label_sent(pieces, t, r)
+                label_one = lambda t, r: label_sent_ids(
+                    pieces, [("asr", t), ("resp", r)]
+                )
             else:
                 label_one = lambda t, r: label_tree(sentence, t, r)
             with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
@@ -1201,7 +1243,7 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
                 "targets": {k: triplet[k]["target"] for k in KINDS},
             }
 
-        if TRACK in ("tree", "beam", "sent-2", "sent-4"):
+        if TRACK in TARGET_TRACKS:
             with ThreadPoolExecutor(max_workers=len(KINDS)) as ex:
                 targets = dict(
                     zip(
@@ -1319,7 +1361,7 @@ def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
         if TRACK == "heard-reply":
             return {"probe": probe, "target": probe["target"]}
 
-        if TRACK in ("tree", "beam", "sent-2", "sent-4"):
+        if TRACK in TARGET_TRACKS:
             target = write_target(sentence, "answer", probe)
             return {"probe": probe, "target": target} if target else {"skip": "targets"}
 
@@ -1413,11 +1455,11 @@ if __name__ == "__main__":
     #   two-pass (the no-flag default): its utterance-level target call still
     #     reads repair_probe["swapped"] and will KeyError there.
     #   --beam-label: still decodes K hypotheses, but is labeled by
-    #     label_sent_beam now, so label_beam / BEAM_LOSS_SYSTEM are unused and
+    #     label_sent_ids now, so label_beam / BEAM_LOSS_SYSTEM are unused and
     #     the beam_losses column comes out empty.
     # --heard-reply and --tree-label are unaffected.
     #
-    # All five write the one `label` field, so the YAML can say `label: sent-4`
+    # All seven write the one `label` field, so the YAML can say `label: sent-4`
     # and the drivers keep passing --sent-4. store_const, not store_true: the
     # override loop needs None when the flag is absent.
     track = ap.add_mutually_exclusive_group()
@@ -1460,6 +1502,28 @@ if __name__ == "__main__":
 
     track.add_argument(
         "--sent-4", dest="label", action="store_const", const="sent-4", default=None
+    )
+
+    track.add_argument(
+        "--sent-1-asr",
+        dest="label",
+        action="store_const",
+        const="sent-1-asr",
+        default=None,
+        help="One ASR pass per probe; label that transcript alone against the "
+        "key-piece inventory. Cheapest track: 64 decoded tokens and one "
+        "labeler call per probe audio, and no intersection to survive.",
+    )
+
+    track.add_argument(
+        "--sent-1-resp",
+        dest="label",
+        action="store_const",
+        const="sent-1-resp",
+        default=None,
+        help="One restating task-reply pass per probe; label that reply alone "
+        "against the same inventory. Same shape as --sent-1-asr with the other "
+        "witness, which is what makes the pair an ablation of witness kind.",
     )
 
     args = ap.parse_args()

@@ -172,6 +172,30 @@ def run_model(
         os.remove(wav_path)
 
 
+VLLM_HOST_FILE = "/gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt"
+
+
+def resolve_judge(base_url, judge_model):
+    """(base_url, model id) for the judge, resolving 'auto' off the host file.
+
+    'auto' is the default because the alternative was a hardcoded node name
+    that is wrong the moment the judge job lands elsewhere -- its slurm job
+    records where it landed in VLLM_HOST_FILE, and every bash driver was
+    reading that file and re-deriving this. The served name is asked of the
+    server rather than defaulted, since the box gets re-served with different
+    models and a stale name 404s on every row. Called before the omni model is
+    loaded, so an unreachable box fails in seconds.
+    """
+    if base_url in (None, "", "openai"):
+        return "openai", judge_model or "gpt-4o"
+    if base_url == "auto":
+        with open(VLLM_HOST_FILE) as f:
+            base_url = f"http://{f.read().strip()}:8000/v1"
+    served = OpenAI(base_url=base_url, api_key="EMPTY").models.list().data[0].id
+    print(f"judge: {judge_model or served} @ {base_url}")
+    return base_url, judge_model or served
+
+
 def make_judge(
     judge_model: str,
     base_url: str = "",
@@ -277,6 +301,12 @@ class Config:
     kinds: str = "answer,repair,repeat"
     num_rows: int = 150
     judge_mode: str = "type"
+    # names the result file. "" keeps the old judge-mode-derived default, which
+    # collides across tracks scored the same way -- set it per track.
+    tag: str = ""
+    # the heard-reply track's output contract, which is a property of the
+    # dataset (its targets are two-line) and so belongs in the file
+    heard_reply: bool = False
 
 
 def main():
@@ -299,12 +329,21 @@ def main():
     )
     ap.add_argument(
         "--judge-model",
-        help="from vllm --served-model-name; from openai, gpt-4o",
+        help="from vllm --served-model-name; from openai, gpt-4o. Left unset "
+        "on a vLLM judge, the served name is read off the server.",
     )
     ap.add_argument(
         "--judge-base-url",
-        default="http://g3085:8000/v1",
-        help="'http://g3085:8000/v1' for vllm, 'openai' to use openai",
+        default="auto",
+        help="'auto' reads the judge node out of VLLM_HOST_FILE, 'openai' uses "
+        "the OpenAI API, or give a URL like 'http://g3085:8000/v1'.",
+    )
+    ap.add_argument(
+        "--tag",
+        default=None,
+        help="Names the result file (results/bab_<model>_<tag>.jsonl). Set it "
+        "per track in the config -- the fallback is derived from the judge "
+        "mode, so two tracks scored the same way overwrite each other.",
     )
     ap.add_argument(
         "--judge-max-tokens",
@@ -383,6 +422,8 @@ def main():
             kinds=cfg.kinds,
             num_rows=cfg.num_rows,
             judge_mode=cfg.judge_mode,
+            tag=cfg.tag,
+            heard_reply=cfg.heard_reply,
         )
     args = ap.parse_args()
 
@@ -405,10 +446,10 @@ def main():
     unknown = [k for k in kinds if k not in JUDGE_BY_KIND]
     if unknown:
         raise SystemExit(f"--kinds: unknown kind(s) {unknown}")
-    tag = "hr" if args.heard_reply else "beam" if per_kind else "v2"
-    if kinds != ["answer", "repair", "repeat"]:
+    tag = args.tag or ("hr" if args.heard_reply else "beam" if per_kind else "v2")
+    if not args.tag and kinds != ["answer", "repair", "repeat"]:
         tag = "-".join(kinds)
-    out_path = args.out or f"results/bab_results_{model_name}_{tag}.jsonl"
+    out_path = args.out or f"results/bab_{model_name}_{tag}.jsonl"
     judge_system = (
         RESPONSE_TYPE_NORESTATE_SYSTEM
         if args.no_restate_judge
@@ -421,6 +462,10 @@ def main():
         f"scores: {'direct' if per_kind else args.score_matrix} | "
         f"kinds: {','.join(kinds)}"
     )
+
+    # before the dataset and the omni load: a dead judge box should cost
+    # seconds, not a model load
+    judge_url, judge_model = resolve_judge(args.judge_base_url, args.judge_model)
 
     ds = load_dataset(args.dataset, split=args.split)
 
@@ -452,8 +497,8 @@ def main():
 
     model, processor = load_model(args.model_path, family, args.adapter_path)
     judge_fn = make_judge(
-        args.judge_model,
-        base_url=args.judge_base_url,
+        judge_model,
+        base_url=judge_url,
         max_tokens=args.judge_max_tokens,
         per_kind=per_kind,
     )
@@ -639,7 +684,7 @@ def main():
                     "model": args.model_path,
                     "adapter": args.adapter_path,
                     "model_family": family,
-                    "judge_model": args.judge_model,
+                    "judge_model": judge_model,
                     "heard_reply": args.heard_reply,
                     "restate_prompt": not args.plain_prompt,
                     "judge_mode": args.judge_mode,

@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Three babble datasets: witness-count ablation</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5b5b5b; --rule: #ddd;
+    --code-bg: #f4f4f5; --accent: #8a3ffc; --bad: #c0392b; --ok: #1a7f37;
+    --warn: #b26a00; --card: #fafafa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#15161a; --fg:#e8e8ea; --muted:#a0a0a8; --rule:#33343a;
+      --code-bg:#1e1f25; --accent:#b794ff; --bad:#ff6b6b; --ok:#4fd07a;
+      --warn:#e0a33a; --card:#1b1c22; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 940px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem;
+  }
+  h1 { font-size: 1.7rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.8rem; border-bottom: 1px solid var(--rule); padding-bottom: .4rem; }
+  h3 { font-size: 1.02rem; margin-top: 1.6rem; color: var(--accent); }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .87em; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg); padding: .9rem 1rem; border-radius: 8px;
+    overflow-x: auto; line-height: 1.5; border: 1px solid var(--rule);
+  }
+  pre code { background: none; padding: 0; }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .9rem; }
+  th, td { border: 1px solid var(--rule); padding: .45rem .6rem; text-align: left; vertical-align: top; }
+  th { background: var(--code-bg); }
+  td.y { color: var(--ok); font-weight: 600; }
+  td.n { color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--rule); border-radius: 10px; padding: 1rem 1.2rem; margin: 1rem 0; }
+  .grid3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(255px, 1fr)); gap: .9rem; margin: 1rem 0; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: .9rem; margin: 1rem 0; }
+  .grid3 .card, .grid2 .card { margin: 0; }
+  .card h4 { margin: 0 0 .4rem; font-size: .98rem; }
+  .card h4 code { font-size: .95em; }
+  .step { display: flex; gap: .7rem; align-items: baseline; margin-top: 2.2rem; }
+  .step-badge {
+    display: inline-block; background: var(--accent); color: #fff;
+    border-radius: 999px; min-width: 1.7em; height: 1.7em; line-height: 1.7em;
+    text-align: center; font-weight: 600; font-size: .8em; padding: 0 .4em; flex: none;
+  }
+  .step h2 { margin: 0; border: 0; padding: 0; }
+  .risk { border-left: 3px solid var(--bad); padding-left: .9rem; margin: .9rem 0; }
+  .note { border-left: 3px solid var(--warn); padding-left: .9rem; margin: .9rem 0; }
+  .ok-note { border-left: 3px solid var(--ok); padding-left: .9rem; margin: .9rem 0; }
+  .muted { color: var(--muted); }
+  .tag { display: inline-block; font-size: .72rem; letter-spacing: .04em; text-transform: uppercase;
+         border: 1px solid var(--rule); border-radius: 999px; padding: .05rem .5rem; color: var(--muted); }
+  ul { padding-left: 1.25rem; }
+  li { margin: .3rem 0; }
+  details { border: 1px solid var(--rule); border-radius: 8px; padding: .6rem .9rem; margin: .9rem 0; background: var(--card); }
+  summary { cursor: pointer; font-weight: 600; font-size: .95rem; }
+  details[open] summary { margin-bottom: .6rem; }
+  svg text { font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; fill: var(--fg); }
+  footer { margin-top: 3.5rem; color: var(--muted); font-size: .85rem; border-top: 1px solid var(--rule); padding-top: 1rem; }
+</style>
+</head>
+<body>
+
+<h1>Three babble datasets, one witness-count ablation</h1>
+<p class="subtitle">Two new single-witness tracks (<code>sent-1-asr</code>, <code>sent-1-resp</code>) plus a faithful rebuild of the <code>heard-reply</code> dataset on the current vLLM judge &mdash; each fully described by its own YAML and launched by one flat <code>.slurm</code> file that runs the same way locally (<code>./exp/x.slurm</code>) and queued (<code>sbatch exp/x.slurm</code>).</p>
+
+<div class="card">
+<strong>The experiment this buys.</strong> <code>sent-2</code> and <code>sent-4</code> intersect the loss lists of 2 and 4 witnesses over one shared key-piece inventory. Adding two 1-witness builds off the same inventory turns witness count into a clean ablation ladder &mdash; <strong>1&nbsp;ASR &middot; 1&nbsp;reply &middot; 2 &middot; 4</strong> &mdash; and separates <em>how many</em> witnesses from <em>which kind</em> of witness, because the two 1-witness builds differ only in that.
+</div>
+
+<h2>Decisions taken</h2>
+<ul>
+  <li><strong>Label route: key-piece ids.</strong> All three feed <code>key_pieces()</code> &rarr; <code>lost_pieces()</code> &rarr; <code>decide_kind_ids()</code>. No new labeling prompts for the single-witness tracks &mdash; <code>SENT_ASR_LOSS_SYSTEM</code> and <code>SENT_RESP_LOSS_SYSTEM</code> already take exactly one witness line each.</li>
+  <li><strong><code>heard-reply</code> is a re-creation, not a redesign.</strong> Same <code>LABEL_TARGET_SYSTEM</code>, same one-call label+target, same disjoint bands. Only the serving model behind <code>VLLM_HOST_FILE</code> is new, so any delta is attributable to the judge and not to a prompt edit.</li>
+  <li><strong>One YAML per dataset</strong>, spanning build &rarr; SFT &rarr; eval, in the shape <a href="../configs/ft-asr.yaml"><code>configs/ft-asr.yaml</code></a> already established.</li>
+  <li><strong>CLI flags survive.</strong> YAML sets <code>label:</code>; <code>--sent-2</code> &amp; co. still override it. Nothing existing has to be migrated in the same pass.</li>
+  <li><strong>Drivers stay bash, but hold no logic.</strong> One flat <code>exp/&lt;track&gt;.slurm</code> per track: a conda activate and four <code>python x.py --config y.yaml</code> lines. Executable, so <code>./exp/x.slurm</code> runs it here and <code>sbatch exp/x.slurm</code> queues the same file. No <code>STAGES</code>, no <code>case</code>, no env-var defaults &mdash; every value is in the YAML, and the logic those env vars carried moves into the Python (step&nbsp;7).</li>
+  <li><strong>No <code>python -m</code>.</strong> See <a href="#dash-m">the last section</a>.</li>
+</ul>
+
+<h2>The three datasets, side by side</h2>
+
+<div class="scroll">
+<table>
+<thead>
+<tr><th></th><th><code>sent-1-asr</code> <span class="tag">new</span></th><th><code>sent-1-resp</code> <span class="tag">new</span></th><th><code>heard-reply</code> <span class="tag">rebuild</span></th></tr>
+</thead>
+<tbody>
+<tr><th>Witness</th><td>base-model ASR transcript</td><td>base-model task reply</td><td>the <code>Heard:</code> line of one reply</td></tr>
+<tr><th>Probe prompt</th><td><code>ASR_PROMPT_QWEN2_5</code></td><td><code>TASK_PROMPT_TREE</code> (restate)</td><td><code>TASK_PROMPT_HR</code> + <code>HEARD_PREFILL</code></td></tr>
+<tr><th>Decodes / probe audio</th><td>1 &times; 64 tok</td><td>1 &times; 128 tok</td><td>1 &times; 256 tok</td></tr>
+<tr><th>Key-piece inventory</th><td class="y">yes, 1 call/utterance</td><td class="y">yes, 1 call/utterance</td><td class="n">no</td></tr>
+<tr><th>Labeler</th><td><code>SENT_ASR_LOSS_SYSTEM</code>, 1 call</td><td><code>SENT_RESP_LOSS_SYSTEM</code>, 1 call</td><td><code>LABEL_TARGET_SYSTEM</code>, 1 call</td></tr>
+<tr><th>Kind rule</th><td colspan="2" style="text-align:center">|lost ids| &rarr; 0&nbsp;answer / 1&nbsp;repair / &ge;2&nbsp;repeat, no intersection to survive</td><td>|lost pieces| from the <code>Heard</code> diff, same 0/1/&ge;2</td></tr>
+<tr><th>Target</th><td colspan="2" style="text-align:center"><code>write_target()</code>, separate call, temp 0.7</td><td>inline in the label call; row target is <code>Heard: &hellip;\nReply: &hellip;</code></td></tr>
+<tr><th>SNR bands</th><td colspan="3" style="text-align:center"><code>SLOT_SNR_DISJOINT</code> + <code>CLEAN_ANSWER_PROB</code> (all three are non-<code>two-pass</code>)</td></tr>
+<tr><th>SFT prompt</th><td colspan="2" style="text-align:center">restate (<code>get_prompts("repair")</code>, today's default)</td><td class="bad"><code>TASK_PROMPT_HR</code> &mdash; <strong>not currently trainable</strong>, see step&nbsp;6</td></tr>
+<tr><th>Eval</th><td colspan="2" style="text-align:center"><code>--judge-mode per-kind</code></td><td><code>--heard-reply --fewshot-judge</code></td></tr>
+<tr><th>Empty row columns</th><td><code>omni_response</code></td><td><code>asr_transcript</code></td><td><code>key_pieces</code>, buckets</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>Where each witness comes from</h3>
+<div class="scroll">
+<svg viewBox="0 0 900 250" width="100%" height="250" role="img" aria-label="Probe audio feeds one of three witness paths, each ending in a label">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+    </marker>
+  </defs>
+  <g color="var(--muted)" stroke="currentColor" fill="none" stroke-width="1.4">
+    <rect x="8" y="100" width="120" height="48" rx="8" stroke="var(--accent)"/>
+    <rect x="215" y="20"  width="185" height="44" rx="8"/>
+    <rect x="215" y="100" width="185" height="44" rx="8"/>
+    <rect x="215" y="180" width="185" height="44" rx="8"/>
+    <rect x="490" y="20"  width="170" height="44" rx="8"/>
+    <rect x="490" y="100" width="170" height="44" rx="8"/>
+    <rect x="490" y="180" width="170" height="44" rx="8"/>
+    <rect x="740" y="60"  width="150" height="48" rx="8" stroke="var(--ok)"/>
+    <rect x="740" y="170" width="150" height="48" rx="8" stroke="var(--ok)"/>
+    <path d="M128,124 C170,124 175,42 213,42"   marker-end="url(#a)"/>
+    <path d="M128,124 L213,122"                  marker-end="url(#a)"/>
+    <path d="M128,124 C170,124 175,202 213,202" marker-end="url(#a)"/>
+    <path d="M400,42 L488,42"   marker-end="url(#a)"/>
+    <path d="M400,122 L488,122" marker-end="url(#a)"/>
+    <path d="M400,202 L488,202" marker-end="url(#a)"/>
+    <path d="M660,42 C700,42 700,78 738,80"    marker-end="url(#a)"/>
+    <path d="M660,122 C700,122 700,90 738,88"  marker-end="url(#a)"/>
+    <path d="M660,202 L738,196"                marker-end="url(#a)"/>
+  </g>
+  <text x="20" y="120">probe wav</text><text x="20" y="138" fill="var(--muted)">(SNR draw)</text>
+  <text x="228" y="40">ASR pass, 64 tok</text><text x="228" y="56" fill="var(--muted)">sent-1-asr</text>
+  <text x="228" y="120">reply pass, 128 tok</text><text x="228" y="136" fill="var(--muted)">sent-1-resp</text>
+  <text x="228" y="200">HR pass, 256 tok</text><text x="228" y="216" fill="var(--muted)">heard-reply</text>
+  <text x="500" y="40">HEARD: &lt;transcript&gt;</text><text x="500" y="56" fill="var(--muted)">1 witness line</text>
+  <text x="500" y="120">REPLY: &lt;response&gt;</text><text x="500" y="136" fill="var(--muted)">1 witness line</text>
+  <text x="500" y="200">Heard: / Reply:</text><text x="500" y="216" fill="var(--muted)">split_heard_reply</text>
+  <text x="752" y="80">lost_pieces()</text><text x="752" y="98" fill="var(--muted)">&rarr; decide_kind_ids</text>
+  <text x="752" y="190">LABEL_TARGET</text><text x="752" y="208" fill="var(--muted)">&rarr; kind + reply</text>
+</svg>
+</div>
+
+<h2>How much of this already exists</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>Piece</th><th>State</th><th>Work</th></tr></thead>
+<tbody>
+<tr><td>YAML config in <code>babble_data.py</code></td><td class="y">exists</td><td><code>--config</code> + <code>util.load_config(path, Config)</code> already there. Only <em>write</em> the files.</td></tr>
+<tr><td>Single-witness kind decision</td><td class="y">exists</td><td><code>decide_kind_ids(pieces, sides)</code> is already n-ary; <code>set.intersection(*[s])</code> is <code>s</code>.</td></tr>
+<tr><td>Single-witness labelers</td><td class="y">exists</td><td><code>SENT_ASR_LOSS_SYSTEM</code> / <code>SENT_RESP_LOSS_SYSTEM</code> each read one witness line.</td></tr>
+<tr><td><code>heard-reply</code> build path</td><td class="y">exists</td><td><code>label_target</code>, <code>TASK_PROMPT_HR</code>, prefill, parser, target composition in <code>make_row</code>. Unchanged.</td></tr>
+<tr><td><code>heard-reply</code> eval path</td><td class="y">exists</td><td><code>babble_eval_qwen.py --heard-reply --fewshot-judge</code>.</td></tr>
+<tr><td>Probe dispatch for 1 witness</td><td class="bad">missing</td><td>Step&nbsp;2 &mdash; the <code>else</code> branch always decodes <em>both</em> ASR and reply.</td></tr>
+<tr><td>Per-witness buckets</td><td class="bad">wrong</td><td>Step&nbsp;3 &mdash; <code>decide_kind_ids</code> writes <code>resp_bucket</code> from <code>sides[-1]</code>, so a 1-ASR row reports a reply bucket it never had.</td></tr>
+<tr><td><code>heard-reply</code> SFT</td><td class="bad">removed</td><td>Step&nbsp;6 &mdash; <code>sft.sh</code> hard-fails HR; <code>get_prompts</code> has no HR branch.</td></tr>
+<tr><td>Driver</td><td class="n">bash</td><td>Step&nbsp;7 &mdash; 5 <code>.sh</code> + 4 <code>.slurm</code> + 15 <code>exp/*.sh</code>, all env-var dispatch.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="note">
+<strong>One decision left, and it is the cheap one to get wrong.</strong> For a witness-count ablation the three builds should ideally cover the <em>same sentences</em>. Today each build streams SLURP in the same deterministic order and skips only what it fails on, so overlap will be high but not identical &mdash; and the kinds diverge on purpose. Options: <em>(a)</em> accept the natural overlap and report it (zero work); <em>(b)</em> add <code>utt_ds_id:</code> to the config, which seeds an <em>allow</em>-list of <code>slurp_id</code>s from an already-built dataset so every later build uses that same sentence set (about 15 lines in <code>candidates()</code>, and it makes build order matter: build <code>sent-1-asr</code> first, then point the other two at it). I'd take <em>(b)</em> only if the paper compares tracks per sentence; otherwise <em>(a)</em>.
+</div>
+
+<div class="step"><span class="step-badge">1</span><h2>Name the track sets instead of listing tracks inline</h2></div>
+<p><code>TRACK in (...)</code> is spelled at five sites and each new label has to be added to three of them. Replace with two frozensets next to the <code>TRACK</code> global, so adding a track is one edit:</p>
+<pre><code># tracks whose label reads key-piece ids off one shared inventory
+PIECE_TRACKS = frozenset({"sent-1-asr", "sent-1-resp", "sent-2", "sent-4"})
+# tracks whose SFT target is written by a second, separate call at temp 0.7
+# (--heard-reply writes it inline with the label; two-pass writes one call per
+# utterance). Everything with an inventory is also in here today, plus tree.
+TARGET_TRACKS = PIECE_TRACKS | {"tree", "beam"}</code></pre>
+<p>Then: <code>probe_by_kinds</code>'s inventory gate becomes <code>if TRACK in PIECE_TRACKS</code>, and the two <code>if TRACK in ("tree", "beam", "sent-2", "sent-4")</code> branches in <code>build_triplets</code> / <code>build_answer_rows</code> become <code>if TRACK in TARGET_TRACKS</code>.</p>
+
+<div class="step"><span class="step-badge">2</span><h2><code>probe_by_kinds</code>: a one-witness probe pass</h2></div>
+<p>The current dispatch has three arms &mdash; beam, heard-reply, and an <code>else</code> that always decodes ASR <em>and</em> reply. Add one arm covering both new tracks; which pass runs is the only thing that differs between them.</p>
+<pre><code>elif TRACK in ("sent-1-asr", "sent-1-resp"):
+    # one witness, so one decode: the other pass would be pure GPU time for
+    # a witness no labeler on this track reads.
+    if TRACK == "sent-1-asr":
+        asr_sysp = ASR_SYSTEM_PROMPT_QWEN2_5 if base_family == "qwen2.5" else None
+        convs = [_conv(p, asr_sysp, ASR_PROMPT_QWEN2_5) for p in paths]
+        transcripts = base_generate_batch(convs, ASR_MAX_NEW_TOKENS)
+        responses = ["" for _ in paths]
+        witnesses = [[("asr", t)] for t in transcripts]
+    else:
+        convs = [_conv(p, sysp, TASK_PROMPT_TREE) for p in paths]
+        responses = base_generate_batch(convs, PROBE_RESP_MAX_NEW_TOKENS)
+        transcripts = ["" for _ in paths]
+        witnesses = [[("resp", r)] for r in responses]
+    with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
+        labels = list(ex.map(lambda w: label_sent_ids(pieces, w), witnesses))</code></pre>
+<div class="ok-note"><strong>Why <code>TASK_PROMPT_TREE</code> for the reply witness.</strong> A reply is only a usable witness if it names back what it caught &mdash; that is precisely the clause the restate prompt adds, and it is what <code>sent-2</code>'s reply pass already runs under. The plain <code>TASK_PROMPT</code> would give "Sure, I'll take care of that", which proves nothing about any piece and would make <code>sent-1-resp</code> a measurement of nothing.</div>
+
+<div class="step"><span class="step-badge">3</span><h2>Collapse the four sent labelers into one, and fix the buckets</h2></div>
+<p><code>label_sent</code> (2 witnesses), <code>label_sent_beam</code> (K hypotheses) and the two new ones are the same function with different witness lists. One named-witness version replaces all of them:</p>
+<pre><code>WITNESS_SYSTEM = {"asr": SENT_ASR_LOSS_SYSTEM, "resp": SENT_RESP_LOSS_SYSTEM}
+WITNESS_LINE = {"asr": "HEARD: {}", "resp": "REPLY: {}"}
+
+
+def label_sent_ids(pieces, witnesses):
+    """[(kind, text), ...] -> label dict | None. One call per witness, in
+    parallel; a witness that came back empty, or a call that never returned
+    valid JSON, leaves nothing to intersect, so the probe is dropped and
+    probe_by_kinds redraws.
+    """
+    witnesses = [(k, t) for k, t in witnesses if t and t.strip()]
+    if not witnesses:
+        return None
+    with ThreadPoolExecutor(max_workers=len(witnesses)) as ex:
+        sides = list(ex.map(
+            lambda w: lost_pieces(
+                WITNESS_SYSTEM[w[0]], pieces,
+                WITNESS_LINE[w[0]].format(_normalize_text(w[1])),
+            ),
+            witnesses,
+        ))
+    if any(s is None for s in sides):
+        return None
+    return decide_kind_ids(pieces, [w[0] for w in witnesses], sides)</code></pre>
+<p>and <code>decide_kind_ids</code> takes the names so each bucket reports only witnesses that exist:</p>
+<pre><code>def decide_kind_ids(pieces, names, sides):
+    agreed = sorted(set.intersection(*sides)) if sides else []
+    kind = "answer" if not agreed else "repair" if len(agreed) == 1 else "repeat"
+    if kind == "repair" and len(pieces) == 1:
+        # nothing left to anchor a question on: the one piece IS the command
+        kind = "repeat"
+
+    def bucket(letter, want):
+        # one digit per witness of this kind; "" when the track has none, so a
+        # 1-witness row can't report a pass it never ran
+        counts = [len(s) for n, s in zip(names, sides) if n == want]
+        return letter + ",".join(str(c) for c in counts) if counts else ""
+
+    return {
+        "kind": kind,
+        "lost": [pieces[i - 1] for i in agreed],
+        "asr_bucket": bucket("a", "asr"),
+        "resp_bucket": bucket("r", "resp"),
+        "reason": (f"{len(pieces)} pieces | "
+                   + " x ".join(f"{n}{sorted(s)}" for n, s in zip(names, sides))
+                   + f" -> agreed {agreed}"),
+        "pieces": pieces,
+    }</code></pre>
+<p>Call sites: <code>sent-2</code> passes <code>[("asr", t), ("resp", r)]</code>; <code>sent-4</code> passes <code>[("asr", h) for h in hyps]</code>. <code>label_sent</code> and <code>label_sent_beam</code> both disappear (each had one caller &mdash; per CLAUDE.md they were module-level helpers advertising reuse that didn't exist; the reuse is now real and lives in one place).</p>
+<div class="risk"><strong>Behavior change to expect on <code>sent-4</code>.</strong> Its <code>asr_bucket</code> goes from <code>a2</code> (the first hypothesis's count) to <code>a2,1,0,1</code> (all four). <code>results/viz.ipynb</code> and any bucket grouping over old rows must treat the column as a string, not an int &mdash; check before rebuilding anything that reads it.</div>
+
+<div class="step"><span class="step-badge">4</span><h2>Register the two labels</h2></div>
+<p>Two <code>store_const</code> flags alongside the existing five, so the drivers and the YAML both keep working:</p>
+<pre><code>track.add_argument("--sent-1-asr", dest="label", action="store_const",
+                   const="sent-1-asr", default=None,
+                   help="One ASR pass per probe; label the transcript alone "
+                        "against the key-piece inventory. Cheapest track: 64 "
+                        "decoded tokens and one labeler call per probe audio.")
+track.add_argument("--sent-1-resp", dest="label", action="store_const",
+                   const="sent-1-resp", default=None,
+                   help="One restating task-reply pass per probe; label the "
+                        "reply alone against the same inventory.")</code></pre>
+<p>Nothing else in <code>__main__</code> changes: both fall through to <code>SLOT_SNR_DISJOINT</code>, and the <code>--asr-adapter</code> guard correctly refuses them (<code>sent-1-resp</code> can't use an ASR-only adapter; <code>sent-1-asr</code> could in principle, but that crossing is the <code>sent-4</code>&nbsp;ft-asr track's job &mdash; leave it out until asked).</p>
+
+<div class="step"><span class="step-badge">5</span><h2>The three YAMLs</h2></div>
+<p>Each file spans build &rarr; SFT &rarr; eval for one track, the shape <code>configs/ft-asr.yaml</code> already uses. Row counts match <code>sent-4</code>'s so the ladder is comparable: 1000 train triplets + 1000 extra answers, 100 test triplets (a 300-row test split, judged whole).</p>
+
+<div class="grid3">
+<div class="card">
+<h4><code>configs/sent-1-asr.yaml</code></h4>
+<pre><code>label: sent-1-asr
+omni_path: Qwen/Qwen2.5-Omni-3B
+ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent1asr-v1
+n_train: 1000
+n_test: 100
+n_extra_ans: 1000
+
+repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent1asr-v1
+repair_repo_name: Qwen2.5-Omni-3B-bab-sent1asr-sft
+repair_epochs: 3
+repair_lr: 2.0e-4
+
+judge_mode: per-kind
+kinds: answer,repair,repeat
+num_rows: -1
+tag: sent1asr</code></pre>
+</div>
+<div class="card">
+<h4><code>configs/sent-1-resp.yaml</code></h4>
+<pre><code>label: sent-1-resp
+omni_path: Qwen/Qwen2.5-Omni-3B
+ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent1resp-v1
+n_train: 1000
+n_test: 100
+n_extra_ans: 1000
+
+repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent1resp-v1
+repair_repo_name: Qwen2.5-Omni-3B-bab-sent1resp-sft
+repair_epochs: 3
+repair_lr: 2.0e-4
+
+judge_mode: per-kind
+kinds: answer,repair,repeat
+num_rows: -1
+tag: sent1resp</code></pre>
+</div>
+<div class="card">
+<h4><code>configs/heard-reply.yaml</code></h4>
+<pre><code>label: heard-reply
+omni_path: Qwen/Qwen2.5-Omni-3B
+ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-hr-v2
+n_train: 1000
+n_test: 100
+n_extra_ans: 1000
+
+task: hr            # step 6
+repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-hr-v2
+repair_repo_name: Qwen2.5-Omni-3B-bab-hr2-sft
+repair_epochs: 3
+repair_lr: 2.0e-4
+
+heard_reply: true   # eval prompt + parser
+fewshot_judge: true
+kinds: answer,repair,repeat
+num_rows: -1
+tag: hr-v2</code></pre>
+</div>
+</div>
+
+<p><strong>Two YAML traps this repo has already paid for</strong>, both worth re-reading before writing the files:</p>
+<ul>
+  <li>PyYAML silently keeps the <em>last</em> of two identical keys in one file. That is why <code>ft-asr.yaml</code> prefixes <code>asr_n_train</code> &mdash; a plain second <code>n_train</code> would have overwritten the first with no warning.</li>
+  <li><code>load_config</code> drops any key the stage's <code>Config</code> doesn't declare, without a word. A typo leaves the field at its dataclass default, and the only place you see it is the <code>log(f"config: {cfg}")</code> line each script prints on start. Read that line on every first run.</li>
+</ul>
+<p>So <code>heard_reply</code> / <code>fewshot_judge</code> / <code>tag</code> must be added to <code>babble_eval_qwen.py</code>'s <code>Config</code> dataclass, or the eval will run under the wrong prompt while looking like it read the file. Check each of the three configs against the three <code>Config</code> dataclasses once, by hand.</p>
+
+<div class="step"><span class="step-badge">6</span><h2>Make <code>heard-reply</code> trainable again <span class="tag">blocker</span></h2></div>
+<p>The build and the eval paths for HR are intact; the <em>SFT</em> path was removed. <code>sft_qwen.py</code> gets its prompts from <code>get_prompts(task, family)</code>, which knows only <code>"asr"</code> and <code>"repair"</code>, and <code>sft.sh</code> hard-exits on <code>HR=1</code> saying exactly this. Without it, dataset&nbsp;3 can be built and can be evaluated on the base model, but no adapter can be trained on it &mdash; which is most of the point.</p>
+<p>Two small edits. In <code>prompts.get_prompts</code>:</p>
+<pre><code>    if task == "hr":
+        # same weights and dataset keys as "repair"; the two-line output
+        # contract is the only difference, and it has to match the prompt the
+        # rows were probed under or SFT trains against its own targets
+        sysp = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
+        return sysp, task_prompt(heard_reply=True)</code></pre>
+<p>and in <code>sft_qwen.py</code>, wherever <code>task == "repair"</code> selects the <code>repair_*</code> config keys, accept both: <code>repair = cfg.task in ("repair", "hr")</code>. The adapter suffix should stay distinguishable (<code>hr-sft</code> vs <code>bab-sft</code>) so an HR adapter can't overwrite a restate one.</p>
+<div class="risk"><strong>Verify before spending the training job:</strong> the row <code>target</code> for HR rows is <code>"Heard: &hellip;\nReply: &hellip;"</code> (composed in <code>make_row</code>). Confirm <code>OmniSFTCollator</code>'s label mask covers <em>both</em> lines &mdash; the diff-the-two-renderings trick is length-based and a target containing a newline is the case most likely to be off by a token. One <code>--smoke</code> batch prints the supervised tokens; read them.</div>
+
+<div class="step"><span class="step-badge">7</span><h2>Make the scripts self-sufficient, so the driver has nothing to compute</h2></div>
+<p>A driver can only be a flat list of <code>python x.py --config y.yaml</code> lines if nothing it would otherwise have to compute is left in bash. Two things are, today &mdash; both in <code>babble_eval_qwen.py</code>, and both are the reason <code>eval.sh</code> and <code>exp/ft-asr-run.sh</code> have any logic at all.</p>
+
+<h3>7a. <code>--tag</code>, and a shorter filename <span class="tag">required</span></h3>
+<p>The result path is <code>args.out or f"results/bab_results_{model_name}_{tag}.jsonl"</code>, where <code>tag</code> is <em>derived from the judge mode</em>: <code>"hr" / "beam" / "v2"</code>. So every per-kind run of every track wants to write the same file, and the bash has been papering over it by computing <code>--out</code> itself:</p>
+<pre><code># eval.sh
+--out "${OUT_DIR}/bab_results_${name}_${TAG}.jsonl"
+# exp/ft-asr-run.sh
+--out "results/bab_results_${name}_${tag}.jsonl"</code></pre>
+<div class="risk">Without this, all three new tracks' base-model runs collide on one filename &mdash; <code>results/bab_results_Qwen2.5-Omni-3B_beam.jsonl</code> &mdash; and the third overwrites the first two. <strong>And <code>configs/ft-asr.yaml</code> already has a <code>tag: sent4-ftasr</code> key that is silently dropped</strong>, because <code>babble_eval_qwen.py</code>'s <code>Config</code> never declared <code>tag</code> and <code>load_config</code> discards unknown keys without a word. That file only got its right filename because the bash passed <code>--out</code>. This is the silent-key-drop trap from step&nbsp;5, live in the repo right now.</div>
+<p>Fix: declare it in the dataclass, add the flag, map it like the others &mdash; and drop the redundant <code>_results</code> while the line is being touched. Everything under <code>results/</code> is a result; the prefix only has to say which track wrote it.</p>
+<pre><code>@dataclass
+class Config:
+    ...
+    tag: str = ""        # names the result file; "" keeps the judge-mode default
+
+ap.add_argument("--tag", default=None,
+                help="Names the result file (results/bab_<model>_<tag>.jsonl)."
+                     " Set it per track in the config -- the old "
+                     "default is derived from the judge mode, so two tracks "
+                     "scored the same way overwrite each other.")
+...
+ap.set_defaults(..., tag=cfg.tag)
+...
+tag = args.tag or ("hr" if args.heard_reply else "beam" if per_kind else "v2")
+# results/bab_&lt;model&gt;_&lt;tag&gt;.jsonl -- was bab_results_&lt;model&gt;_&lt;tag&gt;.jsonl
+out_path = args.out or f"results/bab_{model_name}_{tag}.jsonl"</code></pre>
+<p><code>--out</code> stays, for the one-off. But no driver needs it any more.</p>
+<div class="note"><strong>The 30 files already in <code>results/</code> keep their <code>bab_results_</code> names</strong> &mdash; do not rename them. <code>results/viz.ipynb</code> names those files literally (only the mask track globs), so a bulk rename edits the notebook for no gain, and the old names then no longer match what the commit that produced them says. New runs write the short name; the notebook gets the short names as they are added. <code>mask_results_*</code> and <code>asr_*</code> are untouched &mdash; this is one line in one script, not a naming convention rollout.</div>
+
+<h3>7b. <code>--judge-base-url auto</code>, so no driver reads the host file</h3>
+<p>The default is a hardcoded node (<code>http://g3085:8000/v1</code>) that is wrong the moment the judge job lands elsewhere, so all three bash drivers <code>cat</code> the host file, <code>curl</code> <code>/models</code> to check it is up, and (in <code>ft-asr-run.sh</code>) parse the served model id out of the response &mdash; because a stale <code>--judge-model</code> is a 404 on every row. <code>babble_data.py</code> already does all of this in Python, in <code>gpt_json</code>. Move the same thing into the eval script:</p>
+<pre><code>VLLM_HOST_FILE = "/gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt"
+
+
+def resolve_judge(base_url, judge_model):
+    """(base_url, model id) for the judge, resolving 'auto' off the host file.
+
+    'auto' is the default because the alternative was a hardcoded node name:
+    the judge's slurm job records where it landed in VLLM_HOST_FILE, and every
+    bash driver was reading that file and re-deriving this. The served name is
+    asked of the server rather than defaulted, since the box gets re-served
+    with different models and a stale name 404s on every row.
+    """
+    if base_url == "openai":
+        return None, judge_model or "gpt-4o"
+    if base_url == "auto":
+        base_url = f"http://{open(VLLM_HOST_FILE).read().strip()}:8000/v1"
+    served = OpenAI(base_url=base_url, api_key="EMPTY").models.list().data[0].id
+    print(f"judge: {judge_model or served} @ {base_url}")
+    return base_url, judge_model or served</code></pre>
+<p>Called once in <code>main</code>, before any model is loaded, so an unreachable box fails in seconds instead of after the omni load &mdash; which is the fail-fast the <code>curl</code> precheck existed to provide. Change the flag's default from <code>http://g3085:8000/v1</code> to <code>auto</code>, and <code>--judge-model</code>'s to <code>None</code>.</p>
+<div class="note">Same treatment is worth applying to <code>asr_eval_qwen.py</code> if it grows a judge, and to any new script &mdash; but do not touch <code>babble_data.py</code>'s <code>gpt_json</code>: it already resolves the host itself and its lazy-on-first-call connection is what makes the classifier threads share one client.</div>
+
+<div class="step"><span class="step-badge">8</span><h2>The drivers: three flat <code>.slurm</code> files</h2></div>
+<p>One file per track. Executable with a <code>#!/bin/bash</code> shebang, so the <em>same file</em> is both ways to run it &mdash; the <code>#SBATCH</code> lines are comments to bash and directives to Slurm:</p>
+<pre><code>./exp/bab-sent1asr.slurm          # run it here, in a shell you hold
+sbatch exp/bab-sent1asr.slurm     # queue the identical file</code></pre>
+<p>Body is a conda activate and four <code>python</code> lines. To skip the build, comment out its line; to rerun one step, copy that line to the shell. No <code>STAGES</code>, no <code>case</code>, no <code>for</code>, no env-var defaults &mdash; every value lives in the YAML or is spelled on the line.</p>
+
+<pre><code>#!/bin/bash
+
+#SBATCH --job-name=bab_sent1asr
+#SBATCH --account=sciencehub
+#SBATCH --partition=gpu-a40
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=188G
+#SBATCH --gpus=1
+#SBATCH --time=1-00:00:00
+#SBATCH --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt
+#SBATCH --output=logs/bab_sent1asr_%j.log
+#SBATCH --export=all
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=zanqil@uw.edu
+
+# exp/bab-sent1asr.slurm -- the sent-1-asr track end to end (steps/bab-ds.html).
+# Everything that varies is in configs/sent-1-asr.yaml. To skip a stage,
+# comment out its line; to redo one, paste it into a shell after the activate.
+#
+#   ./exp/bab-sent1asr.slurm        # here
+#   sbatch exp/bab-sent1asr.slurm   # queued, same file
+
+source ~/.bashrc
+set -eo pipefail
+conda activate qwen25omni
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+mkdir -p results logs
+
+CFG=configs/sent-1-asr.yaml
+ADAPTER=checkpoints/Qwen2.5-Omni-3B-bab-sent1asr-sft
+
+python -u babble_data.py     --config $CFG
+python -u sft_qwen.py        --config $CFG
+python -u babble_eval_qwen.py --config $CFG
+python -u babble_eval_qwen.py --config $CFG --adapter-path $ADAPTER</code></pre>
+
+<div class="grid2">
+<div class="card">
+<h4>Why <code>./x.slurm</code> and not <code>. x.slurm</code></h4>
+<p style="margin-bottom:0">Sourcing runs the file in your interactive shell, where <code>set -eo pipefail</code> exits <em>your terminal</em> on the first failure &mdash; and dropping <code>set -e</code> to make sourcing safe means a failed build is followed by an SFT on a dataset that does not exist. Executed, it gets its own subshell and the same file is what <code>sbatch</code> takes. The <code>.slurm</code> extension is just a name; the shebang is what makes it runnable.</p>
+</div>
+<div class="card">
+<h4>The one duplicated value</h4>
+<p style="margin-bottom:0"><code>ADAPTER</code> restates <code>repair_repo_name</code> from the YAML, because <code>--adapter-path</code> is deliberately <em>not</em> a config key (<code>babble_eval_qwen.py</code>'s <code>Config</code> says so: which model a row evaluates is a driver decision, not a track property). Two lines, visible next to each other. The alternative &mdash; teaching the eval script to derive it &mdash; buys one less line and loses the ability to score any adapter against any track.</p>
+</div>
+</div>
+
+<p>The other two files are the same file with three substitutions:</p>
+<div class="scroll">
+<table>
+<thead><tr><th>File</th><th><code>CFG</code></th><th><code>ADAPTER</code></th><th>Differs how</th></tr></thead>
+<tbody>
+<tr><td><code>exp/bab-sent1asr.slurm</code></td><td><code>configs/sent-1-asr.yaml</code></td><td><code>&hellip;-bab-sent1asr-sft</code></td><td>&mdash;</td></tr>
+<tr><td><code>exp/bab-sent1resp.slurm</code></td><td><code>configs/sent-1-resp.yaml</code></td><td><code>&hellip;-bab-sent1resp-sft</code></td><td>nothing else</td></tr>
+<tr><td><code>exp/bab-hr.slurm</code></td><td><code>configs/heard-reply.yaml</code></td><td><code>&hellip;-bab-hr2-sft</code></td><td><code>sft_qwen.py --task hr</code> (step&nbsp;6); the two eval lines take <code>--heard-reply --fewshot-judge</code> from the config</td></tr>
+</tbody>
+</table>
+</div>
+<p>Three near-identical files instead of one parameterized one is the deliberate trade: the duplication is 6 lines and it is <em>visible</em>, where the parameterized version was 5 files of env-var indirection you had to run to understand.</p>
+
+<div class="ok-note">
+<strong>What this replaces, and when.</strong> These three files are what <code>babble_data.sh</code> + <code>sft.sh</code> + <code>eval.sh</code> + their <code>.slurm</code> wrappers + an <code>exp/*.sh</code> pair do for a track, minus the env-var dispatch. Add them; do <em>not</em> delete the old drivers in this change. Retire the bash per track as each track is next re-run &mdash; those files are the only record of how the datasets already sitting in <code>results/</code> were built.
+</div>
+<div class="step"><span class="step-badge">9</span><h2>Build order and what to read</h2></div>
+<ol>
+  <li>Check each config against its three <code>Config</code> dataclasses by hand, then read the <code>config: &hellip;</code> line every script prints on start. That line is the only place a dropped key shows up (step&nbsp;5, and 7a is what it already cost).</li>
+  <li>Cheapest real build first: <code>sent-1-asr</code> at <code>n_train: 20, n_test: 5</code>, run locally as <code>./exp/bab-sent1asr.slurm</code> with the SFT and eval lines commented out and <code>--no-push</code> appended to the build line. Read <code>babble_audio/&lt;ds&gt;/rows.json</code>: are the <code>lost</code> entries exact key-piece strings, is <code>asr_bucket</code> a single digit with <code>resp_bucket</code> empty, and does the <code>kind</code> mix look plausible per band? Fix, then relaunch full.</li>
+  <li>Full <code>sent-1-asr</code>, then <code>sent-1-resp</code>, then <code>heard-reply</code> &mdash; ascending decode cost, so the cheapest one surfaces the shared bugs.</li>
+  <li>Per build, before SFT: the <code>kind</code> counts and the realized-SNR distribution per kind (from <code>rows.json</code>), plus the <code>skip</code> counter in the log tail.</li>
+</ol>
+
+<h3>What the numbers should do &mdash; and the failure mode to watch</h3>
+<p>Dropping from 2 or 4 witnesses to 1 removes the intersection, and the intersection is what suppresses single-witness noise. So <strong>more pieces will be called lost at the same SNR</strong>, which shows up two ways at once:</p>
+<ul>
+  <li><strong>Kind mix shifts toward repair/repeat</strong> at a given band, and the <code>answer</code> slot needs cleaner draws to fill &mdash; watch <code>skip["probe:answer"]</code> and expect the answer rows to sit at higher realized SNR than <code>sent-2</code>'s.</li>
+  <li><strong>Label noise rises</strong> in a specific direction: a single witness's own mistake now becomes the label. For <code>sent-1-asr</code> that is a mistranscription of a piece that was actually audible; for <code>sent-1-resp</code> it is a reply that paraphrases past a piece it did hear. Both file an answerable audio as a repair &mdash; the model is then trained to ask about something it can hear.</li>
+</ul>
+<p>Both are the ablation working, not a bug &mdash; but they are only interpretable if measured. Cheapest measurement: after the builds, run all three labelers over one <em>shared</em> set of ~200 rows from an existing <code>sent-2</code> build (its <code>asr_transcript</code> and <code>omni_response</code> are both stored) and report the kind&nbsp;&rarr;&nbsp;kind&prime; confusion between 1-witness and 2-witness labels on identical audio. That is a text-only job against the vLLM box, no GPU, and it isolates the labeler from the probe draw &mdash; which the three separate builds cannot do, because each redraws its own SNR.</p>
+
+<div class="step"><span class="step-badge">10</span><h2>Then: the full track, one submission each</h2></div>
+<pre><code>sbatch exp/bab-sent1asr.slurm     # build -> SFT -> base eval -> adapter eval
+sbatch exp/bab-sent1resp.slurm
+sbatch exp/bab-hr.slurm           # needs step 6</code></pre>
+<p>One job per track rather than one per stage: the stages are strictly sequential (each consumes what the last produced), so splitting them only adds queue waits, and the build's 16 CPUs are the binding request anyway. To rerun a track whose dataset already exists, comment out its <code>babble_data.py</code> line and resubmit.</p>
+<p>Each writes <code>results/bab_&lt;name&gt;_&lt;tag&gt;.jsonl</code> for the base model and its adapter. Keep the tags in the table above: <code>viz.ipynb</code> keys the run off the filename, and the ladder is only readable if <code>sent1asr</code> / <code>sent1resp</code> / <code>sent2</code> / <code>sent4</code> all sit under the same judge mode.</p>
+<div class="risk"><strong>The comparison that is <em>not</em> free.</strong> <code>heard-reply</code> is scored by <code>--fewshot-judge</code> on the parsed <code>Reply:</code> half; the two sent tracks by the per-kind judges on the whole output. C/R/F from the HR run are therefore <strong>not</strong> comparable with the sent ladder &mdash; the same trap <code>eval.sh</code>'s header documents for the beam track. If HR has to sit on the same axis, score it a second time with <code>--judge-mode per-kind</code> under its own tag, and compare only that pass.</div>
+
+<h2 id="dash-m">Should this repo switch to <code>python -m</code>?</h2>
+<p><strong>No.</strong> That pattern in <code>rlhf-book</code> follows from a property this repo doesn't have: <code>direct_alignment</code> is an installed package whose modules import each other relatively (<code>from .config import load_config</code>), and relative imports only resolve when the file is run <em>as</em> part of a package &mdash; <code>python direct_alignment/train.py</code> would crash. <code>python -m</code> is the fix for that, not a style choice.</p>
+<p>Here every module sits at the repo root and imports absolutely (<code>from prompts import ...</code>, <code>from util import ...</code>), which works identically under both invocations. Switching would mean adding a package directory, an <code>__init__.py</code>, rewriting every import to be relative, and updating every <code>.slurm</code>, <code>.sh</code> and doc &mdash; to type a longer command.</p>
+<p>The parts of that file worth copying are the parts you already have or are adding here:</p>
+<div class="scroll">
+<table>
+<thead><tr><th>Pattern in <code>rlhf-book</code></th><th>Worth adopting?</th></tr></thead>
+<tbody>
+<tr><td>YAML config + dataclass, CLI overrides the file</td><td class="y">already have it &mdash; <code>util.load_config</code> + the <code>for key, value in vars(args).items()</code> loop is the same design</td></tr>
+<tr><td>One config file per experiment, checked in</td><td class="y">yes &mdash; that's step 5</td></tr>
+<tr><td>Config printed at start of run</td><td class="y">already have it, and <code>load_config</code>'s silent key-dropping makes it load-bearing</td></tr>
+<tr><td><code>python -m</code> + package layout</td><td class="n">no &mdash; solves a problem this repo doesn't have</td></tr>
+<tr><td><code>uv run</code></td><td class="n">no &mdash; conda envs are pinned per model family on this cluster</td></tr>
+<tr><td>Explicit CLI override flag per config field</td><td class="n">partially &mdash; ~40 hand-written <code>add_argument</code> lines. Keep flags only for what you actually override ad-hoc (<code>--no-push</code>, <code>--n-train</code>, the track).</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Scope check: what does not change</h2>
+<ul>
+  <li><code>SLOT_SNR_DISJOINT</code>, <code>CLEAN_ANSWER_PROB</code>, <code>SLOT_WEIGHTS</code>, <code>MAX_PROBES</code>, the probe/redraw loop, <code>add_noise</code> &mdash; all three tracks use them exactly as built.</li>
+  <li><code>KEY_PIECES_SYSTEM</code>, <code>SENT_ASR_LOSS_SYSTEM</code>, <code>SENT_RESP_LOSS_SYSTEM</code>, <code>LABEL_TARGET_SYSTEM</code>, <code>write_target</code>'s three target prompts &mdash; <strong>no prompt edits anywhere</strong>. That is what makes the ladder an ablation of witness count rather than of wording, and what makes dataset 3 a re-creation.</li>
+  <li>The EAR / word-masking track, <code>MASK_DS_ID</code> exclusion, <code>asr_data.py</code>, the ft-asr track and <code>configs/ft-asr.yaml</code>.</li>
+  <li><code>two-pass</code> and <code>--beam-label</code> stay broken-as-documented. Step&nbsp;1's <code>TARGET_TRACKS</code> keeps <code>beam</code> in the set purely so its behavior is unchanged; neither is being fixed here.</li>
+  <li>Existing <code>.sh</code> / <code>.slurm</code> drivers keep working through the whole change &mdash; the track flags stay, and the three new <code>exp/*.slurm</code> files are added beside the old drivers, not in place of them.</li>
+</ul>
+
+<footer>
+Planning doc for <code>omni-pt</code>. No code written yet &mdash; steps 1&ndash;8 are the implementation, 9&ndash;10 the run order.
+Related: <a href="resp_only.html">resp_only.html</a> (the earlier reply-only sketch), <a href="ft-asr-2.html">ft-asr-2.html</a> (the config + <code>exp/*.sh</code> pattern this replaces), <a href="data.html">data.html</a> (superseded fixed-eval-set plan).
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,40 @@
+#!/bin/bash
+
+#SBATCH --job-name=bab_sent1resp
+#SBATCH --account=sciencehub
+#SBATCH --partition=gpu-a40
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=188G
+#SBATCH --gpus=1
+#SBATCH --time=2-00:00:00
+#SBATCH --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt
+#SBATCH --output=logs/bab_sent1resp_%j.log
+#SBATCH --export=all
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=zanqil@uw.edu
+
+# exp/bab-sent1resp.slurm -- the sent-1-resp track end to end (steps/bab-ds.html).
+#
+#   ./exp/bab-sent1resp.slurm        # here, in a shell you hold
+#   sbatch exp/bab-sent1resp.slurm   # queued, same file
+#
+# Everything that varies lives in the config. To skip a stage, comment out its
+# line; to redo one, paste it into a shell after the conda activate. The vLLM
+# judge box is resolved inside the python (VLLM_HOST_FILE), so there is nothing
+# to pass and nothing to precheck here.
+
+source ~/.bashrc
+set -eo pipefail
+conda activate qwen25omni
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+mkdir -p results logs
+
+CFG=configs/sent-1-resp.yaml
+ADAPTER=checkpoints/Qwen2.5-Omni-3B-bab-sent1resp-sft
+
+python -u babble_data.py      --config $CFG
+python -u sft_qwen.py         --config $CFG
+python -u babble_eval_qwen.py --config $CFG
+python -u babble_eval_qwen.py --config $CFG --adapter-path $ADAPTER

@@ -1723,4 +1723,12 @@ def get_prompts(task, family="qwen2.5"):
     if task == "repair":
         sysp = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
         return sysp, task_prompt(heard_reply=False, plain=False)
+    if task == "hr":
+        # The heard-reply track: same weights and the same repair_* config keys,
+        # the two-line output contract is the only difference. It has to be the
+        # prompt the rows were probed under -- their target IS a "Heard: ... /
+        # Reply: ..." pair, so training them under the restate prompt teaches
+        # the scaffolding without ever asking for it.
+        sysp = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
+        return sysp, task_prompt(heard_reply=True)
     raise ValueError(f"unknown task {task!r}")

@@ -1,0 +1,34 @@
+# sent-1-resp -- one witness (the base model's restating task reply), labeled
+# against the same key-piece inventory as sent-1-asr. Identical to
+# configs/sent-1-asr.yaml apart from the witness, which is what makes the pair
+# an ablation of witness KIND rather than of witness count.
+# See steps/bab-ds.html.
+#
+#   ./exp/bab-sent1resp.slurm
+#   sbatch exp/bab-sent1resp.slurm
+#
+# Keys not declared by a stage's Config dataclass are dropped SILENTLY -- read
+# the "config: ..." line each script prints on start.
+
+# Model
+omni_path: Qwen/Qwen2.5-Omni-3B
+
+# the build (babble_data.py). The probe runs TASK_PROMPT_TREE, not the plain
+# task prompt: a reply is only a witness if it names back what it caught.
+label: sent-1-resp
+ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent1resp-v1
+n_train: 1000
+n_test: 100
+n_extra_ans: 1000
+
+# the repair LoRA (sft_qwen.py)
+repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent1resp-v1
+repair_repo_name: Qwen2.5-Omni-3B-bab-sent1resp-sft
+repair_epochs: 3
+repair_lr: 2.0e-4
+
+# the eval (babble_eval_qwen.py)
+judge_mode: per-kind
+kinds: answer,repair,repeat
+num_rows: -1
+tag: sent1resp

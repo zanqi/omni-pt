@@ -1,0 +1,35 @@
+# sent-1-asr -- one witness (the base model's ASR transcript), labeled against
+# the key-piece inventory. The 1-witness rung of the ladder whose 2- and
+# 4-witness rungs are configs/sent-2.yaml-style sent2/sent4 builds.
+# See steps/bab-ds.html. Every stage reads this one file:
+#
+#   ./exp/bab-sent1asr.slurm        # here
+#   sbatch exp/bab-sent1asr.slurm   # queued, same file
+#
+# Keys not declared by a stage's Config dataclass are dropped SILENTLY -- read
+# the "config: ..." line each script prints on start.
+
+# Model
+omni_path: Qwen/Qwen2.5-Omni-3B
+
+# the build (babble_data.py)
+label: sent-1-asr
+ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent1asr-v1
+n_train: 1000        # utterances -> x3 kinds = 3000 train rows
+n_test: 100          # -> a 300-row test split; every eval pass judges all of it
+n_extra_ans: 1000    # extra answer-only rows, matching the sent-4 build
+
+# the repair LoRA (sft_qwen.py). repair_ds_id is the same dataset the build
+# pushes above, spelled again because sft_qwen.py's two runs each read their
+# own half of the repair_*/asr_* keys.
+repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent1asr-v1
+repair_repo_name: Qwen2.5-Omni-3B-bab-sent1asr-sft
+repair_epochs: 3
+repair_lr: 2.0e-4
+
+# the eval (babble_eval_qwen.py). Per-kind judges, so C/R/F stay comparable
+# with the sent2/sent4 rows in results/viz.ipynb.
+judge_mode: per-kind
+kinds: answer,repair,repeat
+num_rows: -1
+tag: sent1asr
