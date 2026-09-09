@@ -102,8 +102,8 @@
 <tr><th>Kind rule</th><td colspan="2" style="text-align:center">|lost ids| &rarr; 0&nbsp;answer / 1&nbsp;repair / &ge;2&nbsp;repeat, no intersection to survive</td><td>|lost pieces| from the <code>Heard</code> diff, same 0/1/&ge;2</td></tr>
 <tr><th>Target</th><td colspan="2" style="text-align:center"><code>write_target()</code>, separate call, temp 0.7</td><td>inline in the label call; row target is <code>Heard: &hellip;\nReply: &hellip;</code></td></tr>
 <tr><th>SNR bands</th><td colspan="3" style="text-align:center"><code>SLOT_SNR_DISJOINT</code> + <code>CLEAN_ANSWER_PROB</code> (all three are non-<code>two-pass</code>)</td></tr>
-<tr><th>SFT prompt</th><td colspan="2" style="text-align:center">restate (<code>get_prompts("repair")</code>, today's default)</td><td class="bad"><code>TASK_PROMPT_HR</code> &mdash; <strong>not currently trainable</strong>, see step&nbsp;6</td></tr>
-<tr><th>Eval</th><td colspan="2" style="text-align:center"><code>--judge-mode per-kind</code></td><td><code>--heard-reply --fewshot-judge</code></td></tr>
+<tr><th>SFT prompt</th><td colspan="2" style="text-align:center">restate (<code>get_prompts("repair")</code>, the default)</td><td><code>TASK_PROMPT_HR</code> via <code>--task hr</code> (added in step&nbsp;6)</td></tr>
+<tr><th>Eval</th><td colspan="2" style="text-align:center"><code>--judge-mode per-kind</code></td><td><code>--heard-reply</code> + the same per-kind judges</td></tr>
 <tr><th>Empty row columns</th><td><code>omni_response</code></td><td><code>asr_transcript</code></td><td><code>key_pieces</code>, buckets</td></tr>
 </tbody>
 </table>
@@ -158,7 +158,7 @@
 <tr><td>Single-witness kind decision</td><td class="y">exists</td><td><code>decide_kind_ids(pieces, sides)</code> is already n-ary; <code>set.intersection(*[s])</code> is <code>s</code>.</td></tr>
 <tr><td>Single-witness labelers</td><td class="y">exists</td><td><code>SENT_ASR_LOSS_SYSTEM</code> / <code>SENT_RESP_LOSS_SYSTEM</code> each read one witness line.</td></tr>
 <tr><td><code>heard-reply</code> build path</td><td class="y">exists</td><td><code>label_target</code>, <code>TASK_PROMPT_HR</code>, prefill, parser, target composition in <code>make_row</code>. Unchanged.</td></tr>
-<tr><td><code>heard-reply</code> eval path</td><td class="y">exists</td><td><code>babble_eval_qwen.py --heard-reply --fewshot-judge</code>.</td></tr>
+<tr><td><code>heard-reply</code> eval path</td><td class="y">exists</td><td><code>babble_eval_qwen.py --heard-reply</code>. The <code>--fewshot-judge</code> the v1 hr runs used is <strong>gone</strong> from the script, so this rebuild is scored by the per-kind judges &mdash; which is what makes all three new datasets comparable with each other.</td></tr>
 <tr><td>Probe dispatch for 1 witness</td><td class="bad">missing</td><td>Step&nbsp;2 &mdash; the <code>else</code> branch always decodes <em>both</em> ASR and reply.</td></tr>
 <tr><td>Per-witness buckets</td><td class="bad">wrong</td><td>Step&nbsp;3 &mdash; <code>decide_kind_ids</code> writes <code>resp_bucket</code> from <code>sides[-1]</code>, so a 1-ASR row reports a reply bucket it never had.</td></tr>
 <tr><td><code>heard-reply</code> SFT</td><td class="bad">removed</td><td>Step&nbsp;6 &mdash; <code>sft.sh</code> hard-fails HR; <code>get_prompts</code> has no HR branch.</td></tr>
@@ -325,7 +325,6 @@ repair_epochs: 3
 repair_lr: 2.0e-4
 
 heard_reply: true   # eval prompt + parser
-fewshot_judge: true
 kinds: answer,repair,repeat
 num_rows: -1
 tag: hr-v2</code></pre>
@@ -337,7 +336,7 @@ tag: hr-v2</code></pre>
   <li>PyYAML silently keeps the <em>last</em> of two identical keys in one file. That is why <code>ft-asr.yaml</code> prefixes <code>asr_n_train</code> &mdash; a plain second <code>n_train</code> would have overwritten the first with no warning.</li>
   <li><code>load_config</code> drops any key the stage's <code>Config</code> doesn't declare, without a word. A typo leaves the field at its dataclass default, and the only place you see it is the <code>log(f"config: {cfg}")</code> line each script prints on start. Read that line on every first run.</li>
 </ul>
-<p>So <code>heard_reply</code> / <code>fewshot_judge</code> / <code>tag</code> must be added to <code>babble_eval_qwen.py</code>'s <code>Config</code> dataclass, or the eval will run under the wrong prompt while looking like it read the file. Check each of the three configs against the three <code>Config</code> dataclasses once, by hand.</p>
+<p>So <code>heard_reply</code> and <code>tag</code> must be added to <code>babble_eval_qwen.py</code>'s <code>Config</code> dataclass, or the eval will run under the wrong prompt while looking like it read the file. Check each of the three configs against the three <code>Config</code> dataclasses once, by hand.</p>
 
 <div class="step"><span class="step-badge">6</span><h2>Make <code>heard-reply</code> trainable again <span class="tag">blocker</span></h2></div>
 <p>The build and the eval paths for HR are intact; the <em>SFT</em> path was removed. <code>sft_qwen.py</code> gets its prompts from <code>get_prompts(task, family)</code>, which knows only <code>"asr"</code> and <code>"repair"</code>, and <code>sft.sh</code> hard-exits on <code>HR=1</code> saying exactly this. Without it, dataset&nbsp;3 can be built and can be evaluated on the base model, but no adapter can be trained on it &mdash; which is most of the point.</p>
@@ -414,8 +413,8 @@ sbatch exp/bab-sent1asr.slurm     # queue the identical file</code></pre>
 <pre><code>#!/bin/bash
 
 #SBATCH --job-name=bab_sent1asr
-#SBATCH --account=sciencehub
-#SBATCH --partition=gpu-a40
+#SBATCH --account=intelligentsystems
+#SBATCH --partition=gpu-l40s
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
@@ -467,7 +466,7 @@ python -u babble_eval_qwen.py --config $CFG --adapter-path $ADAPTER</code></pre>
 <tbody>
 <tr><td><code>exp/bab-sent1asr.slurm</code></td><td><code>configs/sent-1-asr.yaml</code></td><td><code>&hellip;-bab-sent1asr-sft</code></td><td>&mdash;</td></tr>
 <tr><td><code>exp/bab-sent1resp.slurm</code></td><td><code>configs/sent-1-resp.yaml</code></td><td><code>&hellip;-bab-sent1resp-sft</code></td><td>nothing else</td></tr>
-<tr><td><code>exp/bab-hr.slurm</code></td><td><code>configs/heard-reply.yaml</code></td><td><code>&hellip;-bab-hr2-sft</code></td><td><code>sft_qwen.py --task hr</code> (step&nbsp;6); the two eval lines take <code>--heard-reply --fewshot-judge</code> from the config</td></tr>
+<tr><td><code>exp/bab-hr.slurm</code></td><td><code>configs/heard-reply.yaml</code></td><td><code>&hellip;-bab-hr2-sft</code></td><td><code>sft_qwen.py --task hr</code> (step&nbsp;6); the two eval lines take <code>heard_reply: true</code> from the config</td></tr>
 </tbody>
 </table>
 </div>
@@ -498,7 +497,7 @@ sbatch exp/bab-sent1resp.slurm
 sbatch exp/bab-hr.slurm           # needs step 6</code></pre>
 <p>One job per track rather than one per stage: the stages are strictly sequential (each consumes what the last produced), so splitting them only adds queue waits, and the build's 16 CPUs are the binding request anyway. To rerun a track whose dataset already exists, comment out its <code>babble_data.py</code> line and resubmit.</p>
 <p>Each writes <code>results/bab_&lt;name&gt;_&lt;tag&gt;.jsonl</code> for the base model and its adapter. Keep the tags in the table above: <code>viz.ipynb</code> keys the run off the filename, and the ladder is only readable if <code>sent1asr</code> / <code>sent1resp</code> / <code>sent2</code> / <code>sent4</code> all sit under the same judge mode.</p>
-<div class="risk"><strong>The comparison that is <em>not</em> free.</strong> <code>heard-reply</code> is scored by <code>--fewshot-judge</code> on the parsed <code>Reply:</code> half; the two sent tracks by the per-kind judges on the whole output. C/R/F from the HR run are therefore <strong>not</strong> comparable with the sent ladder &mdash; the same trap <code>eval.sh</code>'s header documents for the beam track. If HR has to sit on the same axis, score it a second time with <code>--judge-mode per-kind</code> under its own tag, and compare only that pass.</div>
+<div class="risk"><strong>The comparison that is only half free.</strong> All three run the same per-kind judges, so the rubric is shared &mdash; but on <code>heard-reply</code> the judge sees the parsed <code>Reply:</code> half alone, and the model answered under a different prompt. So C/R/F are comparable across the two sent tracks without qualification, and against HR only as "same rubric, different output contract". The <code>--fewshot-judge</code> the v1 hr numbers were produced with no longer exists in the script, so those old numbers are not a baseline for this rebuild either.</div>
 
 <h2 id="dash-m">Should this repo switch to <code>python -m</code>?</h2>
 <p><strong>No.</strong> That pattern in <code>rlhf-book</code> follows from a property this repo doesn't have: <code>direct_alignment</code> is an installed package whose modules import each other relatively (<code>from .config import load_config</code>), and relative imports only resolve when the file is run <em>as</em> part of a package &mdash; <code>python direct_alignment/train.py</code> would crash. <code>python -m</code> is the fix for that, not a style choice.</p>

@@ -1,8 +1,8 @@
 #!/bin/bash
 
 #SBATCH --job-name=bab_sent1resp
-#SBATCH --account=sciencehub
-#SBATCH --partition=gpu-a40
+#SBATCH --account=intelligentsystems
+#SBATCH --partition=gpu-l40s
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
@@ -24,6 +24,10 @@
 # line; to redo one, paste it into a shell after the conda activate. The vLLM
 # judge box is resolved inside the python (VLLM_HOST_FILE), so there is nothing
 # to pass and nothing to precheck here.
+#
+# intelligentsystems/gpu-l40s, as babble_data_qwen25.slurm used for this same
+# build: sciencehub/gpu-a40 is 52 CPUs total and the vllm judge box holds 24 of
+# them, so a 16-CPU job there queues behind AssocGrpCpuLimit.
 
 source ~/.bashrc
 set -eo pipefail
