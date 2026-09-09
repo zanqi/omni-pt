@@ -242,3 +242,34 @@ def load_config(path, cls):
         raw = yaml.safe_load(f) or {}
     names = {f.name for f in dataclasses.fields(cls)}
     return cls(**{k: v for k, v in raw.items() if k in names})
+
+
+# the judge/target vLLM box. Its slurm job records the node it landed on here.
+VLLM_HOST_FILE = "/gscratch/sciencehub/zanqil/vllm_judge/vllm_judge_host.txt"
+
+
+def resolve_judge(base_url, judge_model):
+    """(base_url, model id) for the judge, resolving 'auto' off the host file.
+
+    'auto' is the default because the alternative was a hardcoded node name
+    that is wrong the moment the judge job lands elsewhere -- its slurm job
+    records where it landed in VLLM_HOST_FILE, and every bash driver was
+    reading that file and re-deriving this. The served name is asked of the
+    server rather than defaulted, since the box gets re-served with different
+    models and a stale name 404s on every row. Called before the omni model is
+    loaded, so an unreachable box fails in seconds.
+
+    Shared by babble_eval_qwen.py, mask_eval_qwen.py and mask_dpo_data.py --
+    the DPO ranker has to reach the same box under the same rules as the eval
+    whose metric it is optimising.
+    """
+    from openai import OpenAI
+
+    if base_url in (None, "", "openai"):
+        return "openai", judge_model or "gpt-4o"
+    if base_url == "auto":
+        with open(VLLM_HOST_FILE) as f:
+            base_url = f"http://{f.read().strip()}:8000/v1"
+    served = OpenAI(base_url=base_url, api_key="EMPTY").models.list().data[0].id
+    print(f"judge: {judge_model or served} @ {base_url}")
+    return base_url, judge_model or served

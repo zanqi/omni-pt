@@ -34,7 +34,7 @@ Qwen3ASRProcessor.prepare_forced_aligner_inputs. No omni model is loaded -- the
 0.6B aligner and whisper-tiny are the only GPU residents. Targets are written by
 babble_data.write_target(), served by the same vLLM box as the other tracks.
 
-    python mask_data.py --ds-id keylazy/slurp-mask-v1 --n-train 1500 --n-test 80
+    python mask_data.py --config configs/mask-crf.yaml
 """
 
 import argparse
@@ -48,6 +48,7 @@ import threading
 from difflib import SequenceMatcher
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import numpy as np
 import soundfile as sf
@@ -75,6 +76,7 @@ from babble_data import (
     slurp_ds_stream,
     write_target,
 )
+from util import load_config
 
 ALIGNER_MODEL_ID = "Qwen/Qwen3-ForcedAligner-0.6B-hf"
 ALIGNER_LANGUAGE = "English"
@@ -886,9 +888,28 @@ def build_rows(split, n_utts, seen_slurp_ids, babble_pool):
     return rows
 
 
+@dataclass
+class Config:
+    """The track YAML's key names, shared with the four stages downstream of
+    this one -- they read `ds_id` too, which is the point of one file per
+    track. A key this stage does not declare is dropped by load_config
+    without a word, so read the "config: ..." line it prints on start."""
+
+    ds_id: str | None = None
+    n_train: int = N_TRAIN
+    n_test: int = N_TEST
+    clean_bg_prob: float = CLEAN_BG_PROB
+    mask_pad: float = MASK_PAD
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ds-id", required=True)
+    ap.add_argument(
+        "--config",
+        help="Track YAML (configs/*.yaml). Its keys become parser defaults, so "
+        "any flag also given on the command line still wins.",
+    )
+    ap.add_argument("--ds-id")
     ap.add_argument("--n-train", type=int, default=N_TRAIN)
     ap.add_argument("--n-test", type=int, default=N_TEST)
     ap.add_argument("--clean-bg-prob", type=float, default=CLEAN_BG_PROB)
@@ -912,7 +933,28 @@ if __name__ == "__main__":
     )
     ap.add_argument("--mask-pad", type=float, default=MASK_PAD)
     ap.add_argument("--no-push", action="store_true")
+    # --config has to be read before parse_args, because the file supplies
+    # defaults rather than overrides -- a flag on the command line has to stay
+    # able to beat it, and after parse_args an explicit flag is
+    # indistinguishable from the default it happens to equal.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    config_path = pre.parse_known_args()[0].config
+    if config_path:
+        cfg = load_config(config_path, Config)
+        log(f"config: {cfg}")
+        ap.set_defaults(
+            ds_id=cfg.ds_id,
+            n_train=cfg.n_train,
+            n_test=cfg.n_test,
+            clean_bg_prob=cfg.clean_bg_prob,
+            mask_pad=cfg.mask_pad,
+        )
     args = ap.parse_args()
+    # not required=True: the config supplies it, and argparse checks required
+    # flags before set_defaults has been given a chance to fill them
+    if not args.ds_id:
+        raise SystemExit("no dataset to push to: pass --ds-id or ds_id:")
 
     MASK_PAD = args.mask_pad
     CLEAN_BG_PROB = args.clean_bg_prob

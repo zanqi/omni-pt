@@ -1,0 +1,53 @@
+# mask-crf -- the mask track's three-kind build and its full sweep: answer,
+# repair AND repeat rows, so the eval reports F and
+# EAR = 3*C*R*F/(C*R + C*F + R*F). The two-kind ancestor is the "cr" run
+# (exp/white-cr.sh); "crf" is that plus the repeat kind.
+# See steps/mask.html.
+#
+#   ./exp/mask-crf.slurm
+#   sbatch exp/mask-crf.slurm
+#
+# These are mask-all.sh's v2 defaults verbatim, which means re-running a stage
+# overwrites that sweep's files (results/mask_results_*_mask-v2.jsonl,
+# results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-sft.jsonl). Change the four names
+# below to keep them.
+#
+# Keys not declared by a stage's Config dataclass are dropped SILENTLY -- read
+# the "config: ..." line each script prints on start.
+
+# Model
+omni_path: Qwen/Qwen2.5-Omni-3B
+
+# the build (mask_data.py). n_train utterances x 3 kinds train rows; the test
+# split multiplies by the four masks as well.
+ds_id: keylazy/slurp-mask-v2
+n_train: 1000
+n_test: 100
+
+# the SFT LoRA (sft_qwen.py), which spells the dataset repair_ds_id: one file,
+# and --task picks which half of the repair_*/asr_* keys is read.
+task: repair
+repair_ds_id: keylazy/slurp-mask-v2
+repair_repo_name: Qwen2.5-Omni-3B-mask-v2-sft
+train_kinds: answer,repair,repeat
+repair_epochs: 3
+repair_lr: 2.0e-4
+
+# the preference pairs (mask_dpo_data.py) and DPO on them (dpo_qwen.py). Both
+# read sft_adapter and prefs -- the first writes that file, the second trains
+# on it. dpo_lr is an order below repair_lr: 5e-6, the full-model DPO figure,
+# moved a rank-16 LoRA by ~1% of what SFT moved it and scored exactly SFT.
+sft_adapter: checkpoints/Qwen2.5-Omni-3B-mask-v2-sft
+prefs: results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-sft.jsonl
+dpo_samples: 8
+dpo_run_name: Qwen2.5-Omni-3B-mask-v2-dpo
+dpo_epochs: 2
+dpo_lr: 2.0e-5
+dpo_beta: 1.0
+
+# the eval (mask_eval_qwen.py). The row's own label picks the rubric and the
+# rubric returns the score, so a confident answer on a repair row cannot score
+# 1.0. tag names the result file.
+split: test
+num_rows: -1
+tag: mask-v2

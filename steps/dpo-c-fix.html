@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Fixing the DPO C-drop: hold-firm pairs for answerable rows</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #5b5b5b; --rule: #ddd;
+    --code-bg: #f4f4f5; --accent: #8a3ffc; --bad: #c0392b; --ok: #1a7f37;
+    --warn: #b8860b; --card: #fafafa;
+    --s0: #c0392b; --s5: #d9a441; --s1: #1a7f37;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#15161a; --fg:#e8e8ea; --muted:#a0a0a8; --rule:#33343a;
+      --code-bg:#1e1f25; --accent:#b794ff; --bad:#ff6b6b; --ok:#4fd07a;
+      --warn:#e0b344; --card:#1b1c22;
+      --s0:#d95c52; --s5:#d9a441; --s1:#4fd07a; }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 900px; margin: 0 auto; padding: 2.5rem 1.5rem 5rem;
+  }
+  h1 { font-size: 1.7rem; margin-bottom: .2rem; }
+  h2 { font-size: 1.25rem; margin-top: 2.8rem; border-bottom: 1px solid var(--rule); padding-bottom: .4rem; }
+  h3 { font-size: 1.02rem; margin-top: 1.6rem; color: var(--accent); }
+  .subtitle { color: var(--muted); margin-top: 0; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .87em; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+  pre {
+    background: var(--code-bg); padding: .9rem 1rem; border-radius: 8px;
+    overflow-x: auto; line-height: 1.5; border: 1px solid var(--rule);
+  }
+  pre code { background: none; padding: 0; }
+  .add { color: var(--ok); }
+  .del { color: var(--bad); }
+  .cmt { color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+  th, td { border: 1px solid var(--rule); padding: .45rem .6rem; text-align: left; }
+  th { background: var(--code-bg); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .card {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 1rem 1.2rem; margin: 1rem 0;
+  }
+  .step-badge {
+    display: inline-block; background: var(--accent); color: #fff;
+    border-radius: 999px; width: 1.6em; height: 1.6em; line-height: 1.6em;
+    text-align: center; font-weight: 600; font-size: .85em; margin-right: .5em;
+  }
+  .risk { border-left: 3px solid var(--bad); padding-left: .9rem; margin: .8rem 0; }
+  .note { border-left: 3px solid var(--warn); padding-left: .9rem; margin: .8rem 0; }
+  .good { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+  .muted { color: var(--muted); }
+  ul { padding-left: 1.3rem; } li { margin: .3rem 0; }
+  .toc { columns: 2; column-gap: 2rem; }
+  .toc a { color: var(--fg); text-decoration: none; }
+  .toc a:hover { color: var(--accent); }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; margin: .7rem 0; }
+  .pair > div { border: 1px solid var(--rule); border-radius: 8px; padding: .6rem .8rem; font-size: .9rem; }
+  .pair .h { font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: .3rem; }
+  .win { border-left: 3px solid var(--ok); }
+  .lose { border-left: 3px solid var(--bad); }
+  .say { font-style: italic; }
+  details { margin: .8rem 0; border: 1px solid var(--rule); border-radius: 8px; padding: .6rem .9rem; background: var(--card); }
+  summary { cursor: pointer; font-weight: 600; }
+  .legend { display: flex; gap: 1.2rem; font-size: .85rem; color: var(--muted); margin: .3rem 0 .8rem; flex-wrap: wrap; }
+  .swatch { display: inline-block; width: .8em; height: .8em; border-radius: 2px; margin-right: .35em; vertical-align: -1px; }
+  .chartwrap { overflow-x: auto; }
+  footer { margin-top: 3rem; color: var(--muted); font-size: .85rem; border-top: 1px solid var(--rule); padding-top: 1rem; }
+  @media (max-width: 640px) { .pair { grid-template-columns: 1fr; } .toc { columns: 1; } }
+</style>
+</head>
+<body>
+
+<h1>Fixing the DPO C-drop</h1>
+<p class="subtitle">Why <code>Qwen2.5-Omni-3B-mask-v2-dpo</code> lost 14 points of Competence against its own
+SFT parent, and the one change to <code>mask_dpo_data.py</code> that should get it back. Plan only &mdash;
+nothing here is applied yet. Follows on from <a href="mask.html">mask.html</a> &sect;9&ndash;10 and
+<a href="dpo.html">dpo.html</a>.</p>
+
+<div class="card">
+<b>TL;DR.</b> DPO did not make the model worse at answering &mdash; it moved the answer/ask boundary.
+The question rate on <em>answerable</em> audio went <b>11%&nbsp;&rarr;&nbsp;54%</b>, and the generic
+&ldquo;sorry, say that again&rdquo; phrasing went <b>8&nbsp;&rarr;&nbsp;63</b> rows.<br><br>
+The cause is in the pair set, not the trainer: the SFT policy already answers ~84% of
+<code>answer</code> rows perfectly, so <code>mask_dpo_data.py</code> drops them as <code>all-good</code>.
+<b>~840 of the 1000 answer rows contribute zero gradient</b>, while 958 repair/repeat pairs push the
+clarify prior up. Even after the existing per-kind reweighting, the set rewards repeat-style phrasing
+<b>369 vs 127</b> by weight.<br><br>
+<b>Fix:</b> stop dropping all-good <code>answer</code> rows. Mint a <em>hold-firm</em> pair for each &mdash;
+<span class="good">chosen</span> = the correct sampled answer, <span class="bad">rejected</span> = a
+clarifying/repeat reply. ~840 new pairs in the opposite direction, no new <code>generate</code> and no new
+judge calls.
+</div>
+
+<h2 id="toc">Contents</h2>
+<div class="toc">
+<a href="#s1">1. What actually moved</a><br>
+<a href="#s2">2. It is the boundary, not the capability</a><br>
+<a href="#s3">3. Three regressions, side by side</a><br>
+<a href="#s4">4. Why the pair set teaches this</a><br>
+<a href="#s5">5. The fix</a><br>
+<a href="#s6">6. Choosing the negatives</a><br>
+<a href="#s7">7. Second-order effect on the kind weights</a><br>
+<a href="#s8">8. Run order</a><br>
+<a href="#s9">9. Risks &amp; falsification checks</a><br>
+<a href="#s10">10. What was considered and not chosen</a><br>
+</div>
+
+<h2 id="s1"><span class="step-badge">1</span>What actually moved</h2>
+
+<p>All three runs score the same 1200-row <code>keylazy/slurp-mask-v2:test</code> split (400 per kind)
+under the same <code>Qwen/Qwen3.8-27B</code> judge, 0 judge failures.</p>
+
+<table>
+<tr><th>run</th><th class="num">C</th><th class="num">R</th><th class="num">F</th><th class="num">EAR</th></tr>
+<tr><td>base <code>Qwen2.5-Omni-3B</code></td><td class="num">0.634</td><td class="num">0.311</td><td class="num">0.155</td><td class="num">0.267</td></tr>
+<tr><td><b>+ SFT</b></td><td class="num good"><b>0.863</b></td><td class="num">0.703</td><td class="num">0.903</td><td class="num good"><b>0.813</b></td></tr>
+<tr><td>+ SFT &rarr; DPO</td><td class="num bad"><b>0.723</b></td><td class="num">0.729</td><td class="num">0.983</td><td class="num">0.795</td></tr>
+</table>
+
+<p>The per-kind score histograms say more than the means. Each bar is 400 rows.</p>
+
+<div class="legend">
+<span><span class="swatch" style="background:var(--s0)"></span>score 0</span>
+<span><span class="swatch" style="background:var(--s5)"></span>score 0.5</span>
+<span><span class="swatch" style="background:var(--s1)"></span>score 1</span>
+</div>
+
+<div class="chartwrap">
+<svg viewBox="0 0 880 250" width="100%" height="250" role="img"
+     aria-label="Stacked score histograms per kind, SFT versus DPO, 400 rows each">
+  <g font-size="12" font-family="ui-monospace, monospace" fill="currentColor">
+
+    <!-- answer -->
+    <text x="0" y="26" font-weight="600">answer</text>
+    <text x="70" y="26" fill="#888">SFT</text>
+    <g transform="translate(110,14)">
+      <rect x="0"     y="0" width="76.5"  height="16" fill="var(--s0)"/>
+      <rect x="76.5"  y="0" width="12"    height="16" fill="var(--s5)"/>
+      <rect x="88.5"  y="0" width="511.5" height="16" fill="var(--s1)"/>
+      <text x="608" y="13" fill="currentColor">51 / 8 / 341</text>
+    </g>
+    <text x="70" y="48" fill="#888">DPO</text>
+    <g transform="translate(110,36)">
+      <rect x="0"     y="0" width="166.5" height="16" fill="var(--s0)"/>
+      <rect x="166.5" y="0" width="433.5" height="16" fill="var(--s1)"/>
+      <text x="608" y="13" fill="var(--bad)">111 / 0 / 289</text>
+    </g>
+
+    <!-- repair -->
+    <text x="0" y="96" font-weight="600">repair</text>
+    <text x="70" y="96" fill="#888">SFT</text>
+    <g transform="translate(110,84)">
+      <rect x="0"     y="0" width="88.5"  height="16" fill="var(--s0)"/>
+      <rect x="88.5"  y="0" width="180"   height="16" fill="var(--s5)"/>
+      <rect x="268.5" y="0" width="331.5" height="16" fill="var(--s1)"/>
+      <text x="608" y="13" fill="currentColor">59 / 120 / 221</text>
+    </g>
+    <text x="70" y="118" fill="#888">DPO</text>
+    <g transform="translate(110,106)">
+      <rect x="0"     y="0" width="10.5"  height="16" fill="var(--s0)"/>
+      <rect x="10.5"  y="0" width="304.5" height="16" fill="var(--s5)"/>
+      <rect x="315"   y="0" width="285"   height="16" fill="var(--s1)"/>
+      <text x="608" y="13" fill="currentColor">7 / 203 / 190</text>
+    </g>
+
+    <!-- repeat -->
+    <text x="0" y="166" font-weight="600">repeat</text>
+    <text x="70" y="166" fill="#888">SFT</text>
+    <g transform="translate(110,154)">
+      <rect x="0"    y="0" width="58.5"  height="16" fill="var(--s0)"/>
+      <rect x="58.5" y="0" width="541.5" height="16" fill="var(--s1)"/>
+      <text x="608" y="13" fill="currentColor">39 / 0 / 361</text>
+    </g>
+    <text x="70" y="188" fill="#888">DPO</text>
+    <g transform="translate(110,176)">
+      <rect x="0"    y="0" width="10.5"  height="16" fill="var(--s0)"/>
+      <rect x="10.5" y="0" width="589.5" height="16" fill="var(--s1)"/>
+      <text x="608" y="13" fill="currentColor">7 / 0 / 393</text>
+    </g>
+
+    <line x1="110" y1="212" x2="710" y2="212" stroke="var(--rule)"/>
+    <text x="110" y="228" fill="#888">0</text>
+    <text x="395" y="228" fill="#888">200</text>
+    <text x="672" y="228" fill="#888">400 rows</text>
+  </g>
+</svg>
+</div>
+
+<p>Read the <code>repair</code> row carefully &mdash; it is the part that makes the trade a bad one.
+DPO's R gain (+0.026) is <b>entirely</b> a conversion of zeros into halves: <code>repair@0</code> falls
+59&nbsp;&rarr;&nbsp;7, but <code>repair@1</code> also falls <b>221&nbsp;&rarr;&nbsp;190</b>. The model did
+not learn to repair better; it learned to hedge instead of failing loudly, and lost 31 exact targeted
+repairs on the way. <code>repeat</code> gains +32 rows on a kind SFT already had at 90%. Against that,
+<code>answer@0</code> more than doubles.</p>
+
+<h2 id="s2"><span class="step-badge">2</span>It is the boundary, not the capability</h2>
+
+<p>Two measurements separate &ldquo;the model got worse&rdquo; from &ldquo;the model got more eager to
+ask&rdquo;, and both point at the second.</p>
+
+<p><b>Every single regression is a question.</b> Of the 400 <code>answer</code> rows, 65 score lower under
+DPO than under SFT, and all 65 replace an action with a question. Across the whole <code>answer</code>
+split:</p>
+
+<table>
+<tr><th>on answerable audio (n=400)</th><th class="num">SFT</th><th class="num">DPO</th></tr>
+<tr><td>reply contains a question</td><td class="num">44 (11%)</td><td class="num bad">215 (54%)</td></tr>
+<tr><td>reply is generic <em>&ldquo;say that again&rdquo;</em> phrasing</td><td class="num">8 (2%)</td><td class="num bad">63 (16%)</td></tr>
+<tr><td>&hellip; of which are among the 65 regressions</td><td class="num">&mdash;</td><td class="num">38</td></tr>
+</table>
+
+<p>The single largest failure mode is the <code>repeat</code> kind's template leaking onto fully
+answerable commands.</p>
+
+<p><b>The damage tracks the background, not the difficulty.</b> If DPO had degraded the model's
+ability to understand speech, clean audio would suffer with everything else. It barely moves:</p>
+
+<table>
+<tr><th>C by background</th><th class="num">n</th><th class="num">SFT</th><th class="num">DPO</th><th class="num">&Delta;</th></tr>
+<tr><td>clean</td><td class="num">216</td><td class="num">0.792</td><td class="num">0.736</td><td class="num">&minus;0.056</td></tr>
+<tr><td>babble bed</td><td class="num">984</td><td class="num">0.878</td><td class="num">0.720</td><td class="num bad">&minus;0.158</td></tr>
+</table>
+
+<p>Noise in the signal &mdash; not loss of the signal &mdash; is what now triggers the ask. That is exactly
+the over-triggering failure <a href="mask.html">mask.html</a> &sect;1 designed the dataset to avoid
+(&ldquo;heard a burst &rarr; ask&rdquo;), reintroduced at the DPO stage.</p>
+
+<div class="note">
+<b>Not an SNR story.</b> The by-SNR breakdown is <em>not</em> monotone and the bins are small
+(72&ndash;312 rows): the gap is 27&nbsp;pts at 0&ndash;5&nbsp;dB, 8&nbsp;pts at 5&ndash;10, 20&nbsp;pts at
+10&ndash;15, 19&nbsp;pts at 15&ndash;20, and 0 at 20&ndash;25&nbsp;dB (n=72, both runs at C&nbsp;=&nbsp;1.0).
+The only defensible reading is that the gap is present at every SNR except the quietest bin, and is
+much larger on babble than on clean. Do not lean on a mid-SNR narrative.
+</div>
+
+<h2 id="s3"><span class="step-badge">3</span>Three regressions, side by side</h2>
+
+<p>All three rows are <code>kind="answer"</code>: the masked span is a stopword or a low-rank slot, and the
+command is fully actionable. SFT scores 1, DPO scores 0.</p>
+
+<h3>id 101 &mdash; the <code>repeat</code> template leaks (38 of 65 look like this)</h3>
+<p class="muted say">&ldquo;remind me to send email to boss after one hour&rdquo; &middot; silence mask</p>
+<div class="pair">
+<div class="win"><div class="h">SFT &mdash; score 1</div>I'm setting a reminder to send emails to your boss after one hour.</div>
+<div class="lose"><div class="h">DPO &mdash; score 0</div>Sorry, I missed that. Could you please say that again?</div>
+</div>
+
+<h3>id 138 &mdash; asks for a detail the command already gave</h3>
+<p class="muted say">&ldquo;what events are going in my town this week&rdquo; &middot; white-noise mask</p>
+<div class="pair">
+<div class="win"><div class="h">SFT &mdash; score 1</div>I'm checking what events are happening in your town this week.</div>
+<div class="lose"><div class="h">DPO &mdash; score 0</div>Events this week &mdash; where are you looking for them?<br>
+<span class="muted" style="font-size:.85em">judge: &ldquo;asks for the location, which the command specified as 'my town'&rdquo;</span></div>
+</div>
+
+<h3>id 163 &mdash; the urge to ask bends the parse</h3>
+<p class="muted say">&ldquo;please tell me how to i bake twelve oatmeal cookies&rdquo; &middot; splice mask</p>
+<div class="pair">
+<div class="win"><div class="h">SFT &mdash; score 1</div>I'm pulling up the recipe for oatmeal cookies so you can bake twelve of them.</div>
+<div class="lose"><div class="h">DPO &mdash; score 0</div>I've got the twelve oatmeal cookies &mdash; who should I tell?<br>
+<span class="muted" style="font-size:.85em">judge: &ldquo;misinterprets the command as a request to notify someone&rdquo;</span></div>
+</div>
+
+<h2 id="s4"><span class="step-badge">4</span>Why the pair set teaches this</h2>
+
+<p><code>results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-sft.jsonl</code>, 1117 pairs kept from 3000 train rows
+(<code>breakdown: all-good 1857, sampled 1083, gold-chosen 34, flat 26</code>):</p>
+
+<table>
+<tr><th>kind</th><th class="num">train rows</th><th class="num">pairs kept</th><th class="num">kept %</th><th class="num">weight applied</th></tr>
+<tr><td>answer</td><td class="num">1000</td><td class="num bad">159</td><td class="num bad">16%</td><td class="num">2.34</td></tr>
+<tr><td>repair</td><td class="num">1000</td><td class="num">683</td><td class="num">68%</td><td class="num">0.55</td></tr>
+<tr><td>repeat</td><td class="num">1000</td><td class="num">275</td><td class="num">28%</td><td class="num">1.35</td></tr>
+</table>
+
+<h3>Cause 1: ~840 answer rows are invisible to the objective</h3>
+
+<p>The SFT policy already answers most answerable rows correctly at every one of the K=8 samples, so
+<code>mask_dpo_data.py</code> takes the <code>all-good</code> branch and drops them. Nothing in the DPO
+loss then holds those rows in place while 958 repair/repeat pairs push the clarify prior up. The
+<code>answer</code> kind's whole gradient budget is concentrated on the 159 rows the policy already found
+<em>hard</em> &mdash; high per-pair weight (2.34) spread over a narrow, unrepresentative slice, against a
+broad and diverse 958.</p>
+
+<h3>Cause 2: even after reweighting, the set favours repeat-style phrasing 3:1</h3>
+
+<p>The per-kind weights in <a href="../dpo_qwen.py">dpo_qwen.py:290</a> equalise the <em>count</em> per
+kind. They do not equalise <em>direction</em>. Counting weighted pairs in which one side uses generic
+&ldquo;say that again&rdquo; phrasing and the other does not:</p>
+
+<table>
+<tr><th></th><th class="num">weighted mass</th></tr>
+<tr><td><span class="bad">rewards</span> repeat-style phrasing (chosen has it, rejected does not)</td><td class="num">369</td></tr>
+<tr><td><span class="good">punishes</span> repeat-style phrasing (rejected has it, chosen does not)</td><td class="num">127</td></tr>
+</table>
+
+<p>2.9&nbsp;:&nbsp;1 toward the exact phrasing that then shows up on 63 answerable rows. The
+<code>repair</code> kind supplies the bulk of it: 282 of its 683 pairs have a question as
+<code>chosen</code> and a confident answer as <code>rejected</code>. The model cannot perfectly tell
+answerable-noisy from unanswerable-noisy, so &ldquo;suppress the confident answer under noise&rdquo;
+generalises across the boundary.</p>
+
+<h3>Cause 3: nothing bounds the drift</h3>
+
+<p>DPO optimises only a <em>difference</em>, so raising the clarify prior globally is a cheap way to win
+most pairs. The training log bears it out: the margin climbs monotonically to <b>~1.1 nats/token</b> and
+the loss to 0.40 by epoch 2, with <code>reward_acc</code> pinned at 1.0 in most late windows. Step-0
+<code>|policy &minus; reference|</code> was 0.0064 nats/token, so the plumbing is sound &mdash; the pairs
+really are asking for this.</p>
+
+<div class="note">
+<b>This is the second time.</b> The comment at <a href="../dpo_qwen.py">dpo_qwen.py:283</a> records the
+first DPO run taking the question rate from 12% to 73% and dropping C from 0.79 to 0.75, and the per-kind
+weighting was added to fix it. It halved the effect (73% &rarr; 54%) but did not remove it, because it
+addresses Cause 2 only, and only partially. <b>Cause 1 has never been addressed.</b>
+</div>
+
+<h2 id="s5"><span class="step-badge">5</span>The fix</h2>
+
+<p>One branch in <code>mask_dpo_data.py</code>. For an <code>answer</code> row where every sample already
+scores 1.0, do not drop it &mdash; emit a <em>hold-firm</em> pair whose <code>chosen</code> is the model's
+own correct answer and whose <code>rejected</code> is a clarifying or repeat reply that would be wrong
+here.</p>
+
+<pre><code><span class="cmt"># mask_dpo_data.py, in the MIN_MARGIN branch (currently lines 286-300)</span>
+                 if best["score"] - worst["score"] &lt; MIN_MARGIN:
+                     if best["score"] &gt;= 1.0:
+<span class="del">-                        # the policy already gets this row right every time</span>
+<span class="del">-                        stats["all-good"] += 1</span>
+<span class="del">-                        continue</span>
+<span class="add">+                        if row["kind"] != "answer":</span>
+<span class="add">+                            stats["all-good"] += 1</span>
+<span class="add">+                            continue</span>
+<span class="add">+                        # An answer row the policy never gets wrong makes no</span>
+<span class="add">+                        # sampled pair, so ~840 of the 1000 contribute nothing</span>
+<span class="add">+                        # while 958 repair/repeat pairs push the clarify prior</span>
+<span class="add">+                        # up. Mint the pair the sampler cannot: the negative is</span>
+<span class="add">+                        # a reply that is *correct on some other row of this</span>
+<span class="add">+                        # utterance* and wrong here, so it teaches the boundary</span>
+<span class="add">+                        # rather than a phrasing.</span>
+<span class="add">+                        worst = {"text": hold_firm_negative(row), "score": 0.0,</span>
+<span class="add">+                                 "reason": "clarify on an answerable row"}</span>
+<span class="add">+                        pair_source = "held-firm"</span>
+                     if worst["score"] &gt; 0.0:
+</code></pre>
+
+<p><code>best</code> is left exactly as the sampler produced it &mdash; a real, on-policy, judge-verified
+correct answer. Only the negative is synthesised.</p>
+
+<p>Everything downstream already works: <code>ref_logprob</code> is called on both sides, the record is
+written with the new <code>pair_source</code>, and <code>dpo_qwen.py</code> reweights by
+<code>kind</code> with no change. The <code>gold-chosen</code> warning at the end of <code>main()</code>
+should get a sibling line reporting the <code>held-firm</code> share, since a set dominated by them is a
+different kind of run.</p>
+
+<p><b>Cost.</b> No extra <code>generate</code> and no extra judge calls &mdash; those already ran before the
+row was dropped. The only new work is two <code>ref_logprob</code> forwards on ~840 rows.</p>
+
+<h2 id="s6"><span class="step-badge">6</span>Choosing the negatives</h2>
+
+<p>The negative is the whole design. Three constraints:</p>
+
+<ul>
+<li><b>It must not be one string.</b> 840 copies of a single template teaches the model to unlearn that
+literal string, not the behaviour. Draw from a pool.</li>
+<li><b>It must stay in the model's own register.</b> The pool should be text the policy actually produces,
+so the pair is about <em>when</em> to say it, not <em>how</em> it is worded.</li>
+<li><b>It must not be all repeat-style.</b> Punishing only &ldquo;say that again&rdquo; would leave the
+targeted-question habit untouched; punishing questions indiscriminately would cost R. Mix both.</li>
+</ul>
+
+<p>Both pools come from a single pass over <code>ds</code> before the row loop, keyed by
+<code>slurp_id</code> &mdash; the same utterance's <code>repeat</code> and <code>repair</code> rows already
+carry exactly the two negatives we want, and they are varied: the <code>repeat</code> targets alone span
+<b>90 distinct phrasings</b> across the pairs already built.</p>
+
+<pre><code><span class="cmt"># in main(), before the row loop -- nested beside sample_k / ref_logprob,</span>
+<span class="cmt"># which is where a single-caller helper belongs in this repo</span>
+by_kind = {"repeat": {}, "repair": {}}   <span class="cmt"># kind -&gt; slurp_id -&gt; target</span>
+for r in ds:
+    if r["kind"] in by_kind and r["target"]:
+        by_kind[r["kind"]].setdefault(r["slurp_id"], r["target"])
+repeat_by_id, repair_by_id = by_kind["repeat"], by_kind["repair"]
+rng = random.Random(0)   <span class="cmt"># re-running the pairs stage must reproduce</span>
+
+def hold_firm_negative(row):
+    """A reply that is right on another row of this utterance and wrong here.
+
+    REPEAT_SHARE of them are the generic 'say that again' phrasing, which is
+    the single largest leak (8 -&gt; 63 answerable rows); the rest are the
+    utterance's own targeted repair question, asking about a slot that on
+    THIS row was never masked. Falls back across the two pools, then to the
+    global repeat pool, so a missing sibling row never drops a pair."""
+    sid = row["slurp_id"]
+    want_repeat = rng.random() &lt; REPEAT_SHARE
+    first, second = ((repeat_by_id, repair_by_id) if want_repeat
+                     else (repair_by_id, repeat_by_id))
+    return (first.get(sid) or second.get(sid)
+            or rng.choice(list(repeat_by_id.values())))
+</code></pre>
+
+<p><b>Setting <code>REPEAT_SHARE</code>.</b> Recomputing the &sect;4 directional balance with 840 minted
+pairs added (weights recomputed, since adding answer pairs changes all three):</p>
+
+<table>
+<tr><th class="num">REPEAT_SHARE</th><th class="num">rewards repeat-style</th><th class="num">punishes</th><th class="num">ratio</th></tr>
+<tr><td class="num">0.00</td><td class="num">646</td><td class="num">178</td><td class="num bad">3.62</td></tr>
+<tr><td class="num">0.25</td><td class="num">646</td><td class="num">316</td><td class="num">2.05</td></tr>
+<tr><td class="num">0.50</td><td class="num">646</td><td class="num">453</td><td class="num">1.43</td></tr>
+<tr><td class="num"><b>0.70</b></td><td class="num">646</td><td class="num">562</td><td class="num good"><b>1.15</b></td></tr>
+<tr><td class="num">1.00</td><td class="num">646</td><td class="num">727</td><td class="num warn">0.89</td></tr>
+</table>
+
+<p><b>Start at <code>REPEAT_SHARE = 0.70</code>.</b> It lands the ratio at 1.15 &mdash; near neutral, with a
+small residual lean toward asking, which is the correct sign: the model <em>should</em> still ask when the
+audio warrants it, and we are correcting an over-trigger, not installing the opposite bias. 1.00 flips the
+sign and is the first thing to try only if R survives and C is still short.</p>
+
+<h2 id="s7"><span class="step-badge">7</span>Second-order effect on the kind weights</h2>
+
+<p>Worth flagging because it is not obvious and it partly works against the fix.
+<code>dpo_qwen.py</code>'s weights are <code>len(prefs) / (n_kinds * n_kind[k])</code>, so growing the
+<code>answer</code> bucket <em>raises</em> the per-pair weight of the other two:</p>
+
+<table>
+<tr><th>weight per pair</th><th class="num">answer</th><th class="num">repair</th><th class="num">repeat</th></tr>
+<tr><td>now (1117 pairs)</td><td class="num">2.34</td><td class="num">0.55</td><td class="num">1.35</td></tr>
+<tr><td>after (+840 &rarr; 1957 pairs)</td><td class="num">0.65</td><td class="num">0.96</td><td class="num warn">2.37</td></tr>
+</table>
+
+<p>Total mass per kind is unchanged by construction &mdash; that is the whole point of the scheme &mdash;
+and the real win is that the <code>answer</code> mass now spreads over 999 diverse rows instead of
+concentrating on 159 hard ones. But each individual <code>repeat</code> pair now carries 2.37, and the
+<code>repeat</code> kind is where the leaked phrasing comes from. This is why <code>REPEAT_SHARE</code>
+is tuned against the <em>post-fix</em> weights in &sect;6 rather than the current ones, and it is the
+reason the &ldquo;drop the repeat kind&rdquo; option in &sect;10 stays on the table as a follow-up.</p>
+
+<h2 id="s8"><span class="step-badge">8</span>Run order</h2>
+
+<p>The SFT adapter and the eval are unchanged; only stages 3 and 4 of
+<a href="../configs/mask-crf.yaml">configs/mask-crf.yaml</a> re-run. Rename the outputs so the current
+v2 sweep is not overwritten &mdash; the config header warns about exactly this.</p>
+
+<pre><code><span class="cmt"># configs/mask-crf.yaml -- change these three, leave the rest</span>
+prefs:        results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-sft-hf.jsonl
+dpo_run_name: Qwen2.5-Omni-3B-mask-v2-dpo-hf
+tag:          mask-v2-hf
+
+<span class="cmt"># 1. rebuild the pairs (re-samples K=8 + judges; the expensive stage)</span>
+python mask_dpo_data.py --config configs/mask-crf.yaml
+
+<span class="cmt"># 2. sanity-check the composition BEFORE training -- this is the whole fix</span>
+<span class="cmt">#    expect ~840 held-firm, and the answer bucket near 1000</span>
+grep -o '"pair_source": "[a-z-]*"' results/mask_prefs_*-hf.jsonl | sort | uniq -c
+
+<span class="cmt"># 3. DPO, then eval</span>
+python dpo_qwen.py       --config configs/mask-crf.yaml
+python mask_eval_qwen.py --config configs/mask-crf.yaml
+</code></pre>
+
+<p>Stage 1 re-samples from scratch, which is the bulk of the wall clock. If that is worth avoiding, the
+alternative is to run only the minting half over the rows the current run dropped and concatenate the two
+JSONLs &mdash; but the sampler is not currently resumable, and a clean rebuild keeps every pair drawn from
+one policy snapshot, which is the property the on-policy design in
+<a href="mask.html">mask.html</a>&nbsp;&sect;9 exists to protect.</p>
+
+<h2 id="s9"><span class="step-badge">9</span>Risks &amp; falsification checks</h2>
+
+<div class="risk">
+<b>Over-correction: R and F fall back.</b> The most likely failure. ~840 pairs saying &ldquo;do not ask
+here&rdquo; could push the model back toward SFT's confident-wrong behaviour on genuinely masked rows.<br>
+<b>Check:</b> <code>repair@0</code> in the eval histogram. SFT 59, DPO 7. If the new run comes back above
+~40, <code>REPEAT_SHARE</code> is too low (the targeted-question negatives are teaching &ldquo;questions
+are bad&rdquo; rather than &ldquo;questions are bad <em>here</em>&rdquo;) &mdash; raise it toward 1.00,
+which shifts the punishment onto the repeat phrasing alone.
+</div>
+
+<div class="risk">
+<b>The negatives are off-policy, so the pairs may be too easy to teach anything.</b> The <code>rejected</code>
+side is dataset text, not a sample; if its reference log-prob is already far below <code>chosen</code>,
+the pair sits in the saturated tail of <code>logsigmoid</code> and contributes almost no gradient &mdash;
+840 pairs that look right in the file and do nothing in the run.<br>
+<b>Check:</b> the <code>margin</code> and <code>reward_acc</code> the trainer already logs. If
+<code>reward_acc</code> sits at 1.0 from step 0 with a large positive margin, the held-firm pairs are
+saturated. The recorded <code>ref_logp_chosen</code> / <code>ref_logp_rejected</code> in the JSONL let you
+see this <em>before</em> training: histogram their difference for
+<code>pair_source == "held-firm"</code> and compare against <code>sampled</code>.
+</div>
+
+<div class="risk">
+<b>Template memorisation.</b> Even a 90-phrasing pool is small next to 840 pairs, and the same strings
+appear as <code>chosen</code> on repeat rows. The model could learn to down-weight those specific
+sentences rather than the behaviour, which would look like a fix on C and quietly damage
+<code>repeat</code>.<br>
+<b>Check:</b> <code>repeat@1</code> in the eval (SFT 361, DPO 393). A collapse here means the pool is
+being memorised as bad text; if so, the negatives need to be sampled from the policy on the
+<em>utterance's own</em> repair/repeat audio rather than lifted from targets.
+</div>
+
+<div class="risk">
+<b>The whole diagnosis could be an artefact of the judge.</b> All numbers here come from one
+<code>Qwen3.8-27B</code> judge with 0 reported failures, and the C rubric scores a clarifying question on
+an answer row as 0 by construction.<br>
+<b>Check:</b> the 65 regressions are all questions on commands that are demonstrably actionable (&sect;3),
+and the 8&nbsp;&rarr;&nbsp;63 repeat-phrasing count is a string match, not a judgement. Both hold without
+the judge. This risk is low but should be stated in the paper rather than assumed away.
+</div>
+
+<h2 id="s10"><span class="step-badge">10</span>What was considered and not chosen</h2>
+
+<details>
+<summary>Drop the <code>repeat</code> kind from the DPO pair set</summary>
+<p>Train on <code>answer</code>+<code>repair</code> only (958 &rarr; 842 pairs), one filter in
+<code>dpo_qwen.py</code>, no re-sampling. The repeat pairs bought +32 rows on a kind SFT already had at
+90% and are the origin of the leaked phrasing. <b>Cheapest experiment by far</b> (~11 min train + one
+eval) and it composes cleanly with the chosen fix &mdash; &sect;7 is an argument for trying it
+<em>after</em>. Not chosen first because it treats a symptom: the ~840 unanchored answer rows stay
+unanchored, so the repair pairs alone can re-create the drift.</p>
+</details>
+
+<details>
+<summary>Add an NLL anchor on <code>chosen</code> (RPO)</summary>
+<p><code>loss += alpha * -log p(chosen)/ntok</code>, <code>alpha</code> ~0.5&ndash;1.0, about six lines in
+<code>compute_loss</code> using logits that are already computed. It attacks Cause 3 directly: DPO sees
+only a difference, so the NLL term makes the chosen response's <em>absolute</em> likelihood a target too.
+The standard fix for this drift and it composes with the chosen one. Not chosen first because it does
+nothing about Cause 1 &mdash; it can only anchor rows that are <em>in</em> the pair set, and ~840 answer
+rows are not.</p>
+</details>
+
+<details>
+<summary>Evaluate the earlier checkpoints instead</summary>
+<p><code>checkpoint-69</code> / <code>-138</code> / <code>-207</code> all exist under
+<code>checkpoints/Qwen2.5-Omni-3B-mask-v2-dpo/</code>, and the margin grows monotonically, so C very
+likely degrades along a frontier. Two eval runs, zero training. Worth doing as a free diagnostic &mdash;
+it tells you whether C-vs-R is a smooth trade (pick a point and move on) or a cliff (the pair set is
+wrong). But it buys a trade-off point rather than removing the trade-off, so it is not a fix.</p>
+</details>
+
+<footer>
+Numbers from <code>results/mask_results_Qwen2.5-Omni-3B{,-mask-v2-sft,-mask-v2-dpo}_mask-v2.jsonl</code>,
+<code>results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-sft.jsonl</code> and
+<code>logs/mask_all_39871393.log</code>. Dataset <code>keylazy/slurp-mask-v2</code>, judge
+<code>Qwen/Qwen3.8-27B</code>. Plan only &mdash; no code in this document has been applied.
+</footer>
+
+</body>
+</html>

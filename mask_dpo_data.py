@@ -21,9 +21,7 @@ Writes a JSONL keyed by the dataset's row `id`; dpo_qwen.py joins it back onto
 the audio. Deliberately not a pushed dataset: the audio is already on the Hub
 under --ds-id and re-uploading it per DPO run buys nothing.
 
-  python mask_dpo_data.py --ds-id keylazy/slurp-mask-v1 \
-      --adapter-path checkpoints/Qwen2.5-Omni-3B-mask-sft \
-      --judge-base-url http://g3061:8000/v1 --judge-model Qwen/Qwen3.8-27B
+  python mask_dpo_data.py --config configs/mask-crf.yaml
 """
 
 import argparse
@@ -32,6 +30,7 @@ import os
 import tempfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import soundfile as sf
 import torch
@@ -40,7 +39,13 @@ from tqdm import tqdm
 
 from mask_eval_qwen import JUDGE_BY_KIND, get_audio, judge_user, make_judge
 from prompts import QWEN25_SYSTEM_PROMPT, task_prompt
-from util import detect_model_family, load_model, seq_logprobs
+from util import (
+    detect_model_family,
+    load_config,
+    load_model,
+    resolve_judge,
+    seq_logprobs,
+)
 
 AUDIO_SAMPLING_RATE = 16000
 MAX_AUDIO_SECONDS = 30
@@ -50,14 +55,33 @@ MIN_MARGIN = 0.5
 JUDGE_WORKERS = 8
 
 
+@dataclass
+class Config:
+    """The track YAML's key names, shared with the other four mask stages --
+    hence `omni_path` for the base model and `sft_adapter` for the checkpoint
+    being sampled from, which is dpo_qwen.py's key for the same path. `prefs`
+    is spelled here too: this stage writes the file that stage names."""
+
+    omni_path: str = "Qwen/Qwen2.5-Omni-3B"
+    ds_id: str = "keylazy/slurp-mask-v1"
+    train_split: str = "train"
+    sft_adapter: str | None = None
+    prefs: str | None = None
+    dpo_samples: int = 8
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--config",
+        help="Track YAML (configs/*.yaml). Its keys become parser defaults, so "
+        "any flag also given on the command line still wins.",
+    )
     ap.add_argument("--ds-id", default="keylazy/slurp-mask-v1")
     ap.add_argument("--split", default="train")
     ap.add_argument("--model-path", default="Qwen/Qwen2.5-Omni-3B")
     ap.add_argument(
         "--adapter-path",
-        required=True,
         help="The SFT checkpoint to sample from. It is also the DPO reference "
         "model, which is why the reference log-probs are computed here.",
     )
@@ -71,8 +95,17 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--max-new-tokens", type=int, default=256)
     ap.add_argument("--num-rows", type=int, default=-1)
-    ap.add_argument("--judge-model", default="gpt-4o")
-    ap.add_argument("--judge-base-url", default="openai")
+    ap.add_argument(
+        "--judge-model",
+        help="from vllm --served-model-name; from openai, gpt-4o. Left unset "
+        "on a vLLM judge, the served name is read off the server.",
+    )
+    ap.add_argument(
+        "--judge-base-url",
+        default="auto",
+        help="'auto' reads the judge node out of VLLM_HOST_FILE, 'openai' uses "
+        "the OpenAI API, or give a URL like 'http://g3085:8000/v1'.",
+    )
     ap.add_argument("--judge-max-tokens", type=int, default=4096)
     ap.add_argument(
         "--plain-prompt",
@@ -80,7 +113,32 @@ def main():
         help="Sample under TASK_PROMPT. Must match how the adapter was trained "
         "and how it will be evaluated, or the pairs teach the wrong conditional.",
     )
+    # --config has to be read before parse_args, because the file supplies
+    # defaults rather than overrides -- a flag on the command line has to stay
+    # able to beat it, and after parse_args an explicit flag is
+    # indistinguishable from the default it happens to equal.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    config_path = pre.parse_known_args()[0].config
+    if config_path:
+        cfg = load_config(config_path, Config)
+        print(f"config: {cfg}")
+        ap.set_defaults(
+            model_path=cfg.omni_path,
+            ds_id=cfg.ds_id,
+            split=cfg.train_split,
+            adapter_path=cfg.sft_adapter,
+            out=cfg.prefs,
+            samples=cfg.dpo_samples,
+        )
     args = ap.parse_args()
+    # not required=True: the config supplies it, and argparse checks required
+    # flags before set_defaults has been given a chance to fill them
+    if not args.adapter_path:
+        raise SystemExit("no SFT checkpoint: pass --adapter-path or sft_adapter:")
+
+    # before the omni model is loaded: an unreachable box fails in seconds
+    judge_url, judge_model = resolve_judge(args.judge_base_url, args.judge_model)
 
     family = args.model_family or detect_model_family(args.model_path)
     name = os.path.basename(args.adapter_path.rstrip("/"))
@@ -95,7 +153,7 @@ def main():
 
     model, processor = load_model(args.model_path, family, args.adapter_path)
     judge_fn = make_judge(
-        args.judge_model, base_url=args.judge_base_url, max_tokens=args.judge_max_tokens
+        judge_model, base_url=judge_url, max_tokens=args.judge_max_tokens
     )
     system_prompt = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
     prompt_text = task_prompt(False, args.plain_prompt)

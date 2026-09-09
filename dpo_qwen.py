@@ -24,16 +24,14 @@ pieces sft_qwen.py already has:
 Preference pairs come from mask_dpo_data.py's JSONL and are joined onto the
 dataset's audio by row `id`.
 
-  python dpo_qwen.py --ds-id keylazy/slurp-mask-v1 \
-      --prefs results/mask_prefs_Qwen2.5-Omni-3B-mask-sft.jsonl \
-      --sft-adapter checkpoints/Qwen2.5-Omni-3B-mask-sft \
-      --run-name Qwen2.5-Omni-3B-mask-dpo
+  python dpo_qwen.py --config configs/mask-crf.yaml
 """
 
 import argparse
 import json
 import os
 from collections import Counter
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -48,7 +46,7 @@ from sft_qwen import (
     get_sft_model_cls,
     load_processor,
 )
-from util import detect_model_family, seq_logprobs
+from util import detect_model_family, load_config, seq_logprobs
 
 AUDIO_SAMPLING_RATE = 16000
 
@@ -170,20 +168,42 @@ class DPOTrainer(Trainer):
         super().log(logs, *a, **kw)
 
 
+@dataclass
+class Config:
+    """The track YAML's key names, shared with the other four mask stages. The
+    hyperparameters are spelled dpo_* because sft_qwen.py reads repair_lr and
+    repair_epochs out of the same file: one namespace, one key per flag."""
+
+    omni_path: str = "Qwen/Qwen2.5-Omni-3B"
+    ds_id: str = "keylazy/slurp-mask-v1"
+    train_split: str = "train"
+    # written by mask_dpo_data.py, which spells these two keys the same way
+    prefs: str | None = None
+    sft_adapter: str | None = None
+    dpo_run_name: str | None = None
+    dpo_lr: float = 2e-5
+    dpo_epochs: float = 2.0
+    dpo_beta: float = 1.0
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--config",
+        help="Track YAML (configs/*.yaml). Its keys become parser defaults, so "
+        "any flag also given on the command line still wins.",
+    )
     ap.add_argument("--ds-id", default="keylazy/slurp-mask-v1")
     ap.add_argument("--train-split", default="train")
-    ap.add_argument("--prefs", required=True, help="mask_dpo_data.py JSONL")
+    ap.add_argument("--prefs", help="mask_dpo_data.py JSONL")
     ap.add_argument("--omni-path", default="Qwen/Qwen2.5-Omni-3B")
     ap.add_argument(
         "--sft-adapter",
-        required=True,
         help="Loaded trainable and tuned in place, so the policy starts at "
         "the SFT model and the saved adapter loads onto the plain base.",
     )
     ap.add_argument("--model-family", default=None, choices=["qwen2.5", "qwen3"])
-    ap.add_argument("--run-name", required=True)
+    ap.add_argument("--run-name")
     # an order below the SFT's 2e-4. 5e-6 (the full-model DPO figure) is far
     # too small for a rank-16 LoRA: the first run at that LR over 41 steps
     # moved the weights by ~1% of what SFT moved them and scored exactly SFT.
@@ -204,7 +224,37 @@ def main():
     ap.add_argument("--grad-accum", type=int, default=2)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--no-push", action="store_true")
+    # --config has to be read before parse_args, because the file supplies
+    # defaults rather than overrides -- a flag on the command line has to stay
+    # able to beat it, and after parse_args an explicit flag is
+    # indistinguishable from the default it happens to equal.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    config_path = pre.parse_known_args()[0].config
+    if config_path:
+        cfg = load_config(config_path, Config)
+        print(f"config: {cfg}")
+        ap.set_defaults(
+            omni_path=cfg.omni_path,
+            ds_id=cfg.ds_id,
+            train_split=cfg.train_split,
+            prefs=cfg.prefs,
+            sft_adapter=cfg.sft_adapter,
+            run_name=cfg.dpo_run_name,
+            lr=cfg.dpo_lr,
+            epochs=cfg.dpo_epochs,
+            beta=cfg.dpo_beta,
+        )
     args = ap.parse_args()
+    # none of the three is required=True: the config supplies them, and
+    # argparse checks required flags before set_defaults can fill them
+    for flag, val in (
+        ("--prefs", args.prefs),
+        ("--sft-adapter", args.sft_adapter),
+        ("--run-name", args.run_name),
+    ):
+        if not val:
+            raise SystemExit(f"{flag} is unset, by flag and by config")
 
     family = args.model_family or detect_model_family(args.omni_path)
     out = os.path.join(CHECKPOINT_DIR, args.run_name)

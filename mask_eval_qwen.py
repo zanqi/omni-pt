@@ -19,9 +19,8 @@ and last in the file, so results/viz.ipynb reads these runs unchanged; `F`
 sits beside them and a two-kind dataset simply has none, which is what keeps
 the v1 result files readable next to these.
 
-  python mask_eval_qwen.py --dataset keylazy/slurp-mask-v1 \
-      --adapter-path checkpoints/Qwen2.5-Omni-3B-mask-sft \
-      --judge-base-url http://g3061:8000/v1 --judge-model Qwen/Qwen3.8-27B
+  python mask_eval_qwen.py --config configs/mask-crf.yaml \
+      --adapter-path checkpoints/Qwen2.5-Omni-3B-mask-v2-sft
 """
 
 import argparse
@@ -32,6 +31,7 @@ import threading
 import time
 from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import soundfile as sf
 import torch
@@ -45,7 +45,7 @@ from prompts import (
     REPEAT_JUDGE_SYSTEM,
     task_prompt,
 )
-from util import detect_model_family, load_model
+from util import detect_model_family, load_config, load_model, resolve_judge
 
 AUDIO_SAMPLING_RATE = 16000
 KINDS = ("answer", "repair", "repeat")
@@ -245,8 +245,33 @@ def breakdown(bucket_scores):
     return out
 
 
+@dataclass
+class Config:
+    """The track YAML's own key names, which are not this script's older flag
+    names -- the file is shared with mask_data.py, sft_qwen.py, mask_dpo_data.py
+    and dpo_qwen.py, so it spells the dataset `ds_id` and the model
+    `omni_path`. main() maps the pairs onto the parser as defaults, which is
+    what leaves an explicit flag winning over the file. `adapter_path` is
+    deliberately absent: which model a row evaluates is a driver decision
+    (exp/mask-crf.slurm scores base, SFT and DPO off one config), not a
+    property of the track."""
+
+    omni_path: str = "Qwen/Qwen2.5-Omni-3B"
+    ds_id: str = "keylazy/slurp-mask-v1"
+    split: str = "test"
+    num_rows: int = -1
+    # names the result file; two tracks scored the same way otherwise
+    # overwrite each other
+    tag: str = "mask"
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--config",
+        help="Track YAML (configs/*.yaml). Its keys become parser defaults, so "
+        "any flag also given on the command line still wins.",
+    )
     ap.add_argument("--dataset", default="keylazy/slurp-mask-v1")
     ap.add_argument("--split", default="test")
     ap.add_argument("--model-path", default="Qwen/Qwen2.5-Omni-3B")
@@ -272,13 +297,16 @@ def main():
     )
     ap.add_argument("--num-rows", type=int, default=-1)
     ap.add_argument("--max-new-tokens", type=int, default=256)
-    ap.add_argument("--judge-model", default="gpt-4o")
+    ap.add_argument(
+        "--judge-model",
+        help="from vllm --served-model-name; from openai, gpt-4o. Left unset "
+        "on a vLLM judge, the served name is read off the server.",
+    )
     ap.add_argument(
         "--judge-base-url",
-        default="openai",
-        help="'openai' for the API, or a vLLM box's /v1 URL. Take the model "
-        "name from that box's /v1/models rather than trusting the default: "
-        "a mismatch is a 404 on every row.",
+        default="auto",
+        help="'auto' reads the judge node out of VLLM_HOST_FILE, 'openai' uses "
+        "the OpenAI API, or give a URL like 'http://g3085:8000/v1'.",
     )
     ap.add_argument("--judge-max-tokens", type=int, default=4096)
     ap.add_argument(
@@ -288,7 +316,27 @@ def main():
         "for scoring an adapter trained back when sft_qwen.py still had "
         "--plain-prompt.",
     )
+    # --config has to be read before parse_args, because the file supplies
+    # defaults rather than overrides -- a flag on the command line has to stay
+    # able to beat it, and after parse_args an explicit flag is
+    # indistinguishable from the default it happens to equal.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config")
+    config_path = pre.parse_known_args()[0].config
+    if config_path:
+        cfg = load_config(config_path, Config)
+        print(f"config: {cfg}")
+        ap.set_defaults(
+            model_path=cfg.omni_path,
+            dataset=cfg.ds_id,
+            split=cfg.split,
+            num_rows=cfg.num_rows,
+            tag=cfg.tag,
+        )
     args = ap.parse_args()
+
+    # before the omni model is loaded: an unreachable box fails in seconds
+    judge_url, judge_model = resolve_judge(args.judge_base_url, args.judge_model)
 
     family = args.model_family or detect_model_family(args.model_path)
     # a stack is named after its last adapter -- that is the run being scored
@@ -306,12 +354,12 @@ def main():
     print(
         f"eval {len(ds)} rows from {args.dataset}:{args.split} | model {name} "
         f"({family}) | prompt {'plain' if args.plain_prompt else 'restate'} | "
-        f"judge {args.judge_model} @ {args.judge_base_url}"
+        f"judge {judge_model} @ {judge_url}"
     )
 
     model, processor = load_model(args.model_path, family, args.adapter_path)
     judge_fn = make_judge(
-        args.judge_model, base_url=args.judge_base_url, max_tokens=args.judge_max_tokens
+        judge_model, base_url=judge_url, max_tokens=args.judge_max_tokens
     )
 
     def process_row(row):
@@ -398,8 +446,8 @@ def main():
             "adapter_path": args.adapter_path,
             "dataset": args.dataset,
             "split": args.split,
-            "judge_model": args.judge_model,
-            "judge_base_url": args.judge_base_url,
+            "judge_model": judge_model,
+            "judge_base_url": judge_url,
             "plain_prompt": args.plain_prompt,
             "n": {k: len(scores[k]) for k in KINDS},
             "hist": dict(sorted(hist.items())),

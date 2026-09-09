@@ -67,8 +67,8 @@ built yet.</p>
 <code>mask_dpo_data.py</code> (preference-pair sampler) &middot;
 <code>dpo_qwen.py</code> (DPO trainer) &middot;
 <code>mask_eval_qwen.py</code> (C/R/EAR) &middot;
-<code>exp/mask_data.sh</code>, <code>exp/mask-sft.sh</code>, <code>exp/mask-dpo.sh</code>,
-<code>exp/mask.sh</code> (slurm drivers).<br>
+<code>configs/mask-crf.yaml</code> + <code>exp/mask-crf.slurm</code> (the whole track, one
+config and one driver).<br>
 <b>Hub.</b> dataset <code>keylazy/slurp-mask-v1</code>, adapters
 <code>keylazy/Qwen2.5-Omni-3B-mask-sft</code> and <code>-mask-dpo</code>. The preference pairs stay local
 (see &sect;9).<br>
@@ -443,8 +443,8 @@ omni model is loaded in its <code>__main__</code>, which does not run on import.
 <code>keylazy/</code>&hellip;. LoRA is attached to the <code>Qwen2_5OmniForSFT</code> wrapper so the saved keys
 keep their <code>thinker.</code> prefix &mdash; which is what lets the eval scripts
 <code>PeftModel.from_pretrained</code> + <code>merge_and_unload()</code> them onto a plain
-<code>Qwen2_5OmniForConditionalGeneration</code>. Run it as an <code>exp/mask-sft.sh</code> sbatch alongside
-the existing ones.</p>
+<code>Qwen2_5OmniForConditionalGeneration</code>. It is the second stage of
+<code>exp/mask-crf.slurm</code>, reading the same <code>configs/mask-crf.yaml</code> as the build.</p>
 
 <h2 id="s9"><span class="step-badge">9</span>DPO data</h2>
 
@@ -559,35 +559,32 @@ dpo        --adapter-path checkpoints/Qwen2.5-Omni-3B-mask-dpo</code></pre></li>
 against both (&sect;6) precisely so this is legitimate.</li>
 </ul>
 
-<p><code>exp/mask.sh</code> follows <code>exp/white-cr*.sh</code> exactly,
-including the two habits worth keeping: fail fast if the judge box is unreachable, and <b>read the judge model
-name off <code>/v1/models</code></b> rather than trusting a default &mdash; the box gets re-served with
-different models and a mismatch is a 404 on every row, discovered ~7 minutes in.</p>
+<p>Both habits worth keeping now live in <code>util.resolve_judge</code>, called by the eval and by the
+DPO ranker before either loads an omni model: the judge node is read out of <code>VLLM_HOST_FILE</code>
+(<code>--judge-base-url auto</code>, the default), so an unreachable box fails in seconds, and <b>the judge
+model name is read off <code>/v1/models</code></b> rather than trusting a default &mdash; the box gets
+re-served with different models and a mismatch is a 404 on every row, discovered ~7 minutes in.</p>
 
 <h2 id="s12"><span class="step-badge">12</span>Run order</h2>
 
-<pre><code># 0. judge/target box must be up; it serves both the builder and the evals
+<pre><code># 0. judge/target box must be up; it serves the builder, the ranker and the evals
 sbatch /gscratch/sciencehub/zanqil/vllm_judge/vllm_judge.slurm
 
-# 1. build (qwen3omni env: dev transformers for the aligner + whisper)
-sbatch exp/mask_data.sh         # -> keylazy/slurp-mask-v1
+# 1. the whole track: build (qwen3omni, for the aligner + whisper), SFT,
+#    preference pairs, DPO, then base/SFT/DPO evals -- five stages, one job,
+#    all of them reading configs/mask-crf.yaml
+sbatch exp/mask-crf.slurm       # or ./exp/mask-crf.slurm in a shell you hold
 
-# 2. SFT (qwen25omni)
-sbatch exp/mask-sft.sh          # -> checkpoints/Qwen2.5-Omni-3B-mask-sft
+# to redo one stage, comment out the others' lines (or paste the one you want
+# into a shell after the matching conda activate):
+python -u mask_data.py      --config configs/mask-crf.yaml
+python -u sft_qwen.py       --config configs/mask-crf.yaml
+python -u mask_dpo_data.py  --config configs/mask-crf.yaml
+python -u dpo_qwen.py       --config configs/mask-crf.yaml
+python -u mask_eval_qwen.py --config configs/mask-crf.yaml [--adapter-path ...]</code></pre>
 
-# 3. eval stage 1 -- base + SFT
-STAGES="base sft" sbatch exp/mask.sh   # -> results/mask_results_*_mask.jsonl
-
-# 4-5. preference pairs from the SFT checkpoint, then DPO on them. One job:
-#      they share a GPU and the second is worthless without the first.
-sbatch exp/mask-dpo.sh          # -> results/mask_prefs_*.jsonl
-                                #    checkpoints/Qwen2.5-Omni-3B-mask-dpo
-
-# 6. eval stage 2 -- the same sweep, now with the DPO adapter
-sbatch exp/mask.sh</code></pre>
-
-<p>Steps 1&ndash;3 are the checkpoint worth stopping at: if SFT does not beat base on R without losing C,
-DPO has nothing to correct and the answer is upstream, in &sect;2 or &sect;4.</p>
+<p>Build&ndash;SFT&ndash;eval is the checkpoint worth stopping at: if SFT does not beat base on R without
+losing C, DPO has nothing to correct and the answer is upstream, in &sect;2 or &sect;4.</p>
 
 <h2 id="s13"><span class="step-badge">13</span>Risks &amp; checks</h2>
 
