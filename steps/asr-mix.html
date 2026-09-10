@@ -1,0 +1,877 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>asr1 &amp; asr4 &mdash; witness count &times; ASR mixing</title>
+<style>
+  :root{
+    color-scheme: light dark;
+    --bg:#fbfbfc; --fg:#16171b; --muted:#5f6169; --rule:#e2e3e8;
+    --code-bg:#f2f3f6; --card:#fff; --accent:#0b6cff; --accent2:#8a3ffc;
+    --ok:#0f7b3f; --bad:#c62828; --warn:#a35c00;
+    --add-bg:#e8f7ec; --add-fg:#0f7b3f; --del-bg:#fdecec; --del-fg:#c62828;
+    --a1:#0b6cff; --a4:#8a3ffc;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{--bg:#101116; --fg:#e9eaee; --muted:#9b9da6; --rule:#2c2e36;
+      --code-bg:#191b21; --card:#161820; --accent:#63a4ff; --accent2:#b794ff;
+      --ok:#57d081; --bad:#ff7b72; --warn:#e0a458;
+      --add-bg:#12291a; --add-fg:#57d081; --del-bg:#2a1414; --del-fg:#ff7b72;
+      --a1:#63a4ff; --a4:#b794ff;}
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);margin:0;
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:2rem 1.4rem 6rem}
+  h1{font-size:1.8rem;margin:.2rem 0 .3rem;letter-spacing:-.01em}
+  h2{font-size:1.22rem;margin:3rem 0 .8rem;padding-bottom:.35rem;border-bottom:1px solid var(--rule)}
+  h3{font-size:1rem;margin:1.7rem 0 .5rem;color:var(--accent2)}
+  p{margin:.7rem 0}
+  a{color:var(--accent)}
+  .sub{color:var(--muted);margin-top:0;font-size:1.02rem}
+  code,pre,kbd{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  code{background:var(--code-bg);padding:.1em .35em;border-radius:4px;font-size:.86em}
+  pre{background:var(--code-bg);border:1px solid var(--rule);border-radius:9px;
+    padding:.85rem 1rem;overflow-x:auto;font-size:.8rem;line-height:1.52;margin:.6rem 0}
+  pre code{background:none;padding:0;font-size:1em}
+  .cb{position:relative}
+  .cb .copy{position:absolute;top:.45rem;right:.45rem;font-size:.68rem;
+    background:var(--card);color:var(--muted);border:1px solid var(--rule);
+    border-radius:5px;padding:.18rem .45rem;cursor:pointer;opacity:.65}
+  .cb:hover .copy{opacity:1}
+  .cb .copy.done{color:var(--ok);border-color:var(--ok)}
+  table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:.88rem}
+  th,td{border:1px solid var(--rule);padding:.42rem .6rem;text-align:left;vertical-align:top}
+  th{background:var(--code-bg);font-weight:600}
+  .card{background:var(--card);border:1px solid var(--rule);border-radius:11px;
+    padding:.95rem 1.15rem;margin:1.1rem 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:.8rem}
+  @media (max-width:860px){.grid2,.grid3{grid-template-columns:1fr}}
+  .tag{display:inline-block;font-size:.68rem;letter-spacing:.04em;text-transform:uppercase;
+    padding:.14rem .45rem;border-radius:5px;border:1px solid var(--rule);color:var(--muted);
+    background:var(--code-bg);vertical-align:middle}
+  .tag.new{color:var(--ok);border-color:var(--ok)}
+  .tag.edit{color:var(--warn);border-color:var(--warn)}
+  .tag.gate{color:var(--bad);border-color:var(--bad)}
+  .diff{display:grid;grid-template-columns:1fr 1fr;gap:.7rem;margin:.7rem 0}
+  @media (max-width:860px){.diff{grid-template-columns:1fr}}
+  .diff .pane{border:1px solid var(--rule);border-radius:9px;overflow:hidden}
+  .diff .hd{font-size:.72rem;padding:.3rem .6rem;background:var(--code-bg);
+    border-bottom:1px solid var(--rule);color:var(--muted);font-family:ui-monospace,monospace}
+  .diff .pane.before .hd{color:var(--del-fg)}
+  .diff .pane.after  .hd{color:var(--add-fg)}
+  .diff pre{margin:0;border:0;border-radius:0;background:transparent}
+  ins{background:var(--add-bg);color:var(--add-fg);text-decoration:none;display:block}
+  del{background:var(--del-bg);color:var(--del-fg);text-decoration:none;display:block}
+  details{border:1px solid var(--rule);border-radius:9px;padding:.55rem .85rem;margin:.8rem 0;background:var(--card)}
+  details>summary{cursor:pointer;font-size:.9rem;color:var(--accent2);font-weight:600}
+  details[open]>summary{margin-bottom:.5rem}
+  .why{border-left:3px solid var(--accent2);padding-left:.85rem;color:var(--muted);font-size:.92rem;margin:.7rem 0}
+  .risk{border-left:3px solid var(--bad);padding-left:.85rem;font-size:.92rem;margin:.7rem 0}
+  ol.steps{list-style:none;padding:0;margin:0}
+  ol.steps li{display:flex;gap:.6rem;align-items:flex-start;padding:.32rem 0;
+    border-bottom:1px dashed var(--rule);font-size:.9rem}
+  ol.steps li:last-child{border-bottom:0}
+  ol.steps input{margin-top:.35rem;width:1.05em;height:1.05em;flex:0 0 auto;accent-color:var(--accent)}
+  ol.steps label{cursor:pointer}
+  ol.steps li.done label{opacity:.45;text-decoration:line-through}
+  .chk-wrap{position:sticky;top:0;z-index:5;background:var(--bg);padding-top:.5rem}
+  .bar{height:5px;background:var(--rule);border-radius:99px;overflow:hidden;margin:.4rem 0 .1rem}
+  .bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+  .flow{width:100%;height:auto}
+  .flow text{font:11px ui-monospace,monospace;fill:currentColor}
+  .flow .lbl{font:10px -apple-system,sans-serif;fill:var(--muted)}
+  footer{margin-top:4rem;border-top:1px solid var(--rule);padding-top:1rem;color:var(--muted);font-size:.85rem}
+  .nav{display:flex;gap:.8rem;flex-wrap:wrap;font-size:.85rem;margin:.8rem 0 0}
+  .nav a,.nav button{padding:.25rem .6rem;border:1px solid var(--rule);border-radius:7px;
+    text-decoration:none;background:var(--card);color:var(--accent);font-size:.85rem;cursor:pointer}
+  /* --- the two arms, colour-coded everywhere they appear --- */
+  .a1{color:var(--a1);font-weight:600}
+  .a4{color:var(--a4);font-weight:600}
+  .arm{border-top:3px solid var(--rule)}
+  .arm.one{border-top-color:var(--a1)}
+  .arm.four{border-top-color:var(--a4)}
+  /* --- budget calculator --- */
+  .calc{display:grid;grid-template-columns:300px 1fr;gap:1.3rem}
+  @media (max-width:860px){.calc{grid-template-columns:1fr}}
+  .ctl{margin:.55rem 0}
+  .ctl label{display:flex;justify-content:space-between;font-size:.83rem;color:var(--muted)}
+  .ctl label b{color:var(--fg);font-family:ui-monospace,monospace}
+  .ctl input[type=range]{width:100%;accent-color:var(--accent)}
+  .seg{display:flex;gap:.4rem;margin:.2rem 0 .9rem}
+  .seg button{flex:1;padding:.3rem;border:1px solid var(--rule);background:var(--card);
+    color:var(--muted);border-radius:7px;cursor:pointer;font-size:.82rem}
+  .seg button.on{border-color:var(--accent);color:var(--accent);font-weight:600}
+  .out{display:grid;grid-template-columns:repeat(2,1fr);gap:.7rem}
+  .out .m{background:var(--card);border:1px solid var(--rule);border-radius:9px;padding:.6rem .8rem}
+  .out .m .k{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .out .m .v{font-size:1.35rem;font-family:ui-monospace,monospace;line-height:1.3}
+  .meter{height:22px;border:1px solid var(--rule);border-radius:7px;overflow:hidden;
+    background:var(--code-bg);position:relative;margin:.5rem 0 .2rem}
+  .meter i{display:block;height:100%;background:var(--ok);transition:width .15s,background .15s}
+  .meter span{position:absolute;inset:0;display:flex;align-items:center;
+    justify-content:center;font-size:.75rem;font-family:ui-monospace,monospace}
+  .verdict{font-size:.86rem;margin-top:.5rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1><span class="a1">asr1</span> &amp; <span class="a4">asr4</span> &mdash; one labeler, two witness counts, ASR mixed into the SFT</h1>
+<p class="sub">Both experiments label with the <em>same</em> fine-tuned witness,
+<code>keylazy/Qwen2.5-Omni-3B-asr-sft</code>, and differ only in how many hypotheses that witness
+returns: <span class="a1">asr1</span> reads one transcript, <span class="a4">asr4</span> intersects four
+beams. Both then depart from the <a href="ft-asr.html">ft-asr track</a> in one shared way &mdash; the
+repair SFT mixes in <code>keylazy/slurp-asr-bab-v1</code> 1:1, so the trained model ends up hearing roughly
+what the labeler heard, which is the assumption its labels were resting on all along.</p>
+
+<div class="nav">
+  <a href="#tldr">TL;DR</a>
+  <a href="#premise">Why mix</a>
+  <a href="#budget">Row budget (live)</a>
+  <a href="#files">Files</a>
+  <a href="#checklist">Steps</a>
+  <a href="#read">How to read the result</a>
+  <button id="export">copy plan as text</button>
+</div>
+
+<h2 id="tldr">TL;DR</h2>
+<div class="card">
+<table style="margin:0">
+<tr><th style="width:14%"></th><th class="arm one">asr1</th><th class="arm four">asr4</th></tr>
+<tr><td><b>Labeler</b></td><td colspan="2" style="text-align:center">
+  <code>checkpoints/Qwen2.5-Omni-3B-asr-sft</code> &mdash; identical, the one thing held fixed across the pair</td></tr>
+<tr><td><b>Witnesses</b></td><td>1 transcript, greedy</td><td>4 beams, a piece is lost only if every beam missed it</td></tr>
+<tr><td><b>Track flag</b></td><td><code>--sent-1-asr</code> <span class="tag edit">needs a guard fix</span></td><td><code>--sent-4</code></td></tr>
+<tr><td><b>Dataset</b></td><td><code>keylazy/slurp-bab-Qwen2.5-Omni-3B-asr1-v1</code></td>
+    <td><code>keylazy/slurp-bab-Qwen2.5-Omni-3B-asr4-v1</code></td></tr>
+<tr><td><b>Rows</b></td><td colspan="2" style="text-align:center">
+  2,000 triplets + 2,000 extra answers = <b>8,000</b> clarification rows, mixed 1:1 with all <b>8,000</b> ASR rows</td></tr>
+<tr><td><b>Adapter</b></td><td><code>Qwen2.5-Omni-3B-bab-asr1-sft</code></td><td><code>Qwen2.5-Omni-3B-bab-asr4-sft</code></td></tr>
+<tr><td><b>Build cost</b></td><td>~16 h on one L40S</td><td>~26 h (beam search is 1.75&times; the per-triplet time)</td></tr>
+<tr><td><b>Baseline it moves against</b></td>
+    <td><a href="../results/bab_Qwen2.5-Omni-3B-bab-sent1asr-sft_sent1asr.jsonl">sent1asr</a>
+        EAR <b>0.591</b> <span class="lbl">(C .83 / R .40 / F .73)</span></td>
+    <td><a href="../results/bab_results_Qwen2.5-Omni-3B-bab-sent4ft-sft_sent4-ftasr.jsonl">sent4-ftasr</a>
+        EAR <b>0.515</b> <span class="lbl">(C .65 / R .345 / F .72)</span></td></tr>
+</table>
+</div>
+
+<div class="risk"><b>The pair is a clean ablation of each other; neither is a clean ablation of its
+baseline.</b> <span class="a1">asr1</span> vs <span class="a4">asr4</span> differ in exactly one variable
+(<code>n_best</code>), because everything else in the two YAMLs is byte-identical. But each vs. its no-mix
+baseline moves <em>three</em> things at once: the mix, the row count (4k&rarr;8k), and &mdash; for asr1 only
+&mdash; the witness (base&rarr;fine-tuned). If the mix's own effect has to be named, add the third arm in
+<a href="#read">&sect;how to read</a>: the same 8k dataset trained without the mix.</div>
+
+<h2 id="premise">Why mix ASR rows in at all</h2>
+<p>Every sent-track label is a claim about <em>hearing</em>: this key piece did not survive the noise, so
+the model cannot be expected to act on it and should ask. The claim is measured on the labeler and then
+imposed on a different model &mdash; the base omni weights that the repair LoRA starts from. If those two
+models hear differently, half the training signal is a lie: rows where the labeler lost a piece the student
+would have caught (teaching it to ask about something it heard perfectly well), and rows where the labeler
+caught a piece the student loses (teaching it to answer confidently while deaf).</p>
+<p>Mixing <code>keylazy/slurp-asr-bab-v1</code> in 1:1 makes the student train on the labeler's own
+objective, on the labeler's own data, at the same 8K scale. It does not make the two models identical
+&mdash; but it turns &ldquo;trust the labeler's ears&rdquo; from an assumption into something with a
+measurable proxy, which is why <a href="#s7">step 7</a> re-runs
+<a href="../asr_eval_qwen.py">asr_eval_qwen.py</a> on the finished mixed adapter and reads its WER against
+the ASR LoRA's. That number is the premise, reported rather than assumed.</p>
+
+<div class="why"><b>The mix is leakage-free by construction.</b> <code>asr_data.py</code> builds from SLURP
+<code>devel</code>; <code>babble_data.py</code> builds from <code>train</code> and evaluates on
+<code>test</code>. The two halves of the mixed dataset share no sentence, and neither shares one with the
+eval split &mdash; the <a href="ft-asr.html#leak">ft-asr step-0 preflight</a> is what established that, and
+nothing here changes the splits.</div>
+
+<h2 id="pipeline">What moves, and where</h2>
+<p>Two boxes change against the ft-asr track. Everything else &mdash; prompts, SNR bands, seeds, the
+labeler's two-stage rubric, the judge, the metric &mdash; is the same file it was.</p>
+
+<svg class="flow" viewBox="0 0 1120 330" role="img" aria-label="ft-asr versus asr1/asr4 pipeline">
+  <style>
+    .bx{fill:var(--card);stroke:var(--rule);stroke-width:1.4;rx:8}
+    .hot{stroke:var(--bad);stroke-width:2}
+    .one{stroke:var(--a1);stroke-width:2}
+    .four{stroke:var(--a4);stroke-width:2}
+    .ar{stroke:var(--muted);stroke-width:1.3;fill:none;marker-end:url(#a)}
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L8 4 L0 8 z" fill="var(--muted)"/></marker>
+  </defs>
+
+  <rect class="bx" x="20" y="30" width="150" height="40"/><text x="34" y="55">SLURP devel</text>
+  <path class="ar" d="M95 72 V 96"/>
+  <rect class="bx" x="20" y="98" width="150" height="52"/>
+  <text x="34" y="120">asr_data.py</text><text x="34" y="136" class="lbl">8,000 rows, 0-20 dB</text>
+  <path class="ar" d="M95 152 V 176"/>
+  <rect class="bx" x="20" y="178" width="150" height="52"/>
+  <text x="34" y="200">ASR LoRA</text><text x="34" y="216" class="lbl">already trained</text>
+
+  <path class="ar" d="M172 204 H 300"/>
+  <text x="186" y="196" class="lbl">the labeler, unchanged</text>
+  <path class="ar" d="M95 232 V 268 H 700"/>
+  <text x="200" y="284" class="lbl">and now also 8,000 training rows &mdash; the mix</text>
+
+  <rect class="bx" x="330" y="30" width="170" height="40"/><text x="344" y="55">SLURP train</text>
+  <path class="ar" d="M415 72 V 176"/>
+  <rect class="bx hot" x="330" y="178" width="170" height="52"/>
+  <text x="344" y="200">ASR pass</text>
+  <text x="344" y="216" class="lbl">n_best = 1 or 4</text>
+
+  <path class="ar" d="M502 204 H 560"/>
+  <rect class="bx" x="562" y="178" width="150" height="52"/>
+  <text x="576" y="200">sent labeler</text><text x="576" y="216" class="lbl">unchanged</text>
+  <path class="ar" d="M637 176 V 96"/>
+  <rect class="bx" x="562" y="42" width="150" height="52"/>
+  <text x="576" y="64">8,000 rows</text><text x="576" y="80" class="lbl">asr1-v1 / asr4-v1</text>
+
+  <path class="ar" d="M714 68 H 760 V 268 H 700" fill="none"/>
+  <rect class="bx hot" x="700" y="250" width="180" height="52"/>
+  <text x="714" y="272">sft_qwen.py</text><text x="714" y="288" class="lbl">16,000 rows, 2 prompts</text>
+  <path class="ar" d="M882 276 H 930"/>
+  <rect class="bx" x="932" y="250" width="170" height="52"/>
+  <text x="946" y="272">repair adapter</text><text x="946" y="288" class="lbl">EAR + WER parity</text>
+
+  <rect class="bx" x="900" y="30" width="200" height="120" fill="none"/>
+  <text x="914" y="52">held fixed vs ft-asr</text>
+  <text x="914" y="72" class="lbl">&bull; the ASR LoRA itself</text>
+  <text x="914" y="88" class="lbl">&bull; ASR_PROMPT / TASK_PROMPT</text>
+  <text x="914" y="104" class="lbl">&bull; SNR bands, MAX_PROBES, seeds</text>
+  <text x="914" y="120" class="lbl">&bull; the two-stage sent labeler</text>
+  <text x="914" y="136" class="lbl">&bull; per-kind judges, EAR = 3CRF/(CR+CF+RF)</text>
+</svg>
+
+<h2 id="budget">The row budget &mdash; and why 8,000 is near the ceiling</h2>
+<p>SLURP <code>train</code> ships <b>50,628 recordings</b> of only <b>11,514 distinct prompts</b> &mdash;
+4.4 recordings each, streamed back to back &mdash; and a build claims each <code>slurp_id</code> once. The
+ceiling is <b>distinct sentences</b>, not recordings:</p>
+<div class="card" style="font-family:ui-monospace,monospace;font-size:.85rem">
+11,514 distinct slurp_ids in train<br>
+&minus;&nbsp;&nbsp;1,383 &nbsp;sentences under 4 words &nbsp;<span class="lbl">(build_triplets' filter)</span><br>
+&minus;&nbsp;&nbsp;1,000 &nbsp;ids already spent on <code>keylazy/slurp-ear-sft</code>
+  <span class="lbl">(1,050 ids there, 1,000 of them in train)</span><br>
+<b>=&nbsp;&nbsp;9,131 &nbsp;eligible sentences &mdash; the entire budget, for both arms, forever</b>
+</div>
+
+<div class="card"><b>Where these numbers come from</b> &mdash; all four are measured, not guessed.
+<table style="margin:.6rem 0 0">
+<tr><th>Quantity</th><th>Source</th><th>asr1 rate<br><span class="lbl">(sent-1-asr build)</span></th>
+    <th>asr4 rate<br><span class="lbl">(sent-4 + ft-asr build)</span></th></tr>
+<tr><td>distinct eligible sentences in <code>train</code></td>
+    <td>Counted directly off the Hub (streamed <code>slurp_id</code> + <code>sentence</code> columns), and
+        corroborated by <a href="../logs/sent2_v1_e2e_38582187.log">sent2_v1_e2e</a>, the only run that ever
+        reached the end of the split: <code>scanned=50628, seen/short=41496</code> &rarr; 9,132 claimed.</td>
+    <td colspan="2" style="text-align:center"><b>9,131</b></td></tr>
+<tr><td>triplet yield <span class="lbl">(3 rows per utterance)</span></td>
+    <td><a href="../logs/bab_sent1asr_39873693.log">bab_sent1asr</a> /
+        <a href="../logs/sent4ft_data_39437266.log">sent4ft_data</a>, final pbar</td>
+    <td>1000 / ~2,005 = <b>50%</b></td><td>1000 / ~2,566 = <b>39%</b></td></tr>
+<tr><td>extra-answer yield <span class="lbl">(1 row per utterance)</span></td><td>same two logs</td>
+    <td>1000 / ~1,266 = <b>79%</b></td><td>1000 / ~1,080 = <b>93%</b></td></tr>
+<tr><td>wall clock</td><td>same two logs</td>
+    <td>24.9 s/triplet, 4.0 s/answer</td><td>43.6 s/triplet, 3.8 s/answer</td></tr>
+</table>
+</div>
+
+<p>Move the sliders. The meter is the fraction of <code>train</code>'s distinct sentences the build would
+consume &mdash; the one resource there is no more of.</p>
+
+<div class="card calc">
+  <div>
+    <div class="seg" id="seg">
+      <button data-arm="one" class="on">asr1 &middot; 1 witness</button>
+      <button data-arm="four">asr4 &middot; 4 beams</button>
+    </div>
+    <div class="ctl"><label for="nt">n_train <span class="lbl">(triplets)</span> <b id="ntv">2000</b></label>
+      <input type="range" id="nt" min="0" max="4000" step="100" value="2000"></div>
+    <div class="ctl"><label for="na">n_extra_ans <span class="lbl">(answer-only rows)</span> <b id="nav">2000</b></label>
+      <input type="range" id="na" min="0" max="4000" step="100" value="2000"></div>
+    <div class="ctl"><label for="ep">epochs <b id="epv">3</b></label>
+      <input type="range" id="ep" min="1" max="5" step="1" value="3"></div>
+    <p class="lbl" style="font-size:.78rem;color:var(--muted)">Presets:
+      <a href="#budget" data-p="2000,2000">the plan (8k)</a> &middot;
+      <a href="#budget" data-p="1000,1000">ft-asr shape (4k)</a> &middot;
+      <a href="#budget" data-p="4000,0">all-triplets</a></p>
+  </div>
+  <div>
+    <div class="out">
+      <div class="m"><div class="k">clarification rows</div><div class="v" id="oRows">8,000</div></div>
+      <div class="m"><div class="k">ASR rows mixed 1:1</div><div class="v" id="oMix">8,000</div></div>
+      <div class="m"><div class="k">build wall clock</div><div class="v" id="oHrs">26.3 h</div></div>
+      <div class="m"><div class="k">SFT steps @ bs 16</div><div class="v" id="oSteps">3,000</div></div>
+    </div>
+    <div class="meter"><i id="mBar"></i><span id="mTxt"></span></div>
+    <div class="verdict" id="verdict"></div>
+    <p class="lbl" style="font-size:.78rem;color:var(--muted);margin-top:.6rem">
+      SFT time uses the measured 1.76 s/step
+      (<a href="../logs/asr_sft_39430198.log">asr_sft_39430198.log</a>: 1,000 steps in 29:19), so training
+      the mix is never the constraint &mdash; the build is.</p>
+  </div>
+</div>
+
+<div class="why"><b>Why the answer-only stage is so much cheaper than it looks.</b>
+<code>build_answer_rows</code> re-streams <code>train</code> from the top and skips every id the triplet
+stage already claimed, so its <code>scanned</code> counter is not comparable with the triplet stage's. What
+matters is that it needs only the <em>answer</em> slot to fill, which succeeds on ~79&ndash;93% of the
+utterances it reaches, against ~39&ndash;50% for a full triplet. Rows per sentence spent: <b>~1.0</b> for the
+answer stage, <b>~1.2&ndash;1.5</b> for the triplet stage.</div>
+
+<h2 id="files">File inventory</h2>
+<table>
+<tr><th>File</th><th></th><th>What happens to it</th></tr>
+<tr><td><code>configs/asr1.yaml</code>, <code>configs/asr4.yaml</code></td><td><span class="tag new">new</span></td>
+<td>The two tracks. Identical except for four keys &mdash; see <a href="#s4">step 4</a>, which shows them as a diff for exactly that reason.</td></tr>
+<tr><td><code>exp/asr-mix.slurm</code></td><td><span class="tag new">new</span></td>
+<td>One driver, both arms, selected by <code>CFG</code> in the environment. Same shape as <code>exp/bab-sent1asr.slurm</code>.</td></tr>
+<tr><td><code>babble_data.py</code></td><td><span class="tag edit">edit</span></td>
+<td>One tuple: the <code>--asr-adapter</code> guard has to admit <code>sent-1-asr</code>. <a href="#s1">Step 1</a>.</td></tr>
+<tr><td><code>sft_qwen.py</code></td><td><span class="tag edit">edit</span></td>
+<td>Per-row prompt selection in the collator, and the mix itself. <a href="#s2">Steps 2</a>&ndash;<a href="#s3">3</a>. This is the whole engineering cost of the plan.</td></tr>
+<tr><td><code>asr_data.py</code>, <code>prompts.py</code>, <code>babble_eval_qwen.py</code>, <code>asr_eval_qwen.py</code>, <code>util.py</code></td>
+<td><span class="tag">untouched</span></td>
+<td>Including the ASR LoRA itself &mdash; it is reused as a checkpoint, not retrained.</td></tr>
+</table>
+
+<h2 id="checklist">Progress</h2>
+<p class="muted" style="font-size:.9rem">Ticks are stored in this browser (<code>localStorage</code>).</p>
+<div class="chk-wrap">
+<div class="bar"><i id="pbar"></i></div>
+<div class="muted" style="font-size:.8rem" id="pcount"></div>
+</div>
+<ol class="steps" id="chk">
+  <li><input type="checkbox" id="s1c"><label for="s1c"><b>1</b> &mdash; <code>babble_data.py</code>: let <code>--asr-adapter</code> onto <code>sent-1-asr</code></label></li>
+  <li><input type="checkbox" id="s2c"><label for="s2c"><b>2</b> &mdash; <code>OmniSFTCollator</code>: one prompt pair <em>per row</em>, keyed on <code>kind</code></label></li>
+  <li><input type="checkbox" id="s3c"><label for="s3c"><b>3</b> &mdash; <code>sft_qwen.py</code>: the 1:1 mix + its two config keys</label></li>
+  <li><input type="checkbox" id="s4c"><label for="s4c"><b>4</b> &mdash; <code>configs/asr1.yaml</code> + <code>configs/asr4.yaml</code></label></li>
+  <li><input type="checkbox" id="s5c"><label for="s5c"><b>5</b> &mdash; <span class="tag gate">gate</span> smoke the mixed collator before either build</label></li>
+  <li><input type="checkbox" id="s6c"><label for="s6c"><b>6</b> &mdash; build both datasets (~16 h + ~26 h)</label></li>
+  <li><input type="checkbox" id="s7c"><label for="s7c"><b>7</b> &mdash; SFT both, then the WER parity check</label></li>
+  <li><input type="checkbox" id="s8c"><label for="s8c"><b>8</b> &mdash; eval: per-kind and type judges, base and adapter</label></li>
+  <li><input type="checkbox" id="s9c"><label for="s9c"><b>9</b> &mdash; read the outcome off the matrix</label></li>
+</ol>
+
+<h2 id="s1">Step 1 &mdash; the guard that would block asr1 <span class="tag edit">edit</span></h2>
+<p><a href="../babble_data.py#L1540">babble_data.py:1540</a> refuses <code>--asr-adapter</code> on every
+track but <code>beam</code> and <code>sent-4</code>, on the grounds that the other tracks also generate the
+task response with the same model and an ASR-only adapter cannot write one. That reasoning is right for
+<code>sent-2</code>, <code>tree</code>, <code>two-pass</code> and <code>sent-1-resp</code> &mdash; and wrong
+for <code>sent-1-asr</code>, whose probe branch decodes a transcript and explicitly skips the response pass
+(<code>responses = ["" for _ in paths]</code>, <a href="../babble_data.py#L987">babble_data.py:987</a>).
+asr1 is exactly that track with that adapter, so the guard has to learn the distinction.</p>
+
+<div class="diff">
+<div class="pane before"><div class="hd">babble_data.py:1540 &mdash; before</div>
+<pre><code><del>    if cfg.asr_adapter and TRACK not in ("beam", "sent-4"):</del></code></pre></div>
+<div class="pane after"><div class="hd">&mdash; after</div>
+<pre><code><ins>    # the ASR-only tracks: their probe decodes a transcript and nothing else
+    ASR_ONLY_TRACKS = ("beam", "sent-4", "sent-1-asr")
+    if cfg.asr_adapter and TRACK not in ASR_ONLY_TRACKS:</ins></code></pre></div>
+</div>
+<p>The <code>--asr-adapter</code> help text at <a href="../babble_data.py#L1443">babble_data.py:1443</a>
+names the legal tracks too (&ldquo;Legal only on <code>--beam-label</code> / <code>--sent-4</code>&rdquo;) and
+has to gain the third, or the next person reads the flag and believes the old rule.</p>
+
+<h2 id="s2">Step 2 &mdash; the collator picks a prompt per row, not per run <span class="tag edit">edit</span></h2>
+<p>This is the one change that makes mixing possible at all.
+<a href="../sft_qwen.py#L70">OmniSFTCollator</a> resolves <code>get_prompts(task, family)</code> <em>once</em>
+in <code>__init__</code> and renders every example under it. A mixed batch holds two kinds of row whose
+targets were written for two different prompts: an <code>asr</code> row's target is a verbatim transcript
+that belongs under <code>ASR_PROMPT_QWEN2_5</code>, and an <code>answer</code>/<code>repair</code>/<code>repeat</code>
+row's target is an assistant reply that belongs under the restate <code>TASK_PROMPT</code>. Render either
+under the other's prompt and the row teaches the wrong contract &mdash; and there is no error to notice,
+just a worse adapter.</p>
+<p><code>SlurpDataset.__getitem__</code> already carries <code>kind</code> through
+(<a href="../sft_qwen.py#L54">sft_qwen.py:54</a>), so the row knows which it is. Both renders &mdash; full
+conversation and prompt-only &mdash; must use the same pair, which falls out of passing the kind down to
+<code>_conv</code>.</p>
+
+<div class="diff">
+<div class="pane before"><div class="hd">sft_qwen.py:70 &mdash; before</div>
+<pre><code><del>    def __init__(self, processor, family, task="repair") -> None:
+        self.processor = processor
+        # must match the prompts the dataset's targets were built under, and
+        # the ones babble_eval_qwen.py evaluates with
+        self.system_prompt, self.task_prompt = get_prompts(task, family)
+
+    def _conv(self, audio, answer=None):
+        conv = []
+        if self.system_prompt is not None:
+            ...text: self.system_prompt...
+        ...text: self.task_prompt...</del></code></pre></div>
+<div class="pane after"><div class="hd">&mdash; after</div>
+<pre><code><ins>    def __init__(self, processor, family, task="repair") -> None:
+        self.processor = processor
+        # One pair per row KIND, not one per run. A mixed dataset carries
+        # kind="asr" rows whose target is a verbatim transcript and
+        # answer/repair/repeat rows whose target is an assistant reply; each
+        # has to be rendered under the prompt its target was written for, and
+        # under the one babble_eval_qwen.py / asr_eval_qwen.py will ask with.
+        self.task = task
+        self.pairs = {
+            "asr": get_prompts("asr", family),
+            task: get_prompts(task, family),
+        }
+
+    def _conv(self, kind, audio, answer=None):
+        system_prompt, task_prompt = self.pairs[
+            "asr" if kind == "asr" else self.task
+        ]
+        conv = []
+        if system_prompt is not None:
+            ...text: system_prompt...
+        ...text: task_prompt...</ins></code></pre></div>
+</div>
+
+<div class="cb"><pre><code># __call__ -- both renders take the same kind, or the label diff is meaningless
+        full_convs   = [self._conv(ex["kind"], ex["audio"], ex["target"]) for ex in features]
+        prompt_convs = [self._conv(ex["kind"], ex["audio"], None)         for ex in features]</code></pre></div>
+
+<div class="risk"><b>A <code>task="hr"</code> run now builds two pairs where it used one.</b> Harmless
+&mdash; <code>self.pairs</code> is keyed by the task string, an hr dataset holds no <code>kind="asr"</code>
+rows, and the <code>"asr"</code> entry is simply never read. But if <code>task</code> is ever
+<code>"asr"</code> itself the dict collapses to a single entry, which is also correct and is what
+<code>--task asr</code> should do. Do not &ldquo;fix&rdquo; that collapse.</div>
+
+<h2 id="s3">Step 3 &mdash; the mix <span class="tag edit">edit</span></h2>
+<p>Two config keys and one block in <code>main()</code>. It stays a block rather than a helper: CLAUDE.md's
+rule is that a module-level <code>def</code> earns its place with two call sites or by being a pipeline
+step, and this has exactly one caller.</p>
+
+<h3>3a. The two keys</h3>
+<div class="cb"><pre><code># --- sft_qwen.py, in @dataclass Config, under the --task repair half ---
+    # the ASR rows folded into a repair run's training set. -1 means "as many
+    # as there are clarification rows", i.e. the 1:1 mix; 0 disables it, which
+    # is how the no-mix control arm of this experiment is trained off the SAME
+    # dataset and the same config file.
+    mix_asr_ds_id: str | None = None
+    mix_asr_rows: int = -1</code></pre></div>
+
+<div class="risk"><b>The prefix matters &mdash; <code>mix_asr_*</code>, never <code>asr_mix_*</code>.</b>
+<a href="../sft_qwen.py#L469">sft_qwen.py:469</a> raises <code>SystemExit</code> when a
+<code>--task repair</code> run is handed any <code>asr_*</code> flag, on the theory that it would be read by
+nobody. A field named <code>asr_mix_ds_id</code> is precisely the flag that <em>is</em> read on a repair run,
+and the guard would reject the only run that wants it.</div>
+
+<h3>3b. The block</h3>
+<p>The two datasets do not share a schema, which is the whole reason this is more than one line:</p>
+<div class="grid2">
+<div class="card"><b><code>slurp-asr-bab-v1</code></b><br>
+<code style="font-size:.75rem">id, target, kind, audio, snr_db, sentence, slurp_id, source</code></div>
+<div class="card"><b><code>slurp-bab-*-sent4-ftasr-v1</code></b><br>
+<code style="font-size:.75rem">id, kind, target, audio, snr_db, asr_transcript, omni_response, lost,
+classifier_reason, asr_bucket, resp_bucket, beam_hypotheses, beam_losses, key_pieces, slurp_id, sentence,
+source</code></div>
+</div>
+<p><code>concatenate_datasets</code> requires one schema, so both sides are projected to the three columns
+<code>SlurpDataset</code> actually reads before they meet.</p>
+
+<div class="cb"><pre><code># --- sft_qwen.py main(), right after train_hf = load_ds_split(...) ---
+
+    # --- fold in the ASR rows (the asr1/asr4 tracks) ---
+    # The student trains on the labeler's own objective, so "the labeler's
+    # transcript is what this audio sounded like" stops being an assumption
+    # imported from another model. steps/asr-mix.html#premise.
+    if repair and cfg.mix_asr_ds_id and cfg.mix_asr_rows != 0:
+        asr_hf = load_ds_split(cfg.mix_asr_ds_id, "train")
+        n_mix = len(train_hf) if cfg.mix_asr_rows < 0 else cfg.mix_asr_rows
+        if n_mix > len(asr_hf):
+            print(f"WARNING: asked for {n_mix} asr rows, {cfg.mix_asr_ds_id} has {len(asr_hf)}")
+        # shuffled before the cut so a subsample is not the head of the
+        # stream, which is one contiguous run of SLURP devel
+        asr_hf = asr_hf.shuffle(seed=42).select(range(min(n_mix, len(asr_hf))))
+        # the builders write different columns, and concatenate_datasets needs
+        # one schema -- project both to what SlurpDataset reads
+        cols = ["audio", "target", "kind"]
+        train_hf = concatenate_datasets(
+            [train_hf.select_columns(cols), asr_hf.select_columns(cols)]
+        )
+        print(f"mixed in {len(asr_hf)} asr rows -> {len(train_hf)} train rows")
+
+    train_ds = SlurpDataset(train_hf)</code></pre></div>
+
+<p>Import <code>concatenate_datasets</code> alongside the existing
+<code>from datasets import Audio, load_dataset</code>. No shuffle of the concatenation is needed &mdash;
+<code>Trainer</code> wraps the train dataset in a <code>RandomSampler</code>, so the two halves interleave
+per epoch on their own.</p>
+
+<details><summary>Why not upsample the clarification rows instead of subsampling the ASR rows?</summary>
+<p>At the planned size the question is moot &mdash; 8,000 clarification rows against 8,000 ASR rows is 1:1
+with no resampling on either side, which is the reason <a href="#budget">the budget</a> was set at 8,000
+rather than at whatever the split happens to yield. <code>mix_asr_rows</code> exists for the cases where it
+is not: a 4,000-row rebuild takes <code>-1</code> and gets 4,000 of the 8,000 ASR rows, and the no-mix
+control takes <code>0</code>. Duplicating clarification rows to reach a ratio would change the number of
+gradient steps those rows get, which is the variable the whole experiment is about.</p>
+</details>
+
+<h2 id="s4">Step 4 &mdash; the two configs <span class="tag new">new</span></h2>
+<p>Shown as a diff on purpose: what differs between the arms is the experiment, and it is four keys.</p>
+
+<div class="cb"><pre><code># configs/asr1.yaml -- one witness (the ft ASR LoRA's single transcript),
+# labeled against the key-piece inventory, and trained 1:1 against that same
+# LoRA's training set. See steps/asr-mix.html. Every stage reads this file:
+#
+#   CFG=configs/asr1.yaml sbatch --job-name=asr1 exp/asr-mix.slurm
+#
+# Keys a stage's Config does not declare are dropped SILENTLY -- read the
+# "config: ..." line each script prints on start.
+
+# Model
+omni_path: Qwen/Qwen2.5-Omni-3B
+
+# --- the build (babble_data.py) ---
+label: sent-1-asr
+# the witness is the ft-asr adapter, not the base model: that IS the experiment
+asr_adapter: checkpoints/Qwen2.5-Omni-3B-asr-sft
+ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-asr1-v1
+n_train: 2000        # utterances -> x3 kinds = 6000 train rows
+n_test: 100          # -> a 300-row test split; every eval pass judges all of it
+n_extra_ans: 2000    # -> 8000 train rows total, 1:1 with the 8000 asr rows
+
+# --- the repair LoRA (sft_qwen.py) ---
+repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-asr1-v1
+repair_repo_name: Qwen2.5-Omni-3B-bab-asr1-sft
+repair_epochs: 3
+repair_lr: 2.0e-4
+batch_size: 16
+# the mix. `mix_asr_` and not `asr_mix_`: sft_qwen.py rejects asr_* flags on a
+# repair run, and this one is read by a repair run.
+mix_asr_ds_id: keylazy/slurp-asr-bab-v1
+mix_asr_rows: -1     # -1 = match the clarification row count
+
+# --- the WER parity check (asr_eval_qwen.py, step 7) ---
+asr_ds_id: keylazy/slurp-asr-bab-v1
+n_best: 1            # mirrors this track's witness count
+sample_temp: 0.0
+
+# --- the EAR eval (babble_eval_qwen.py) ---
+judge_mode: per-kind
+kinds: answer,repair,repeat
+num_rows: -1
+tag: asr1</code></pre></div>
+
+<div class="diff">
+<div class="pane before"><div class="hd">configs/asr1.yaml</div>
+<pre><code>label: sent-1-asr
+ds_id: ...-asr1-v1
+repair_ds_id: ...-asr1-v1
+repair_repo_name: ...-bab-asr1-sft
+n_best: 1
+tag: asr1</code></pre></div>
+<div class="pane after"><div class="hd">configs/asr4.yaml &mdash; the same file, six values changed</div>
+<pre><code><ins>label: sent-4
+ds_id: ...-asr4-v1
+repair_ds_id: ...-asr4-v1
+repair_repo_name: ...-bab-asr4-sft
+n_best: 4
+tag: asr4</ins></code></pre></div>
+</div>
+
+<div class="risk"><b><code>n_best</code> is read by <code>asr_eval_qwen.py</code> only &mdash; the build's
+beam count is a module constant.</b> <code>babble_data.ASR_N_BEST = 4</code> /
+<code>ASR_NUM_BEAMS = 4</code> (<a href="../babble_data.py#L126">babble_data.py:126</a>) are not in
+<code>babble_data.Config</code>, so the YAML cannot set them. asr1 gets its single hypothesis from being the
+<code>sent-1-asr</code> <em>track</em> (a plain <code>base_generate_batch</code> call with no
+<code>n_best</code>), not from a config key. Nothing to change &mdash; but do not read the
+<code>n_best: 1</code> line as if it configured the build, and do not "fix" the constant to match, which
+would silently change asr4.</div>
+
+<h3>The driver <span class="tag new">new</span></h3>
+<div class="cb"><pre><code>#!/bin/bash
+
+#SBATCH --job-name=asr_mix
+#SBATCH --account=intelligentsystems
+#SBATCH --partition=gpu-l40s
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=188G
+#SBATCH --gpus=1
+#SBATCH --time=2-00:00:00
+#SBATCH --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt
+#SBATCH --output=logs/asr_mix_%j.log
+#SBATCH --export=all
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=zanqil@uw.edu
+
+# exp/asr-mix.slurm -- one arm of steps/asr-mix.html, chosen by CFG.
+#
+#   CFG=configs/asr1.yaml sbatch --job-name=asr1 exp/asr-mix.slurm
+#   CFG=configs/asr4.yaml sbatch --job-name=asr4 exp/asr-mix.slurm
+#
+# asr4's build is ~26 h and asr1's ~16 h; both fit the 2-day wall with the SFT
+# and the four eval passes after them. To redo one stage, comment the others
+# out and resubmit -- every stage is idempotent except the build, which
+# rmtree's its own audio dir.
+
+source ~/.bashrc
+set -eo pipefail
+conda activate qwen25omni
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+mkdir -p results logs
+
+CFG=${CFG:?set CFG=configs/asr1.yaml or configs/asr4.yaml}
+TAG=$(python -c "import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))['tag'])" "$CFG")
+ADAPTER=checkpoints/Qwen2.5-Omni-3B-bab-${TAG}-sft
+
+python -u babble_data.py      --config "$CFG"
+python -u sft_qwen.py         --config "$CFG"
+
+# the premise check: does the mixed adapter hear like the labeler it trusted?
+python -u asr_eval_qwen.py --config "$CFG" --tag "${TAG}-mixed" --adapter-path "$ADAPTER"
+
+python -u babble_eval_qwen.py --config "$CFG"
+python -u babble_eval_qwen.py --config "$CFG" --adapter-path "$ADAPTER"</code></pre></div>
+
+<h2 id="s5">Step 5 &mdash; <span class="tag gate">gate</span> smoke the mixed collator</h2>
+<p>Before either 16&ndash;26 h build: the mix reads a dataset that already exists, so the collator change can
+be exercised today against <code>sent4-ftasr-v1</code> (4,000 rows) with the ASR rows folded in. What is
+being checked is that <em>both</em> row kinds render under their own prompt and that the supervised span is
+the target and nothing else.</p>
+
+<div class="cb"><pre><code>conda activate qwen25omni
+python -u sft_qwen.py --smoke \
+    --repair-ds-id keylazy/slurp-bab-Qwen2.5-Omni-3B-sent4-ftasr-v1 \
+    --mix-asr-ds-id keylazy/slurp-asr-bab-v1 --mix-asr-rows 8 --batch-size 4</code></pre></div>
+
+<div class="card"><b>What good output looks like.</b> <code>mixed in 8 asr rows -&gt; 4008 train rows</code>,
+then per-example <code>supervised_text</code> lines that are the target alone (no
+<code>&lt;|im_start|&gt;assistant</code> scaffolding, no prompt text), and a finite loss.
+<code>run_smoke</code> reads the head of the dataset, so all four examples are clarification rows &mdash;
+to see an ASR row rendered, pass <code>--mix-asr-rows 8</code> and slice the tail by hand, or trust step 7's
+WER number, which cannot come out right if the ASR rows trained under the wrong prompt.</div>
+
+<div class="risk"><b><code>--smoke</code> is the exception to CLAUDE.md's no-scaffolding rule, not a new
+one.</b> It already exists and costs one batch. Do not grow it, and do not add a "preview" flag to the
+builders &mdash; a short real build with <code>--n-train 5 --no-push</code> is the cheaper check.</div>
+
+<h2 id="s6">Step 6 &mdash; build both datasets</h2>
+<div class="cb"><pre><code># asr1 first: it is 10 h shorter, and it exercises the step-1 guard change
+CFG=configs/asr1.yaml sbatch --job-name=asr1 exp/asr-mix.slurm
+CFG=configs/asr4.yaml sbatch --job-name=asr4 exp/asr-mix.slurm</code></pre></div>
+
+<div class="card"><b>Watch the pbar postfix, not the loss.</b> At the end of the triplet stage the line reads
+like
+<code>[train]: 100%|...| 2000/2000 [...s/triplet, seen/short=..., probe:repair=..., pieces=..., target-leak=..., scanned=...]</code>.
+Two numbers decide whether the build is healthy:
+<ul style="margin:.4rem 0">
+<li><code>scanned</code> at completion. asr1 should finish near <b>~30,000</b> and asr4 near <b>~36,000</b>
+of the 50,628. Materially higher means the yield dropped and the split may run out before
+<code>n_extra_ans</code> is satisfied &mdash; the run does not fail, it just returns fewer rows, and the
+1:1 mix follows via <code>mix_asr_rows: -1</code>.</li>
+<li><code>pieces</code>. This is <code>key_pieces</code> failing on the vLLM box. A handful is normal (21 in
+the whole sent4-ftasr build); hundreds means the labeler server is sick, and every affected utterance is
+<em>consumed</em> from the split as it fails. That is how
+<a href="../logs/sent2_v1_e2e_38582187.log">sent2_v1_e2e</a> burned all 50,628 recordings for 600 triplets.
+Kill the job rather than let it eat the split.</li>
+</ul></div>
+
+<h2 id="s7">Step 7 &mdash; SFT, then the premise check</h2>
+<p>16,000 rows &times; 3 epochs at batch 16 is 3,000 steps, ~90 min on one L40S at the measured 1.76 s/step.
+Then the number this whole plan was built to produce:</p>
+
+<table>
+<tr><th>WER on <code>slurp-asr-bab-v1</code>'s test split</th><th>Reading</th></tr>
+<tr><td>mixed adapter &asymp; ASR LoRA <span class="lbl">(within ~1 point)</span></td>
+<td>The premise holds. The labels were derived from a model that hears like the one that learned them, and
+an EAR change is attributable to label quality rather than to a hearing gap.</td></tr>
+<tr><td>mixed adapter clearly worse than the ASR LoRA</td>
+<td>1:1 was not enough weight, or 3 epochs on a 2-task mix under-trains the ASR half. Report the gap
+&mdash; the EAR number is still valid, the <em>justification</em> is what weakens. Do not raise the ratio
+and rebuild without saying so; that is a second experiment.</td></tr>
+<tr><td>mixed adapter <em>better</em> than the ASR LoRA</td>
+<td>Expected to be rare. Check <code>--tag</code> collisions in <code>results/</code> before believing it
+&mdash; <code>asr_eval_qwen.py</code> writes <code>results/asr_&lt;name&gt;_&lt;tag&gt;.jsonl</code>, and a
+repeated tag overwrites.</td></tr>
+</table>
+<p>The comparison run already exists: <a href="../results/asr_Qwen2.5-Omni-3B-asr-sft_ft.jsonl">asr_Qwen2.5-Omni-3B-asr-sft_ft.jsonl</a>,
+same split, same script. Nothing to re-run on that side.</p>
+
+<h2 id="s8">Step 8 &mdash; eval</h2>
+<p>Same two judge passes as every sent track, base and adapter, so the delta is measured on this dataset
+rather than read across from another table. The driver runs the per-kind pass; the type-judge pass is the
+same command with <code>--judge-mode type --score-matrix tree</code> and its own tag.</p>
+
+<div class="cb"><pre><code># results this track will write, in the naming convention viz.ipynb parses:
+results/bab_results_Qwen2.5-Omni-3B_asr1.jsonl                 # base, per-kind
+results/bab_results_Qwen2.5-Omni-3B-bab-asr1-sft_asr1.jsonl    # adapter, per-kind
+results/bab_results_Qwen2.5-Omni-3B_asr1-typejudge.jsonl
+results/bab_results_Qwen2.5-Omni-3B-bab-asr1-sft_asr1-typejudge.jsonl
+results/asr_Qwen2.5-Omni-3B-bab-asr1-sft_asr1-mixed.jsonl      # the WER parity check
+#   ... and the same five with asr4 / -bab-asr4-sft.</code></pre></div>
+
+<h2 id="read">Step 9 &mdash; how to read the outcome</h2>
+<p>Two questions, and they are answered by different comparisons. Read them in this order.</p>
+
+<div class="grid2">
+<div class="card arm one"><b>Q1. Do four witnesses beat one, with a fine-tuned labeler?</b>
+<p style="font-size:.9rem"><span class="a4">asr4</span> EAR vs <span class="a1">asr1</span> EAR. This is the
+clean one: the two configs differ in six values, all of them naming the track or its outputs. Whatever the
+sign, it is the answer to the question <a href="ft-asr-2.html">ft-asr part 2's step-8 gate</a> raised and
+could not settle &mdash; whether a fine-tuned ASR model's four beams still carry four opinions, or collapse
+into one witness wearing four hats.</p></div>
+<div class="card arm four"><b>Q2. Did the mix help?</b>
+<p style="font-size:.9rem">asr1 vs <a href="../results/bab_Qwen2.5-Omni-3B-bab-sent1asr-sft_sent1asr.jsonl">sent1asr</a>
+(0.591) and asr4 vs <a href="../results/bab_results_Qwen2.5-Omni-3B-bab-sent4ft-sft_sent4-ftasr.jsonl">sent4-ftasr</a>
+(0.515). <b>Confounded</b>, and say so in the paper: 4k&rarr;8k rows moved at the same time, and for asr1 so
+did the witness. A rise here is consistent with the mix helping, with more data helping, or with a better
+witness &mdash; it does not separate them.</p></div>
+</div>
+
+<div class="card"><b>The third arm that would separate them</b>, if Q2 needs a real answer. It costs one
+SFT run and two eval passes &mdash; no build, because it trains off the dataset asr4 already produced:
+<div class="cb"><pre><code>python -u sft_qwen.py --config configs/asr4.yaml --mix-asr-rows 0 \
+    --repair-repo-name Qwen2.5-Omni-3B-bab-asr4-nomix-sft
+python -u babble_eval_qwen.py --config configs/asr4.yaml --tag asr4-nomix \
+    --adapter-path checkpoints/Qwen2.5-Omni-3B-bab-asr4-nomix-sft</code></pre></div>
+<span class="lbl">asr4 vs asr4-nomix is then the mix alone, at fixed data and fixed witness. This is why
+<code>mix_asr_rows: 0</code> is a supported value rather than something to assert against.</span></div>
+
+<table>
+<tr><th></th><th>asr4 &gt; asr1</th><th>asr4 &asymp; asr1</th><th>asr4 &lt; asr1</th></tr>
+<tr><th>both &gt; their baselines</th>
+<td>Beam consensus survives fine-tuning; the ladder is worth climbing. Report the pair as the track's best.</td>
+<td>The extra three beams buy nothing once the witness is good &mdash; a real, publishable negative: use
+the cheap track.</td>
+<td>Four fine-tuned beams agree too much, so &ldquo;lost only if every witness missed it&rdquo; degenerates
+into a one-witness rule with 4&times; the decode cost. Also the <a href="ft-asr-2.html">part 2</a>
+diversity number's prediction, now confirmed end to end.</td></tr>
+<tr><th>both &asymp; their baselines</th>
+<td colspan="3">The mix is neutral on EAR. That is not a failure &mdash; it buys the WER parity in step 7,
+which is a claim about the method, and it costs nothing in the metric. Say exactly that.</td></tr>
+<tr><th>both &lt; their baselines</th>
+<td colspan="3">Suspect the mix before the witness: 8,000 transcription rows against 8,000 clarification
+rows may simply be teaching the model to transcribe when asked to act. Check the eval transcripts for
+replies that read like ASR output; if that is what it is, the fix is a ratio, not a rebuild.</td></tr>
+</table>
+
+<footer>
+asr1 / asr4 &mdash; the plan. Nothing here is built yet.<br>
+Sibling docs: <a href="ft-asr.html">ft-asr.html</a> &middot; <a href="ft-asr-2.html">ft-asr-2.html</a>
+&middot; <a href="bab-ds.html">bab-ds.html</a> &middot; <a href="sent.md">sent.md</a>.
+</footer>
+</div>
+
+<script>
+// ---- copy buttons ----
+document.querySelectorAll('.cb').forEach(function(box){
+  var b = document.createElement('button');
+  b.className = 'copy'; b.textContent = 'copy';
+  b.onclick = function(){
+    navigator.clipboard.writeText(box.querySelector('code').innerText);
+    b.textContent = 'copied'; b.classList.add('done');
+    setTimeout(function(){ b.textContent = 'copy'; b.classList.remove('done'); }, 1400);
+  };
+  box.appendChild(b);
+});
+
+// ---- progress ----
+(function(){
+  var KEY = 'asr-mix-progress';
+  var boxes = Array.from(document.querySelectorAll('#chk input'));
+  var state = {};
+  try { state = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch(e) {}
+  function paint(){
+    var n = 0;
+    boxes.forEach(function(b){
+      b.checked = !!state[b.id];
+      b.closest('li').classList.toggle('done', b.checked);
+      if (b.checked) n++;
+    });
+    document.getElementById('pbar').style.width = (100*n/boxes.length) + '%';
+    document.getElementById('pcount').textContent = n + ' / ' + boxes.length + ' steps done';
+  }
+  boxes.forEach(function(b){
+    b.onchange = function(){
+      state[b.id] = b.checked;
+      try { localStorage.setItem(KEY, JSON.stringify(state)); } catch(e) {}
+      paint();
+    };
+  });
+  paint();
+})();
+
+// ---- budget calculator ----
+(function(){
+  // measured rates, see the table above #budget
+  var ARM = {
+    one:  {yt:0.50, ya:0.79, st:24.9, sa:4.0, name:'asr1'},
+    four: {yt:0.39, ya:0.93, st:43.6, sa:3.8, name:'asr4'}
+  };
+  var CEIL = 9131;      // distinct eligible sentences in SLURP train (counted, not estimated)
+  var ASR_ROWS = 8000;  // keylazy/slurp-asr-bab-v1
+  var SEC_STEP = 1.76, BS = 16;
+  var arm = 'one';
+  var nt = document.getElementById('nt'), na = document.getElementById('na'),
+      ep = document.getElementById('ep');
+  function fmt(n){ return Math.round(n).toLocaleString(); }
+  function paint(){
+    var a = ARM[arm], T = +nt.value, A = +na.value, E = +ep.value;
+    var rows = 3*T + A;
+    var ids  = (a.yt ? T/a.yt : 0) + (a.ya ? A/a.ya : 0);
+    var hrs  = (T*a.st + A*a.sa)/3600;
+    var mix  = Math.min(rows, ASR_ROWS);
+    var steps = Math.ceil((rows + mix) * E / BS);
+    document.getElementById('ntv').textContent = fmt(T);
+    document.getElementById('nav').textContent = fmt(A);
+    document.getElementById('epv').textContent = E;
+    document.getElementById('oRows').textContent = fmt(rows);
+    document.getElementById('oMix').textContent  = fmt(mix) + (mix < ASR_ROWS ? ' *' : '');
+    document.getElementById('oHrs').textContent  = hrs.toFixed(1) + ' h';
+    document.getElementById('oSteps').textContent = fmt(steps) +
+      ' · ' + (steps*SEC_STEP/3600).toFixed(1) + 'h';
+    var pct = 100*ids/CEIL;
+    var bar = document.getElementById('mBar');
+    bar.style.width = Math.min(100, pct) + '%';
+    bar.style.background = pct > 100 ? 'var(--bad)' : pct > 85 ? 'var(--warn)' : 'var(--ok)';
+    document.getElementById('mTxt').textContent =
+      fmt(ids) + ' / ' + fmt(CEIL) + ' distinct sentences  (' + pct.toFixed(0) + '%)';
+    var v = document.getElementById('verdict');
+    if (pct > 100) {
+      v.innerHTML = '<b style="color:var(--bad)">Over the ceiling.</b> The build will exhaust ' +
+        'SLURP train before it fills n_extra_ans and return fewer rows than asked — it does not ' +
+        'crash, it just ends short, and mix_asr_rows: -1 follows it down.';
+    } else if (pct > 85) {
+      v.innerHTML = '<b style="color:var(--warn)">Tight.</b> Under ' + fmt(CEIL-ids) +
+        ' sentences of headroom; a yield a few points below the measured rate lands you short.';
+    } else {
+      v.innerHTML = '<b style="color:var(--ok)">Fits</b> with ' + fmt(CEIL-ids) +
+        ' sentences to spare' + (mix < ASR_ROWS ?
+        ' — <span style="color:var(--warn)">* but only ' + fmt(mix) +
+        ' of the 8,000 ASR rows are used, to hold 1:1.</span>' : '.');
+    }
+  }
+  [nt, na, ep].forEach(function(el){ el.oninput = paint; });
+  document.querySelectorAll('#seg button').forEach(function(b){
+    b.onclick = function(){
+      document.querySelectorAll('#seg button').forEach(function(x){ x.classList.remove('on'); });
+      b.classList.add('on'); arm = b.dataset.arm; paint();
+    };
+  });
+  document.querySelectorAll('[data-p]').forEach(function(a){
+    a.onclick = function(){
+      var p = a.dataset.p.split(','); nt.value = p[0]; na.value = p[1]; paint();
+    };
+  });
+  paint();
+})();
+
+// ---- export the plan back to text ----
+document.getElementById('export').onclick = function(){
+  var lines = ['# asr1 & asr4 -- plan (exported from steps/asr-mix.html)', ''];
+  document.querySelectorAll('h2, ol.steps li, .cb pre code').forEach(function(el){
+    if (el.tagName === 'H2') lines.push('', '## ' + el.innerText.trim());
+    else if (el.tagName === 'LI') lines.push('- [' + (el.querySelector('input').checked ? 'x' : ' ') +
+      '] ' + el.innerText.trim());
+    else lines.push('```', el.innerText.trim(), '```');
+  });
+  navigator.clipboard.writeText(lines.join('\n'));
+  this.textContent = 'copied ✓';
+  var b = this; setTimeout(function(){ b.textContent = 'copy plan as text'; }, 1500);
+};
+</script>
+</body>
+</html>

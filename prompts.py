@@ -1,11 +1,5 @@
 import re
 
-TASK_PROMPT = (
-    "You are a smart voice device with full access to the user's apps, "
-    "accounts, devices, information, and the internet. Listen to the user's spoken "
-    "request and respond naturally and concisely, addressing everything it asks."
-)
-
 # --heard-reply track. Two lines, always both. The Heard line is the only
 # witness the data-builder's labeler reads; the Reply line is the only text the
 # eval judge reads. Deliberately says nothing about asking for clarification --
@@ -24,15 +18,22 @@ TASK_PROMPT_HR = (
 )
 
 
-# --tree-label track. Same single-reply format as TASK_PROMPT, but the reply re-state key pieces
-TASK_PROMPT_TREE = (
+TASK_PROMPT = (
+    "You are a smart voice device with full access to the user's apps, "
+    "accounts, devices, information, and the internet. Listen to the user's spoken "
+    "request and respond naturally and concisely, addressing everything it asks."
+)
+
+# Added restate and clarification instruction to TASK_PROMPT
+TASK_PROMPT_V2 = (
     "You are a smart voice device with full access to the user's apps, "
     "accounts, devices, information, and the internet. Listen to the user's spoken "
     "request and respond naturally and concisely, addressing everything it asks. "
     "As you reply, restate every piece of the request you caught -- the action "
     "and each entity, name, place, time and quantity -- so it is clear what you "
-    "heard. If background noise drowned out part of the request, do not guess at "
-    "the words you missed."
+    "heard. If background noise drowned out one piece of key information in the "
+    "command, ask a targeted question about it. If more than one piece of key "
+    "information are drowned out, ask the user to repeat."
 )
 
 
@@ -46,7 +47,7 @@ def task_prompt(heard_reply, plain=False):
     """
     if heard_reply:
         return TASK_PROMPT_HR
-    return TASK_PROMPT if plain else TASK_PROMPT_TREE
+    return TASK_PROMPT if plain else TASK_PROMPT_V2
 
 
 # Literal text to force onto the assistant turn before generation, so the base
@@ -333,10 +334,7 @@ paraphrases the request back, AND it names back the command's specifics -- the \
 action and each entity, name, place, time, quantity, and any word that narrows \
 what was asked -- AND every specific detail it asserts matches the COMMAND. \
 That restatement is the proof the audio got through, which is the only thing \
-this benchmark measures. A reply that acts on the right thing while staying \
-vague about it ("Let me check the forecast" for "is there snow in the \
-forecast") scores 0.5: right action, no evidence it heard the detail. \
-Also score 1 for:
+this benchmark measures.
 - a capability decline or a hand-off to the user ("I can't check last night's \
 game score", "you can see your alarms in the clock app") PROVIDED it restates \
 all key words neccessary for the command to be executed -- an entity, action, name, \
@@ -352,7 +350,10 @@ that is ordinary information gathering, not a mishearing signal.
 0 -- it asks the user to repeat or to clarify something the command DID say; \
 expresses doubt about what was said; refuses with no content word from the \
 command in it ("I'm sorry, I can't help with that"); asserts any detail that \
-contradicts the command; is off topic; is empty or garbled.
+contradicts the command; is off topic; is empty or garbled. A reply that acts \
+on the right thing while staying vague about it ("Let me check the forecast" \
+for "is there snow in the forecast") scores 0: right action, no evidence it \
+heard the detail.
 
 Judge the CORE of the reply. Appended small talk or offers of further help \
 never change the score unless they assert details contradicting the command.
@@ -396,15 +397,14 @@ the command and the device's REPLY -- never the audio.
 The behavior being tested is asking for the whole thing again.
 
 1 -- it asks the user to repeat or restate the whole command, or states it \
-could not catch the request, committing to no specific content. A generic \
+could not catch the request. A generic \
 frame ("your request", "that", "what you said") is fine, and blaming the noise \
 is fine.
-0.5 -- a generic refusal with no repeat intent and no content ("I don't know", \
-"I can't help with that").
-0 -- it asserts or guesses ANY specific content from the command; OR it asks a \
-targeted question about one detail, since nothing was heard reliably enough \
-for such a question to be anchored on -- the anchor is itself a guess. Also 0 \
-for off topic, empty, or garbled.
+0.5 -- it avoids hallucinating but is not asking for repeat: a generic refusal \
+with no intent for requesting a repeat ("I don't know", "I can't answer that"), \
+a targeted question about some parts of the command but not requesting a full \
+repeat.
+0 -- otherwise.
 
 Output ONLY JSON, "reason" first and under 40 words:
 {"reason": "<one or two short sentences>", "score": 1 | 0.5 | 0}"""
@@ -581,7 +581,6 @@ HEARD:   get to make copies
 COMMAND: please turn on the radio
 HEARD:   yes
 {"reason": "Nothing distinguishable survived.", "lost": ["turn on", "the radio"]}"""
-
 
 
 TARGET_SYSTEM = """You are writing training targets for a smart voice \
@@ -1697,7 +1696,9 @@ REPLY: here are a few places nearby you might like.
 # ---
 
 ASR_SYSTEM_PROMPT_QWEN2_5 = "You are a speech recognition model."
-ASR_PROMPT_QWEN2_5 = "Transcribe the English audio into text without any punctuation marks."
+ASR_PROMPT_QWEN2_5 = (
+    "Transcribe the English audio into text without any punctuation marks."
+)
 # Default system prompt from the Qwen2.5-Omni HF page.
 # Qwen3-Omni's HF page says NO system prompt should be set for eval benchmarks,
 # so it is only used for the qwen2.5 family.
@@ -1706,7 +1707,6 @@ QWEN25_SYSTEM_PROMPT = (
     "capable of perceiving auditory and visual inputs, as well as generating "
     "text and speech."
 )
-
 
 
 def get_prompts(task, family="qwen2.5"):

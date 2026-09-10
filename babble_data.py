@@ -40,7 +40,7 @@ from prompts import (
     SENT_RESP_LOSS_SYSTEM,
     TARGET_SYSTEM,
     TASK_PROMPT,
-    TASK_PROMPT_TREE,
+    TASK_PROMPT_V2,
     split_heard_reply,
     task_prompt,
 )
@@ -990,7 +990,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                 # the restate prompt, not the plain one: a reply is only a
                 # witness if it names back what it caught, which is the clause
                 # TASK_PROMPT_TREE adds
-                convs = [_conv(p, sysp, TASK_PROMPT_TREE) for p in paths]
+                convs = [_conv(p, sysp, TASK_PROMPT_V2) for p in paths]
                 responses = base_generate_batch(convs, PROBE_RESP_MAX_NEW_TOKENS)
                 transcripts = ["" for _ in paths]
                 witnesses = [[("resp", r)] for r in responses]
@@ -1024,7 +1024,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             # get batch omni assistant respond.
             # The lock is released between 2 base_generate_batch calls.
             # It allows others more chance to use the GPU
-            task = TASK_PROMPT_TREE if TRACK in ("tree", "sent-2") else TASK_PROMPT
+            task = TASK_PROMPT_V2 if TRACK in ("tree", "sent-2") else TASK_PROMPT
             convs = [_conv(p, sysp, task) for p in paths]
             responses = base_generate_batch(convs, PROBE_RESP_MAX_NEW_TOKENS)
 
