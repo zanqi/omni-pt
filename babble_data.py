@@ -1441,9 +1441,9 @@ if __name__ == "__main__":
         "--asr-adapter",
         default=None,
         help="LoRA attached to the probe model (the ft-asr track). Legal only "
-        "on --beam-label / --sent-4, whose probe pass is ASR and nothing "
-        "else: every other track writes the task response with this same "
-        "model, and an ASR-only adapter answers a spoken command by "
+        "on --beam-label / --sent-4 / --sent-1-asr, whose probe pass is ASR "
+        "and nothing else: every other track writes the task response with "
+        "this same model, and an ASR-only adapter answers a spoken command by "
         "transcribing it back.",
     )
 
@@ -1537,7 +1537,9 @@ if __name__ == "__main__":
     log(f"config: {cfg}")
     log(f"track: {TRACK}")
 
-    if cfg.asr_adapter and TRACK not in ("beam", "sent-4"):
+    # the ASR-only tracks: their probe decodes a transcript and nothing else
+    ASR_ONLY_TRACKS = ("beam", "sent-4", "sent-1-asr")
+    if cfg.asr_adapter and TRACK not in ASR_ONLY_TRACKS:
         raise SystemExit(
             f"--asr-adapter is not usable on track {TRACK}: its probe also "
             "generates the task response from this model, which an ASR-only "

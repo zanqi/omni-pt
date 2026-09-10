@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from datasets import Audio, load_dataset
+from datasets import Audio, concatenate_datasets, load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from qwen_omni_utils import process_mm_info
 from torch import nn
@@ -30,9 +30,10 @@ CHECKPOINT_DIR = "checkpoints"
 AUDIO_SAMPLING_RATE = 16000
 MAX_AUDIO_SECONDS = 30
 
+
 def get_audio(field):
     samples = field.get_all_samples()
-    arr = samples.data # (C, T), C=num chanels
+    arr = samples.data  # (C, T), C=num chanels
     if arr.ndim > 1:
         arr = arr.mean(dim=0)
     arr = arr.numpy().astype("float32")
@@ -75,15 +76,25 @@ class OmniSFTCollator:
         task="repair",
     ) -> None:
         self.processor = processor
-        # must match the prompts the dataset's targets were built under, and
-        # the ones babble_eval_qwen.py evaluates with
-        self.system_prompt, self.task_prompt = get_prompts(task, family)
+        # One pair per row KIND, not one per run. A mixed dataset (the asr1 /
+        # asr4 tracks) carries kind="asr" rows whose target is a verbatim
+        # transcript and answer/repair/repeat rows whose target is a restating
+        # assistant reply; each has to be rendered under the prompt its target
+        # was written for, and under the one babble_eval_qwen.py /
+        # asr_eval_qwen.py will ask with. A --task asr run collapses the dict
+        # to one entry, which is correct.
+        self.task = task
+        self.pairs = {
+            "asr": get_prompts("asr", family),
+            task: get_prompts(task, family),
+        }
 
-    def _conv(self, audio, answer=None):
+    def _conv(self, kind, audio, answer=None):
+        system_prompt, task_prompt = self.pairs["asr" if kind == "asr" else self.task]
         conv = []
-        if self.system_prompt is not None:
+        if system_prompt is not None:
             conv.append(
-                {"role": "system", "content": [{"type": "text", "text": self.system_prompt}]}
+                {"role": "system", "content": [{"type": "text", "text": system_prompt}]}
             )
         conv.append(
             {
@@ -91,7 +102,7 @@ class OmniSFTCollator:
                 "content": [
                     # audio is an in-memory float32 array
                     {"type": "audio", "audio": audio},
-                    {"type": "text", "text": self.task_prompt},
+                    {"type": "text", "text": task_prompt},
                 ],
             }
         )
@@ -105,11 +116,14 @@ class OmniSFTCollator:
     def __call__(self, features: list[dict[str, Any]]) -> Any:
         """Return label ids"""
 
-        full_convs = [self._conv(ex["audio"], ex["target"]) for ex in features]
-        prompt_convs = [self._conv(ex["audio"], None) for ex in features]
+        # both renders take the same kind, or the label-length diff below is
+        # measuring two different prompts
+        full_convs = [
+            self._conv(ex["kind"], ex["audio"], ex["target"]) for ex in features
+        ]
+        prompt_convs = [self._conv(ex["kind"], ex["audio"], None) for ex in features]
 
-        # two renders per example, so at batch 16 this is where the
-        # "System prompt modified" warning would print 32 times a step
+        # turn off the qwen sys prompt warning
         with quiet_chat_template():
             full_texts = self.processor.apply_chat_template(
                 full_convs,
@@ -129,7 +143,9 @@ class OmniSFTCollator:
 
         # full_convs contains the audio narrays; process_mm_info
         # passes them through unchanged.
-        audios, images, videos, *_ = process_mm_info(full_convs, use_audio_in_video=False)
+        audios, images, videos, *_ = process_mm_info(
+            full_convs, use_audio_in_video=False
+        )
 
         full = self.processor(
             text=full_texts,
@@ -236,7 +252,7 @@ def load_model(omni_path, family, use_qlora):
 
     model = model_cls.from_pretrained(omni_path, **kwargs)
     model.disable_talker()
-    model.thinker.config.use_cache = False # TODO: ?
+    model.thinker.config.use_cache = False  # TODO: ?
     model.thinker.enable_input_require_grads()  # TODO: ?
 
     if use_qlora:
@@ -261,9 +277,7 @@ def load_model(omni_path, family, use_qlora):
     return model
 
 
-def run_smoke(
-    model, processor, dataset, batch_size, family, task
-):
+def run_smoke(model, processor, dataset, batch_size, family, task):
     print("\n=== SMOKE TEST ===")
     coll = OmniSFTCollator(
         processor,
@@ -283,13 +297,16 @@ def run_smoke(
 
         n_sup = int((batch["labels"][i] != -100).sum())
         n_real = int(batch["attention_mask"][i].sum())
-        print(f"  ex{i}: seq_len={total} real_tokens={n_real} supervised(label!=-100)={n_sup}")
+        print(
+            f"  ex{i}: seq_len={total} real_tokens={n_real} supervised(label!=-100)={n_sup}"
+        )
 
     batch = {k: v.to(model.device) for k, v in batch.items()}
     with torch.no_grad():
         out = model(**batch)
     print(f"  batch loss={float(out.loss):.4f}")
     print("Finite loss & supervised count ~ target length => ready.\n")
+
 
 @dataclass
 class Config:
@@ -311,12 +328,21 @@ class Config:
     repair_epochs: float = 3.0
     repair_lr: float = 2e-4
     repair_repo_name: str | None = None
+    # the ASR rows folded into a repair run's training set (the asr1 / asr4
+    # tracks). -1 means "as many as there are clarification rows", i.e. the
+    # 1:1 mix; 0 disables it, which is how the no-mix control arm is trained
+    # off the SAME dataset and the same config file. Named mix_asr_* and not
+    # asr_mix_*: __main__ rejects asr_* flags on a repair run, and this one is
+    # read by a repair run.
+    mix_asr_ds_id: str | None = None
+    mix_asr_rows: int = -1
 
     # --task asr
     asr_ds_id: str | None = None
     asr_epochs: float = 2.0
     asr_lr: float = 1e-4
     asr_repo_name: str | None = None
+
 
 def main(cfg: Config):
     # A key this stage does not declare is dropped by load_config without a
@@ -346,6 +372,33 @@ def main(cfg: Config):
     print(f"Loading SFT dataset {ds_id} ...")
     kinds = [k.strip() for k in cfg.train_kinds.split(",")] if cfg.train_kinds else None
     train_hf = load_ds_split(ds_id, cfg.train_split, kinds=kinds)
+
+    # --- fold in the ASR rows (the asr1/asr4 tracks) ---
+    # The student trains on the labeler's own objective, so "the labeler's
+    # transcript is what this audio sounded like" stops being an assumption
+    # imported from another model. steps/asr-mix.html#premise.
+    if repair and cfg.mix_asr_ds_id and cfg.mix_asr_rows != 0:
+        # always "train": cfg.train_split names a split of the repair
+        # dataset, and the ASR builder writes only train/test
+        asr_hf = load_ds_split(cfg.mix_asr_ds_id, "train")
+        n_mix = len(train_hf) if cfg.mix_asr_rows < 0 else cfg.mix_asr_rows
+        if n_mix > len(asr_hf):
+            print(
+                f"WARNING: asked for {n_mix} asr rows, "
+                f"{cfg.mix_asr_ds_id} has {len(asr_hf)}"
+            )
+        # shuffled before the cut so a subsample is not the head of the
+        # stream, which is one contiguous run of SLURP devel
+        asr_hf = asr_hf.shuffle(seed=42).select(range(min(n_mix, len(asr_hf))))
+        # the builders write different columns, and concatenate_datasets needs
+        # one schema -- project both to what SlurpDataset reads
+        cols = ["audio", "target", "kind"]
+        train_hf = concatenate_datasets(
+            [train_hf.select_columns(cols), asr_hf.select_columns(cols)]
+        )
+        # no shuffle of the concatenation: Trainer wraps the train dataset in a
+        # RandomSampler, so the two halves interleave per epoch on their own
+        print(f"mixed in {len(asr_hf)} asr rows -> {len(train_hf)} train rows")
 
     train_ds = SlurpDataset(train_hf)
 
@@ -452,6 +505,19 @@ if __name__ == "__main__":
     ap.add_argument("--repair-epochs", type=float)
     ap.add_argument("--repair-lr", type=float)
     ap.add_argument("--repair-repo-name", type=str)
+    ap.add_argument(
+        "--mix-asr-ds-id",
+        type=str,
+        help="Fold this ASR dataset's train split into a --task repair run, "
+        "so the model learns to hear what its labeler heard (asr1 / asr4).",
+    )
+    ap.add_argument(
+        "--mix-asr-rows",
+        type=int,
+        help="How many of those rows. -1 (default) matches the clarification "
+        "row count, i.e. a 1:1 mix; 0 trains the no-mix control off the same "
+        "config file.",
+    )
 
     ap.add_argument("--asr-ds-id", type=str)
     ap.add_argument("--asr-epochs", type=float)

@@ -1,0 +1,44 @@
+# configs/asr1.yaml -- one witness (the ft ASR LoRA's single transcript),
+# labeled against the key-piece inventory, and trained 1:1 against that same
+# LoRA's training set. See steps/asr-mix.html. Every stage reads this file:
+#
+#   CFG=configs/asr1.yaml sbatch --job-name=asr1 exp/asr-mix.slurm
+#
+# Keys a stage's Config does not declare are dropped SILENTLY -- read the
+# "config: ..." line each script prints on start.
+
+# Model
+omni_path: Qwen/Qwen2.5-Omni-3B
+
+# --- the build (babble_data.py) ---
+label: sent-1-asr
+# the witness is the ft-asr adapter, not the base model: that IS the experiment
+asr_adapter: checkpoints/Qwen2.5-Omni-3B-asr-sft
+ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-asr1-v1
+n_train: 2000        # utterances -> x3 kinds = 6000 train rows
+n_test: 100          # -> a 300-row test split; every eval pass judges all of it
+n_extra_ans: 2000    # -> 8000 train rows total, 1:1 with the 8000 asr rows
+
+# --- the repair LoRA (sft_qwen.py) ---
+repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-asr1-v1
+repair_repo_name: Qwen2.5-Omni-3B-bab-asr1-sft
+repair_epochs: 3
+repair_lr: 2.0e-4
+batch_size: 16
+# the mix. `mix_asr_` and not `asr_mix_`: sft_qwen.py rejects asr_* flags on a
+# repair run, and this one is read by a repair run.
+mix_asr_ds_id: keylazy/slurp-asr-bab-v1
+mix_asr_rows: -1     # -1 = match the clarification row count
+
+# --- the WER parity check (asr_eval_qwen.py, step 7) ---
+asr_ds_id: keylazy/slurp-asr-bab-v1
+n_best: 1            # mirrors this track's witness count
+sample_temp: 0.0
+
+# --- the EAR eval (babble_eval_qwen.py) ---
+judge_mode: per-kind
+kinds: answer,repair,repeat
+num_rows: -1
+tag: asr1
+# no prompt key here on purpose: the eval prompts with TASK_PROMPT_V2 unless
+# --plain-prompt is passed on the command line, which this track never does.
