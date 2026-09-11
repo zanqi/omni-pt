@@ -201,6 +201,13 @@ def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
     # inputs computed on CPU do not need to lock the GPU
     # Only the transfering of inputs from cpu to gpu
     # needs lock
+    audio_kwargs = {}
+    if base_family == "qwen2.5":
+        # qwen 3 already does this padding to
+        # the longest by default
+        hop = base_processor.feature_extractor.hop_length
+        longest = max(len(a) for a in mm_audios)
+        audio_kwargs = {"max_length": -(-longest // hop) * hop, "truncation": True}
     inputs = base_processor(
         text=texts,
         audio=mm_audios,
@@ -208,6 +215,7 @@ def base_generate_batch(convs, max_new_tokens, prefill=None, n_best=1):
         videos=videos,
         return_tensors="pt",
         padding=True,
+        audio_kwargs=audio_kwargs,
     )
 
     gen_kwargs = {"do_sample": False}

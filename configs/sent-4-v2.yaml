@@ -1,0 +1,50 @@
+# sent-4-v2 -- a fresh build of the four-witness track (the base model's 4-best
+# ASR list; a key piece counts lost only if every beam missed it). No ft-asr
+# adapter is involved: this is the BASE model as its own witness, which is what
+# separates it from configs/ft-asr.yaml's sent-4 build.
+#
+#   CFG=configs/sent-4-v2.yaml sbatch --job-name=sent4v2 exp/sent-v2.slurm
+#
+# Why this one rebuilds and configs/sent-1-asr-v2.yaml does not, given both
+# probe ASR-only and neither renders a task prompt during the build: sent4-v1
+# was built 2026-08-18, one day BEFORE e0b137c rewrote the rubrics that produce
+# its rows -- KEY_PIECES_SYSTEM and SENT_ASR_LOSS_SYSTEM (which decide what
+# counts as lost, i.e. every row's kind) and both target writers (which decide
+# what the assistant is trained to say). Its labels and its targets are the old
+# rubrics' output, and no amount of re-SFT or re-eval changes that. sent1asr-v1
+# is from 2026-09-08, after all of it. The 50/50/50 test split is the second
+# reason, not the first.
+#
+# Eval-side, this run is TASK_PROMPT_V2 and whatever the vLLM box serves today
+# (Qwen3.8-27B), matching sent1asr-v2 / asr1 / asr4 -- and so NOT comparable
+# with the sent4-v1 row, which was plain TASK_PROMPT under the Qwen3.5-122B
+# judge.
+#
+# Keys a stage's Config does not declare are dropped SILENTLY -- read the
+# "config: ..." line each script prints on start.
+
+# Model
+omni_path: Qwen/Qwen2.5-Omni-3B
+
+# --- the build (babble_data.py) ---
+# no asr_adapter key: the probe is the base model's own 4 beams
+label: sent-4
+ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent4-v2
+n_train: 1000        # utterances -> x3 kinds = 3000 train rows
+n_test: 100          # -> a 300-row test split, 2x sent4-v1's 50/50/50
+n_extra_ans: 1000    # -> 4000 train rows total, the sent4-v1 shape
+
+# --- the repair LoRA (sft_qwen.py) ---
+repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent4-v2
+repair_repo_name: Qwen2.5-Omni-3B-bab-sent4-v2-sft
+repair_epochs: 3
+repair_lr: 2.0e-4
+batch_size: 16
+
+# --- the eval (babble_eval_qwen.py) ---
+judge_mode: per-kind
+kinds: answer,repair,repeat
+num_rows: -1
+tag: sent4-v2
+# no prompt key on purpose: the eval prompts with TASK_PROMPT_V2 unless
+# --plain-prompt is passed, which this track -- unlike sent4-v1 -- never does.

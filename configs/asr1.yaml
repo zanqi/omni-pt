@@ -15,9 +15,9 @@ label: sent-1-asr
 # the witness is the ft-asr adapter, not the base model: that IS the experiment
 asr_adapter: checkpoints/Qwen2.5-Omni-3B-asr-sft
 ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-asr1-v1
-n_train: 2000        # utterances -> x3 kinds = 6000 train rows
-n_test: 100          # -> a 300-row test split; every eval pass judges all of it
-n_extra_ans: 2000    # -> 8000 train rows total, 1:1 with the 8000 asr rows
+n_train: 1000        # tripples -> x3 rows
+n_test: 100          # tripples -> x3 rows
+n_extra_ans: 1000    # rows
 
 # --- the repair LoRA (sft_qwen.py) ---
 repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-asr1-v1
