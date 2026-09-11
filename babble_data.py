@@ -82,6 +82,14 @@ PROBE_DIR = None  # scratch wavs the probes listen to, under AUDIO_DIR
 SEED = 42
 ROW_ID = itertools.count(1)
 
+# How many recordings of one sentence may become rows. SLURP streams several
+# takes of the same prompt back to back (up to ~10), all carrying one
+# slurp_id, so this is a per-SENTENCE cap, not a per-recording one -- the
+# takes are different speakers reading the same text, which is a real
+# acoustic difference worth keeping, but uncapped a handful of many-take
+# prompts would crowd out the corpus. Measured on the asr1 run: 18523
+# scanned -> 2706 distinct sentences, i.e. ~6.8 takes per sentence.
+SENTENCE_TAKE_CAP = 3
 BABBLE_POOL_SIZE = 300
 BABBLE_CLIP_MAX_SEC = 10  # trim pool clips to save memory
 
@@ -120,7 +128,14 @@ CLASSIFY_TEMPERATURE = 0.0
 CLASSIFY_MAX_TOKENS = 1024
 TARGET_MAX_TOKENS = 1024
 TARGET_RETRIES = 8
-CLASSIFY_WORKERS = 8  # parallel classifier calls to vLLM
+# How many probe labels may run ahead of the in-order consumer in probe_by_kinds.
+# The consumer stops the moment every slot is filled, so this is also the
+# overshoot: a label already in flight then is paid for anyway. Smaller wastes
+# fewer calls on a scarce labeler; larger keeps more of it busy per utterance.
+# UTTERANCE_WORKERS builds run at once, so the labeler sees up to
+# UTTERANCE_WORKERS * LABEL_LOOKAHEAD concurrent calls.
+LABEL_LOOKAHEAD = 4
+label_calls = Counter()  # made / saved, reported in the build progress bar
 
 ASR_MAX_NEW_TOKENS = 64
 ASR_N_BEST = 4
@@ -976,13 +991,8 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             # no task-response pass on this track: nothing reads it, so
             # decoding it would be dead GPU time
             responses = ["" for _ in hyp_lists]
-            with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
-                labels = list(
-                    ex.map(
-                        lambda h: label_sent_ids(pieces, [("asr", x) for x in h]),
-                        hyp_lists,
-                    )
-                )
+            label_one = lambda h: label_sent_ids(pieces, [("asr", x) for x in h])
+            label_args = hyp_lists
         elif TRACK in ("sent-1-asr", "sent-1-resp"):
             # one witness, so one decode: the other pass would be GPU time
             # spent on a witness no labeler on this track reads
@@ -1002,8 +1012,8 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                 responses = base_generate_batch(convs, PROBE_RESP_MAX_NEW_TOKENS)
                 transcripts = ["" for _ in paths]
                 witnesses = [[("resp", r)] for r in responses]
-            with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
-                labels = list(ex.map(lambda w: label_sent_ids(pieces, w), witnesses))
+            label_one = lambda w: label_sent_ids(pieces, w)
+            label_args = witnesses
         elif TRACK == "heard-reply":
             convs = [_conv(p, sysp, task_prompt(True)) for p in paths]
             outs = base_generate_batch(
@@ -1021,8 +1031,8 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
                         log(f"[format-fail raw output]: {o!r}")
                         break
             skip["format"] += n_format_fail
-            with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
-                labels = list(ex.map(lambda h: label_target(sentence, h), transcripts))
+            label_one = lambda h: label_target(sentence, h)
+            label_args = transcripts
         else:  # 2-witness (sent-2) track goes here
             # get batch omni asr respond
             asr_sysp = ASR_SYSTEM_PROMPT_QWEN2_5 if base_family == "qwen2.5" else None
@@ -1037,57 +1047,85 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             responses = base_generate_batch(convs, PROBE_RESP_MAX_NEW_TOKENS)
 
             if TRACK == "two-pass":
-                label_one = classify
+                label_pair = classify
             elif TRACK == "sent-2":
-                label_one = lambda t, r: label_sent_ids(
+                label_pair = lambda t, r: label_sent_ids(
                     pieces, [("asr", t), ("resp", r)]
                 )
             else:
-                label_one = lambda t, r: label_tree(sentence, t, r)
-            with ThreadPoolExecutor(max_workers=CLASSIFY_WORKERS) as ex:
-                labels = list(
-                    ex.map(
-                        lambda it: label_one(*it),
-                        list(zip(transcripts, responses)),
-                    )
-                )
+                label_pair = lambda t, r: label_tree(sentence, t, r)
+            label_one = lambda it: label_pair(*it)
+            label_args = list(zip(transcripts, responses))
 
+        # --- label in list order, stop once every slot is filled ---
+        # The fill below lets the FIRST probe in list order claim a slot, so a
+        # label computed after the last open slot is taken is never read. Each
+        # label depends only on its own probe, so not computing those is
+        # bit-identical to the old eager `ex.map` over the whole round -- and
+        # it is most of the cost of a round. The labeler is the build's scarce
+        # resource (it tops out around 6 calls/s for the whole run, while the
+        # probe GPU pass is ~1s of a ~14s round), so a round costs what it
+        # labels, not what it decodes. Rounds 2 and 3 need only one or two
+        # slots and usually claim them in the first few probes.
+        # LABEL_LOOKAHEAD labels run ahead of the consumer to keep the labeler
+        # busy; that look-ahead is also the overshoot, since a label already in
+        # flight when the last slot fills is paid for anyway.
         filled = False
-        for snr, probe_path, transcript, response, hyps, label in zip(
-            snrs, paths, transcripts, responses, hyp_lists, labels
-        ):
-            if label is None:
-                continue
+        with ThreadPoolExecutor(max_workers=LABEL_LOOKAHEAD) as ex:
+            inflight, queued = {}, 0
+            for i in range(len(paths)):
+                while queued < len(paths) and len(inflight) < LABEL_LOOKAHEAD:
+                    inflight[queued] = ex.submit(label_one, label_args[queued])
+                    queued += 1
+                label = inflight.pop(i).result()
+                label_calls["made"] += 1
+                snr, probe_path = snrs[i], paths[i]
+                transcript, response = transcripts[i], responses[i]
+                hyps = hyp_lists[i]
 
-            kind = label["kind"]
-            # tree/beam/two-pass call it "missing" and quote it out of the
-            # command; the sent tracks call it "lost" and it is already exact
-            # key-piece text
-            lost = label.get("lost", label.get("missing", []))
-            if kind in results and results[kind] is None:
-                filled = True
-                results[kind] = {
-                    "snr_db": snr,
-                    "audio": probe_path,
-                    "transcript": transcript,
-                    "response": response,
-                    "lost": lost,
-                    "reason": label["reason"],
-                    # --heard-reply writes the target in the same call; the
-                    # other two tracks fill this in later, once the probe is
-                    # actually kept
-                    "target": label.get("reply", ""),
-                    # tree track only: the two per-pass loss counts
-                    "asr_bucket": label.get("asr_bucket", ""),
-                    "resp_bucket": label.get("resp_bucket", ""),
-                    "pieces": label.get("pieces", []),
-                    # beam track only: all K hypotheses (the repair target
-                    # writer grounds its question in these), the per-hypothesis
-                    # loss lists behind the consensus, and whether the
-                    # hypotheses read as some other sentence entirely
-                    "hypotheses": list(hyps),
-                    "beam_losses": label.get("per_hypothesis", []),
-                }
+                if label is None:
+                    continue
+
+                kind = label["kind"]
+                # tree/beam/two-pass call it "missing" and quote it out of the
+                # command; the sent tracks call it "lost" and it is already
+                # exact key-piece text
+                lost = label.get("lost", label.get("missing", []))
+                if kind in results and results[kind] is None:
+                    filled = True
+                    results[kind] = {
+                        "snr_db": snr,
+                        "audio": probe_path,
+                        "transcript": transcript,
+                        "response": response,
+                        "lost": lost,
+                        "reason": label["reason"],
+                        # --heard-reply writes the target in the same call;
+                        # the other two tracks fill this in later, once the
+                        # probe is actually kept
+                        "target": label.get("reply", ""),
+                        # tree track only: the two per-pass loss counts
+                        "asr_bucket": label.get("asr_bucket", ""),
+                        "resp_bucket": label.get("resp_bucket", ""),
+                        "pieces": label.get("pieces", []),
+                        # beam track only: all K hypotheses (the repair target
+                        # writer grounds its question in these), the
+                        # per-hypothesis loss lists behind the consensus, and
+                        # whether the hypotheses read as some other sentence
+                        # entirely
+                        "hypotheses": list(hyps),
+                        "beam_losses": label.get("per_hypothesis", []),
+                    }
+
+                if all(v is not None for v in results.values()):
+                    break
+
+            # whatever is still queued is now known-dead work
+            for f in inflight.values():
+                f.cancel()
+            label_calls["saved"] += (
+                len(paths) - queued + sum(1 for f in inflight.values() if f.cancelled())
+            )
 
         # clean up non-kept wav files
         kept = {r["audio"] for r in results.values() if r}
@@ -1108,6 +1146,14 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
 # ---
 # triplet-building loop
 # ---
+
+
+def label_pct():
+    """ "made/total (pct)" for the progress bar -- how much of the probe
+    labeling the early stop in probe_by_kinds actually paid for."""
+    made, saved = label_calls["made"], label_calls["saved"]
+    total = made + saved
+    return f"{made}/{total} ({100 * made // max(total, 1)}%)"
 
 
 def imap_ordered(items, work, workers):
@@ -1166,7 +1212,7 @@ def collect_babble_pool(split):
     return pool
 
 
-def make_row(kind, target, path, probe, slurp_id, sentence):
+def make_row(kind, target, path, probe, slurp_id, sentence, take):
     if TRACK == "heard-reply" and target:
         target = f"Heard: {probe['transcript']}\nReply: {target}"
     return {
@@ -1192,12 +1238,15 @@ def make_row(kind, target, path, probe, slurp_id, sentence):
         ),
         "key_pieces": probe["pieces"],
         "slurp_id": slurp_id,
+        # which recording of that sentence: slurp_id alone no longer
+        # identifies a row now that SENTENCE_TAKE_CAP > 1
+        "take": take,
         "sentence": sentence,
         "source": "babble",
     }
 
 
-def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
+def build_triplets(split, n_triplets, blocked_ids, takes, babble_pool):
     rows, scanned, done = [], 0, 0
     skip.clear()
     pbar = tqdm(total=n_triplets, desc=f"[{split}]", unit="triplet", dynamic_ncols=True)
@@ -1206,17 +1255,29 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
         nonlocal scanned
         for row in slurp_ds_stream(split):
             scanned += 1
-            pbar.set_postfix({**skip, "scanned": scanned}, refresh=False)
-            if row["slurp_id"] in seen_slurp_ids or len(row["sentence"].split()) < 4:
-                skip["seen/short"] += 1
+            pbar.set_postfix(
+                {**skip, "scanned": scanned, "labels": label_pct()},
+                refresh=False,
+            )
+            sid = row["slurp_id"]
+            if (
+                sid in blocked_ids
+                or takes[sid] >= SENTENCE_TAKE_CAP
+                or len(row["sentence"].split()) < 4
+            ):
+                skip["blocked/short"] += 1
                 continue
-            # claim the id HERE, not after a successful build: slurp streams
+            # claim the take HERE, not after a successful build: slurp streams
             # several recordings of the same prompt back to back (up to ~10),
             # and imap_ordered keeps UTTERANCE_WORKERS builds in flight, so
-            # marking it in the consumer let duplicates of one sentence race
-            # through the check together.
-            seen_slurp_ids.add(row["slurp_id"])
-            yield row
+            # counting in the consumer let takes of one sentence race through
+            # the cap together.
+            takes[sid] += 1
+            # the take rides along because the wav name has to carry it: two
+            # takes of one sentence would otherwise write the same
+            # `{split}_{slurp_id}_{kind}.wav`, the second silently replacing
+            # the first and leaving two rows pointing at one audio
+            yield {**row, "take": takes[sid]}
 
     def build(row):
         # this is the threadpool worker
@@ -1315,12 +1376,22 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
         sentence = row["sentence"]
         for kind in KINDS:
             probe = built["triplet"][kind]
-            path = os.path.join(AUDIO_DIR, f"{split}_{slurp_id}_{kind}.wav")
+            path = os.path.join(
+                AUDIO_DIR, f"{split}_{slurp_id}_t{row['take']}_{kind}.wav"
+            )
             # move from temp folder to audio dir
             # ready for hf upload
             os.replace(probe["audio"], path)
             rows.append(
-                make_row(kind, built["targets"][kind], path, probe, slurp_id, sentence)
+                make_row(
+                    kind,
+                    built["targets"][kind],
+                    path,
+                    probe,
+                    slurp_id,
+                    sentence,
+                    row["take"],
+                )
             )
 
         done += 1
@@ -1333,7 +1404,7 @@ def build_triplets(split, n_triplets, seen_slurp_ids, babble_pool):
     return rows
 
 
-def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
+def build_answer_rows(split, n_rows, blocked_ids, takes, babble_pool):
     rows, scanned = [], 0
     skip.clear()
     pbar = tqdm(total=n_rows, desc=f"[{split}ans]", unit="row", dynamic_ncols=True)
@@ -1342,12 +1413,20 @@ def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
         nonlocal scanned
         for row in slurp_ds_stream(split):
             scanned += 1
-            pbar.set_postfix({**skip, "scanned": scanned}, refresh=False)
-            if row["slurp_id"] in seen_slurp_ids or len(row["sentence"].split()) < 4:
-                skip["seen/short"] += 1
+            pbar.set_postfix(
+                {**skip, "scanned": scanned, "labels": label_pct()},
+                refresh=False,
+            )
+            sid = row["slurp_id"]
+            if (
+                sid in blocked_ids
+                or takes[sid] >= SENTENCE_TAKE_CAP
+                or len(row["sentence"].split()) < 4
+            ):
+                skip["blocked/short"] += 1
                 continue
-            seen_slurp_ids.add(row["slurp_id"])  # see build_triplets.candidates
-            yield row
+            takes[sid] += 1  # see build_triplets.candidates
+            yield {**row, "take": takes[sid]}
 
     def build(row):
         slurp_id = row["slurp_id"]
@@ -1400,11 +1479,17 @@ def build_answer_rows(split, n_rows, seen_slurp_ids, babble_pool):
         slurp_id = row["slurp_id"]
         sentence = row["sentence"]
 
-        path = os.path.join(AUDIO_DIR, f"{split}_{slurp_id}_answer.wav")
+        path = os.path.join(AUDIO_DIR, f"{split}_{slurp_id}_t{row['take']}_answer.wav")
         os.replace(built["probe"]["audio"], path)
         rows.append(
             make_row(
-                "answer", built["target"], path, built["probe"], slurp_id, sentence
+                "answer",
+                built["target"],
+                path,
+                built["probe"],
+                slurp_id,
+                sentence,
+                row["take"],
             )
         )
 
@@ -1581,22 +1666,42 @@ if __name__ == "__main__":
 
     # avoid slurp ids in word-masking dataset, so the same sentence
     # isn't double-weighted across the 2 tracks
-    seen_ids = set()
-    for split in ("train", "test"):
-        mask_ds = load_dataset(MASK_DS_ID, split=split, streaming=True)
-        for r in mask_ds.select_columns(["slurp_id"]):
-            seen_ids.add(r["slurp_id"])
+    ear_ids = set()
+    # disabled the ear exclusion
+    # for split in ("train", "test"):
+    #     mask_ds = load_dataset(MASK_DS_ID, split=split, streaming=True)
+    #     for r in mask_ds.select_columns(["slurp_id"]):
+    #         ear_ids.add(r["slurp_id"])
 
+    # `blocked` is what may not be used at all; `takes` is how many recordings
+    # of each sentence already have been. They are separate now that a sentence
+    # may be used more than once: blocking is a hard exclusion, the cap is a
+    # budget.
+    test_takes = Counter()
     test_babble_pool = collect_babble_pool("test")
-    test_rows = build_triplets("test", cfg.n_test, seen_ids, test_babble_pool)
+    test_rows = build_triplets(
+        "test", cfg.n_test, ear_ids, test_takes, test_babble_pool
+    )
+
+    # a sentence used in test is blocked from train outright. A different
+    # speaker reading it is still the same target text, so training on one and
+    # evaluating on the other would score the adapter on a sentence it was
+    # taught -- the one place the take cap must not apply.
+    train_blocked = ear_ids | {r["slurp_id"] for r in test_rows}
+    # train and the extra-answer pass share one counter: the cap is per
+    # sentence across the whole train build, not per phase
+    train_takes = Counter()
     train_babble_pool = collect_babble_pool("train")
-    train_rows = build_triplets("train", cfg.n_train, seen_ids, train_babble_pool)
+    train_rows = build_triplets(
+        "train", cfg.n_train, train_blocked, train_takes, train_babble_pool
+    )
 
     if cfg.n_extra_ans:
         train_rows += build_answer_rows(
             "train",
             cfg.n_extra_ans,
-            seen_ids,
+            train_blocked,
+            train_takes,
             train_babble_pool,
         )
 

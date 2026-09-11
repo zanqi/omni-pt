@@ -28,7 +28,7 @@ from `__main__`. A helper that exactly one function uses does not belong at modu
 
 - **Nest it** as a `def` inside its single caller. This is the user's preferred fix: it makes the
   "only used here" relationship visible, lets the helper close over the caller's locals, and keeps the
-  caller's body short. Examples in `babble_data.py`: `classify` inside `probe_kinds`, `list2ds` inside
+  caller's body short. Examples in `babble_data.py`: `classify` inside `probe_by_kinds`, `list2ds` inside
   `__main__`.
 - **Inline it** when it is short, needs no name, and reads as one step of the caller. Mark the pasted block
   with a short comment (or a `# --- ... ---` banner for a longer block), and carry over any non-obvious
@@ -61,20 +61,38 @@ The repo has two independently-developed variants of the same idea; don't confla
      for a task response — and has an LLM classifier read (ground-truth sentence, transcript, response) to
      decide whether the audio is fully intelligible (`answer`), missing exactly one key piece (`repair`), or
      missing so much that no part can be trusted (`repeat`).
-   - Probing loop (`probe_kinds`) keeps redrawing SNR/babble (up to `MAX_PROBES` batches) until one audio
-     of each requested kind is found for an utterance; skips the utterance otherwise.
+   - Probing loop (`probe_by_kinds`) keeps redrawing SNR/babble (up to `MAX_PROBES` batches) until one
+     audio of each requested kind is found for an utterance; skips the utterance otherwise. Within a
+     batch the probes are labeled **in list order and only until every open slot is filled** — the fill
+     lets the first probe in list order claim a slot, so a label computed after the last slot is taken is
+     never read. `LABEL_LOOKAHEAD` labels run ahead of that consumer to keep the labeler busy, and is
+     therefore also the overshoot. Verified bit-identical to labeling the whole batch: a paired build
+     differed only in `target`, which `write_target` writes at `temperature=0.7`. The saving is modest
+     (measured 93% of labels still paid for on a short run) because a starved utterance fills no slot and
+     so can never stop early.
    - Excludes any `slurp_id` already used by the EAR dataset (`MASK_DS_ID = keylazy/slurp-ear-sft`) to avoid
      double-weighting the same sentence.
 
    **`slurp_id` identifies a distinct *sentence*, not a distinct recording.** SLURP streams several
-   recordings (up to ~10) of the same prompt back to back, all carrying the same `slurp_id`. So
-   `seen_slurp_ids` in `build_triplets` / `build_answer_rows` is a sentence-level dedupe — each distinct
-   sentence is used at most once per build, and the id is claimed in the *producer* (`candidates`) rather
-   than after a successful build, so the back-to-back duplicates can't race through the check together.
-   Anything keyed on the sentence text is therefore equivalent *in coverage* to keying on `slurp_id`,
-   so never justify one over the other by "it dedupes more". Prefer `slurp_id`: it is unique as-is,
-   where sentence text is only a correct key after `_normalize_text` and stays one only as long as no
-   caller re-cases or re-punctuates it. Threading the id one extra level down is the cheaper cost.
+   recordings (up to ~10) of the same prompt back to back, all carrying the same `slurp_id` — different
+   speakers reading one prompt. Those takes are kept: `SENTENCE_TAKE_CAP` (3) of them may become rows.
+   So a `slurp_id` no longer identifies a row, and `(slurp_id, take)` does; rows carry a `take` column and
+   probe wavs are named `{split}_{slurp_id}_t{take}_{kind}.wav`, because on the old name two takes of one
+   sentence would write the same file and the second would silently replace the first.
+
+   The old single `seen_slurp_ids` set did three jobs at once and is now two:
+   - `blocked_ids` — a hard exclusion, never added to while a phase runs: the EAR-track ids, plus every
+     test sentence when building train. **The cap must not apply to the test/train boundary**: a different
+     speaker reading a test sentence is still the same target text, so allowing it in train would train
+     the adapter on a sentence the eval scores.
+   - `takes` — a per-sentence budget (`Counter`). `build_triplets` for train and `build_answer_rows` share
+     one counter, so the cap is 3 per sentence across the whole train build, not 3 per phase.
+
+   The take is still claimed in the *producer* (`candidates`) rather than after a successful build:
+   `imap_ordered` keeps `UTTERANCE_WORKERS` builds in flight, so counting in the consumer let takes of one
+   sentence race through the cap together. Prefer `slurp_id` over sentence text as a key: it is unique
+   as-is, where sentence text is only a correct key after `_normalize_text` and stays one only as long as
+   no caller re-cases or re-punctuates it. Threading the id one extra level down is the cheaper cost.
    - Metric: `EAR = 3*C*R*F/(C*R + C*F + R*F)` (harmonic mean of three judged scores, one added dimension
      `F` = full-repair quality).
    - Dataset pushed to `--ds-id` (e.g. `keylazy/slurp-babble-Qwen2.5-Omni-3B-v1`).
