@@ -38,9 +38,9 @@ repair_lr: 2.0e-4
 # on it. dpo_lr is an order below repair_lr: 5e-6, the full-model DPO figure,
 # moved a rank-16 LoRA by ~1% of what SFT moved it and scored exactly SFT.
 sft_adapter: checkpoints/Qwen2.5-Omni-3B-mask-v2-sft
-prefs: results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-sft.jsonl
+prefs: results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-sft-hf.jsonl
 dpo_samples: 8
-dpo_run_name: Qwen2.5-Omni-3B-mask-v2-dpo
+dpo_run_name: Qwen2.5-Omni-3B-mask-v2-dpo-hf
 dpo_epochs: 2
 dpo_lr: 2.0e-5
 dpo_beta: 1.0
@@ -50,4 +50,4 @@ dpo_beta: 1.0
 # 1.0. tag names the result file.
 split: test
 num_rows: -1
-tag: mask-v2
+tag: mask-v2-hf

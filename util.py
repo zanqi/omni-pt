@@ -217,7 +217,7 @@ def omni_generate(model, inputs, **gen_kwargs):
 
 
 def seq_logprobs(logits, labels):
-    """Summed log-prob of each sequence's supervised tokens.
+    """Sum log-prob of each sequence's supervised tokens.
 
     logits: (B, T, V) straight from the thinker; labels: (B, T) with -100
     everywhere but the assistant turn, as OmniSFTCollator builds them. Shifts
@@ -228,12 +228,15 @@ def seq_logprobs(logits, labels):
     Shared by mask_dpo_data.py (reference logps, under the SFT model) and
     dpo_qwen.py (policy logps, under the LoRA being trained).
     """
+
     logits = logits[:, :-1, :]
     labels = labels[:, 1:]
     mask = labels != -100
     safe = labels.masked_fill(~mask, 0).unsqueeze(-1)
     token_logp = torch.log_softmax(logits.float(), dim=-1).gather(-1, safe).squeeze(-1)
+
     return (token_logp * mask).sum(dim=-1)
+
 
 def load_config(path, cls):
     import yaml

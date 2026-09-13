@@ -41,7 +41,7 @@ from prompts import (
     RESPONSE_TYPE_NORESTATE_SYSTEM,
     RESPONSE_TYPE_SYSTEM,
     split_heard_reply,
-    task_prompt,
+    get_task_prompt,
 )
 
 AUDIO_SAMPLING_RATE = 16000
@@ -138,7 +138,7 @@ def run_model(
                     # must match the prompt the adapter was trained under --
                     # evaluating an hr adapter under the plain prompt is a
                     # train/test mismatch that reads as a regression
-                    {"type": "text", "text": task_prompt(heard_reply, plain)},
+                    {"type": "text", "text": get_task_prompt(heard_reply, plain)},
                 ],
             }
         )
@@ -146,7 +146,9 @@ def run_model(
         text = processor.apply_chat_template(
             conversation, add_generation_prompt=True, tokenize=False
         )
-        audios, images, videos, *_ = process_mm_info(conversation, use_audio_in_video=False)
+        audios, images, videos, *_ = process_mm_info(
+            conversation, use_audio_in_video=False
+        )
         inputs = processor(
             text=text,
             audio=audios,

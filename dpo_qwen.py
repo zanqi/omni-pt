@@ -280,6 +280,7 @@ def main():
         prefs = prefs[: args.limit]
     if not prefs:
         raise SystemExit(f"no usable pairs in {args.prefs}")
+
     # repair pairs outnumber answer pairs ~3:1 -- the SFT policy already
     # answers most answerable rows perfectly, so those rows make no pair --
     # and every repair `chosen` is a clarifying question. Unweighted, the run
@@ -290,6 +291,7 @@ def main():
     n_kind = Counter(p["kind"] for p in prefs)
     for p in prefs:
         p["weight"] = len(prefs) / (len(n_kind) * n_kind[p["kind"]])
+
     print(
         f"{len(prefs)} pairs | kinds {n_kind} | "
         f"weights { {k: round(len(prefs) / (len(n_kind) * v), 2) for k, v in n_kind.items()} } | "

@@ -37,7 +37,7 @@ TASK_PROMPT_V2 = (
 )
 
 
-def task_prompt(heard_reply, plain=False):
+def get_task_prompt(heard_reply, plain=False):
     """The system prompt a run generates under. Restating is the default.
 
     Naming the request's specifics back is what the answer targets are written
@@ -45,6 +45,7 @@ def task_prompt(heard_reply, plain=False):
     data. TASK_PROMPT (no restatement clause) is still reachable with
     `plain=True`, which is what reproduces the runs already in results/.
     """
+
     if heard_reply:
         return TASK_PROMPT_HR
     return TASK_PROMPT if plain else TASK_PROMPT_V2
@@ -1722,7 +1723,7 @@ def get_prompts(task, family="qwen2.5"):
         return sysp, ASR_PROMPT_QWEN2_5
     if task == "repair":
         sysp = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
-        return sysp, task_prompt(heard_reply=False, plain=False)
+        return sysp, get_task_prompt(heard_reply=False, plain=False)
     if task == "hr":
         # The heard-reply track: same weights and the same repair_* config keys,
         # the two-line output contract is the only difference. It has to be the
@@ -1730,5 +1731,5 @@ def get_prompts(task, family="qwen2.5"):
         # Reply: ..." pair, so training them under the restate prompt teaches
         # the scaffolding without ever asking for it.
         sysp = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
-        return sysp, task_prompt(heard_reply=True)
+        return sysp, get_task_prompt(heard_reply=True)
     raise ValueError(f"unknown task {task!r}")

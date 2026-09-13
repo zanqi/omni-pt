@@ -32,18 +32,18 @@ mkdir -p results logs
 
 CFG=configs/mask-crf.yaml
 SFT=checkpoints/Qwen2.5-Omni-3B-mask-v2-sft
-DPO=checkpoints/Qwen2.5-Omni-3B-mask-v2-dpo
+DPO=checkpoints/Qwen2.5-Omni-3B-mask-v2-dpo-hf
 
 # the build alone runs in qwen3omni: that is where transformers is new enough
 # to carry the forced aligner, and openai-whisper (the mask gate) is installed
 # beside it. Everything after it loads an omni model, which wants qwen25omni.
 conda activate qwen3omni
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-python -u mask_data.py --config $CFG
+# python -u mask_data.py --config $CFG
 
 conda activate qwen25omni
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-python -u sft_qwen.py      --config $CFG
+# python -u sft_qwen.py      --config $CFG
 python -u mask_dpo_data.py --config $CFG
 python -u dpo_qwen.py      --config $CFG
 

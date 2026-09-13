@@ -1,4 +1,4 @@
-# sent1asr-v2 -- NOT a rebuild. It reuses the sent1asr-v1 dataset unchanged and
+# sent1asr-v2 -- NOT a rebuild. It reuses the sent1asr-v2 dataset unchanged and
 # only re-runs what the 4da5e87 prompt/rubric changes invalidated:
 #
 #   * TASK_PROMPT_V2 gained the "ask a targeted question / ask to repeat"
@@ -20,19 +20,19 @@
 # Model
 omni_path: Qwen/Qwen2.5-Omni-3B
 
-# the v1 dataset, reused as-is. `label`/`n_*` are here only so a BUILD=1 run
+# the v2 dataset, reused as-is. `label`/`n_*` are here only so a BUILD=1 run
 # would reproduce it rather than silently building the default track.
 label: sent-1-asr
-ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent1asr-v1
+ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent1asr-v2
 n_train: 1000
 n_test: 100
 n_extra_ans: 1000
 
 # --- the repair LoRA (sft_qwen.py) ---
-# v2 repo name: retraining under the v1 name would overwrite both
-# checkpoints/Qwen2.5-Omni-3B-bab-sent1asr-sft and its Hub repo, and the v1
+# v2 repo name: retraining under the v2 name would overwrite both
+# checkpoints/Qwen2.5-Omni-3B-bab-sent1asr-sft and its Hub repo, and the v2
 # numbers in results/ would then point at weights that no longer exist.
-repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent1asr-v1
+repair_ds_id: keylazy/slurp-bab-Qwen2.5-Omni-3B-sent1asr-v2
 repair_repo_name: Qwen2.5-Omni-3B-bab-sent1asr-v2-sft
 repair_epochs: 3
 repair_lr: 2.0e-4

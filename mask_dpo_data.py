@@ -27,6 +27,7 @@ under --ds-id and re-uploading it per DPO run buys nothing.
 import argparse
 import json
 import os
+import random
 import tempfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -35,10 +36,11 @@ from dataclasses import dataclass
 import soundfile as sf
 import torch
 from datasets import Audio, load_dataset
+from qwen_omni_utils import process_mm_info
 from tqdm import tqdm
 
 from mask_eval_qwen import JUDGE_BY_KIND, get_audio, judge_user, make_judge
-from prompts import QWEN25_SYSTEM_PROMPT, task_prompt
+from prompts import QWEN25_SYSTEM_PROMPT, get_task_prompt
 from util import (
     detect_model_family,
     load_config,
@@ -53,6 +55,7 @@ MAX_AUDIO_SECONDS = 30
 # forward pass on both; 0.5 is one rubric step
 MIN_MARGIN = 0.5
 JUDGE_WORKERS = 8
+REPEAT_SHARE = 0.7
 
 
 @dataclass
@@ -68,6 +71,72 @@ class Config:
     sft_adapter: str | None = None
     prefs: str | None = None
     dpo_samples: int = 8
+
+
+def conversation(wav_path: str, task_prompt: str, sys_prompt=None, resp=None):
+    """concat sys prompt, audio, task prompt, and assistant resp into an openai conv array"""
+
+    conv = []
+    if sys_prompt is not None:
+        conv.append(
+            {"role": "system", "content": [{"type": "text", "text": sys_prompt}]}
+        )
+
+    conv.append(
+        {
+            "role": "user",
+            "content": [
+                {"type": "audio", "audio": wav_path},
+                {"type": "text", "text": task_prompt},
+            ],
+        }
+    )
+
+    if resp is not None:
+        conv.append({"role": "assistant", "content": [{"type": "text", "text": resp}]})
+    return conv
+
+
+def pre_process(processor, conv, add_generation_prompt: bool):
+    text = processor.apply_chat_template(
+        conv, add_generation_prompt=add_generation_prompt, tokenize=False
+    )
+    audios, images, videos, *_ = process_mm_info(conv, use_audio_in_video=False)
+    return processor(
+        text=text,
+        audio=audios,
+        images=images,
+        videos=videos,
+        return_tensors="pt",
+    )
+
+
+@torch.inference_mode()
+def ref_logprob(model, processor, wav_path, task_prompt, resp, sys_prompt):
+    """log P(resp | audio, prompts) under the SFT model.
+
+    The label mask is built the way OmniSFTCollator builds it: render the
+    conversation with and without the assistant turn and diff the token
+    counts, Only consider text after '<|im_start|>assistant\\n'.
+    """
+
+    # full text is sys+audio+resp
+    full_conv = conversation(wav_path, task_prompt, sys_prompt, resp)
+    # prompt text is sys+audio+"<|im_start|>assistant\\n"
+    prefix_conv = conversation(wav_path, task_prompt, sys_prompt)
+
+    # TODO: refactor it to util and make OmniSFTCollator use it too
+    full = pre_process(processor, full_conv, add_generation_prompt=False)
+    prefix = pre_process(processor, prefix_conv, add_generation_prompt=True)
+    ans_len = int(full["attention_mask"].sum() - prefix["attention_mask"].sum())
+    if ans_len <= 0:
+        return None
+    full = full.to(model.device).to(model.dtype)
+    labels = torch.full_like(full["input_ids"], -100)
+    labels[:, -ans_len:] = full["input_ids"][:, -ans_len:]
+    logits = model.thinker(**full).logits
+
+    return float(seq_logprobs(logits, labels)[0])
 
 
 def main():
@@ -131,6 +200,7 @@ def main():
             out=cfg.prefs,
             samples=cfg.dpo_samples,
         )
+
     args = ap.parse_args()
     # not required=True: the config supplies it, and argparse checks required
     # flags before set_defaults has been given a chance to fill them
@@ -155,97 +225,64 @@ def main():
     judge_fn = make_judge(
         judge_model, base_url=judge_url, max_tokens=args.judge_max_tokens
     )
-    system_prompt = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
-    prompt_text = task_prompt(False, args.plain_prompt)
-
-    def conversation(wav_path, answer=None):
-        conv = []
-        if system_prompt is not None:
-            conv.append(
-                {"role": "system", "content": [{"type": "text", "text": system_prompt}]}
-            )
-        conv.append(
-            {
-                "role": "user",
-                "content": [
-                    {"type": "audio", "audio": wav_path},
-                    {"type": "text", "text": prompt_text},
-                ],
-            }
-        )
-        if answer is not None:
-            conv.append(
-                {"role": "assistant", "content": [{"type": "text", "text": answer}]}
-            )
-        return conv
+    sys_prompt = QWEN25_SYSTEM_PROMPT if family == "qwen2.5" else None
+    task_prompt = get_task_prompt(False, args.plain_prompt)
 
     @torch.inference_mode()
-    def sample_k(wav_path):
-        """K sampled replies in one generate call -- the audio encoder runs once."""
-        from qwen_omni_utils import process_mm_info
+    def sample_k(wav_path, k):
+        """sample K replies in one generate call -- the audio encoder runs once."""
 
-        conv = conversation(wav_path)
-        text = processor.apply_chat_template(
-            conv, add_generation_prompt=True, tokenize=False
+        conv = conversation(wav_path, task_prompt, sys_prompt)
+        inputs = (
+            pre_process(processor, conv, add_generation_prompt=True)
+            .to(model.device)
+            .to(model.dtype)
         )
-        audios, images, videos, *_ = process_mm_info(conv, use_audio_in_video=False)
-        inputs = processor(
-            text=text, audio=audios, images=images, videos=videos, return_tensors="pt"
-        ).to(model.device).to(model.dtype)
         ids = model.generate(
             **inputs,
             return_audio=False,
             do_sample=True,
             temperature=args.temperature,
             top_p=args.top_p,
-            num_return_sequences=args.samples,
+            num_return_sequences=k,
             thinker_max_new_tokens=args.max_new_tokens,
         )
         gen = ids[:, inputs["input_ids"].shape[1] :]
+
         return [
-            t.strip()
-            for t in processor.batch_decode(
+            txt.strip()
+            for txt in processor.batch_decode(
                 gen, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
         ]
 
-    @torch.inference_mode()
-    def ref_logprob(wav_path, answer):
-        """log P(answer | audio, prompt) under the SFT model.
+    # === get ans negative ===
+    #
+    # kind -> slurp_id -> target
+    by_kind = {"repeat": {}, "repair": {}}
+    for r in ds.select_columns(["kind", "slurp_id", "target"]):
+        if r["kind"] in by_kind and r["target"]:
+            by_kind[r["kind"]][r["slurp_id"]] = r["target"]
+    repair_by_sid, repeat_by_sid = by_kind["repair"], by_kind["repeat"]
+    rng = random.Random(0)
 
-        The label mask is built the way OmniSFTCollator builds it: render the
-        conversation with and without the assistant turn and diff the token
-        counts, since add_generation_prompt's trailing '<|im_start|>assistant\\n'
-        is a prefix of the full render.
-        """
-        from qwen_omni_utils import process_mm_info
+    def get_ans_negative(row):
+        sid = row["slurp_id"]
 
-        full_conv = conversation(wav_path, answer)
-        full_text = processor.apply_chat_template(
-            full_conv, add_generation_prompt=False, tokenize=False
+        want_repeat = rng.random() < REPEAT_SHARE
+        first, second = (
+            (repeat_by_sid, repair_by_sid)
+            if want_repeat
+            else (repair_by_sid, repeat_by_sid)
         )
-        prompt_text_only = processor.apply_chat_template(
-            conversation(wav_path), add_generation_prompt=True, tokenize=False
+
+        # first kind choice > second kind choice
+        # > repeat pool
+        return (
+            first.get(sid)
+            or second.get(sid)
+            or rng.choice(list(repeat_by_sid.values()))
         )
-        audios, images, videos, *_ = process_mm_info(full_conv, use_audio_in_video=False)
-        full = processor(
-            text=full_text, audio=audios, images=images, videos=videos,
-            return_tensors="pt",
-        )
-        prompt = processor(
-            text=prompt_text_only, audio=audios, images=images, videos=videos,
-            return_tensors="pt",
-        )
-        ans_len = int(
-            full["attention_mask"].sum() - prompt["attention_mask"].sum()
-        )
-        if ans_len <= 0:
-            return None
-        full = full.to(model.device).to(model.dtype)
-        labels = torch.full_like(full["input_ids"], -100)
-        labels[:, -ans_len:] = full["input_ids"][:, -ans_len:]
-        logits = model.thinker(**full).logits
-        return float(seq_logprobs(logits, labels)[0])
 
     kept, stats = 0, Counter()
     with open(out_path, "w", encoding="utf-8") as fout:
@@ -254,15 +291,18 @@ def main():
             arr = arr[: MAX_AUDIO_SECONDS * AUDIO_SAMPLING_RATE]
             fd, wav_path = tempfile.mkstemp(suffix=".wav")
             os.close(fd)
+
             try:
                 sf.write(wav_path, arr, sr)
-                samples = sample_k(wav_path)
+                samples = sample_k(wav_path, args.samples)
+
                 # dedupe before judging: identical samples cost a judge call
                 # each and can never form a pair with each other
                 uniq = list(dict.fromkeys(s for s in samples if s))
                 if not uniq:
                     stats["empty"] += 1
                     continue
+
                 with ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as ex:
                     judged = list(
                         ex.map(
@@ -272,35 +312,68 @@ def main():
                             uniq,
                         )
                     )
+
                 # score only, and a stable sort, so ties keep sampling order.
                 # Breaking them on length made `chosen` the shortest sample of
                 # the top score and `rejected` the longest of the bottom one,
                 # which teaches brevity as much as it teaches repair.
                 scored = sorted(
-                    ({"text": s, "score": j[0], "reason": j[1]} for s, j in zip(uniq, judged)),
+                    (
+                        {"text": s, "score": j[0], "reason": j[1]}
+                        for s, j in zip(uniq, judged)
+                    ),
                     key=lambda d: d["score"],
                 )
                 best, worst = scored[-1], scored[0]
 
                 pair_source = "sampled"
                 if best["score"] - worst["score"] < MIN_MARGIN:
-                    if best["score"] >= 1.0:
-                        # the policy already gets this row right every time
-                        stats["all-good"] += 1
-                        continue
-                    if worst["score"] > 0.0:
+                    # this means best == worst when min margin is 0.5
+
+                    if worst["score"] >= 1.0:
+                        # worst == best == 1.0
+                        # the policy already gets this audio right every time
+                        if row["kind"] != "answer":
+                            stats["all-good"] += 1
+                            continue
+
+                        # pick a non-answer resp from the other 2 of the triplet
+                        worst = {
+                            "text": get_ans_negative(row),
+                            "score": 0.0,
+                            "reason": "clarify on an answerable row",
+                        }
+                        pair_source = "mint-negative"
+
+                    elif worst["score"] > 0.0:
+                        # best == worst == 0.5 here
                         stats["flat"] += 1
                         continue
-                    # every sample failed: the row is worth keeping, but the
-                    # only better answer available is the written target
-                    if not row.get("target"):
-                        stats["all-bad-no-target"] += 1
-                        continue
-                    best = {"text": row["target"], "score": 1.0, "reason": "dataset target"}
-                    pair_source = "gold-chosen"
+                    else:
+                        # every sample failed: the row is worth keeping, but the
+                        # only better answer available is the written target
+                        if not row.get("target"):
+                            stats["all-bad-no-target"] += 1
+                            continue
+                        best = {
+                            "text": row["target"],
+                            "score": 1.0,
+                            "reason": "dataset target",
+                        }
+                        pair_source = "gold-chosen"
 
-                ref_c = ref_logprob(wav_path, best["text"])
-                ref_r = ref_logprob(wav_path, worst["text"])
+                ref_c = ref_logprob(
+                    model, processor, wav_path, task_prompt, best["text"], sys_prompt
+                )
+                ref_r = ref_logprob(
+                    model,
+                    processor,
+                    wav_path,
+                    task_prompt,
+                    worst["text"],
+                    sys_prompt,
+                )
+
                 if ref_c is None or ref_r is None:
                     stats["logprob"] += 1
                     continue
@@ -338,6 +411,16 @@ def main():
 
     print(f"\nkept {kept}/{len(ds)} pairs -> {out_path}")
     print(f"breakdown: {dict(stats)}")
+    # the minted share is the fix itself, so report it rather than leaving it
+    # to a grep over the JSONL: a run that mints nothing has silently fallen
+    # back to the old pair set, and one dominated by them is a different kind
+    # of run -- every minted negative is off-policy dataset text
+    if kept:
+        print(
+            f"mint-negative: {stats['mint-negative']}/{kept} "
+            f"({stats['mint-negative'] / kept:.0%}) of pairs hold firm on an "
+            "answerable row the policy never gets wrong"
+        )
     if stats["gold-chosen"] > kept * 0.5:
         print(
             "warning: over half the pairs use the written target as `chosen`. "

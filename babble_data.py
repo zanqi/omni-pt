@@ -42,7 +42,7 @@ from prompts import (
     TASK_PROMPT,
     TASK_PROMPT_V2,
     split_heard_reply,
-    task_prompt,
+    get_task_prompt,
 )
 from util import (
     NUM_BAB_SPEAKERS,
@@ -1015,7 +1015,7 @@ def probe_by_kinds(clean, pool, sentence, kinds_need, batch_size, rng):
             label_one = lambda w: label_sent_ids(pieces, w)
             label_args = witnesses
         elif TRACK == "heard-reply":
-            convs = [_conv(p, sysp, task_prompt(True)) for p in paths]
+            convs = [_conv(p, sysp, get_task_prompt(True)) for p in paths]
             outs = base_generate_batch(
                 convs, RESP_MAX_NEW_TOKENS, prefill=HEARD_PREFILL
             )

@@ -43,7 +43,7 @@ from prompts import (
     QWEN25_SYSTEM_PROMPT,
     REPAIR_JUDGE_SYSTEM,
     REPEAT_JUDGE_SYSTEM,
-    task_prompt,
+    get_task_prompt,
 )
 from util import detect_model_family, load_config, load_model, resolve_judge
 
@@ -101,7 +101,7 @@ def run_model(model, processor, family, audio_array, sr, max_new_tokens, plain):
                     # must match what the adapter was trained under: scoring a
                     # restate-trained adapter under the plain prompt is a
                     # train/test mismatch that reads as a regression
-                    {"type": "text", "text": task_prompt(False, plain)},
+                    {"type": "text", "text": get_task_prompt(False, plain)},
                 ],
             }
         )
@@ -109,7 +109,9 @@ def run_model(model, processor, family, audio_array, sr, max_new_tokens, plain):
         text = processor.apply_chat_template(
             conversation, add_generation_prompt=True, tokenize=False
         )
-        audios, images, videos, *_ = process_mm_info(conversation, use_audio_in_video=False)
+        audios, images, videos, *_ = process_mm_info(
+            conversation, use_audio_in_video=False
+        )
         inputs = processor(
             text=text, audio=audios, images=images, videos=videos, return_tensors="pt"
         )
@@ -236,7 +238,9 @@ def breakdown(bucket_scores):
             vals = by_kind.get(kind, [])
             means[METRIC_NAME[kind]] = sum(vals) / len(vals) if vals else None
         n = sum(len(v) for v in by_kind.values())
-        scored = [means[METRIC_NAME[k]] for k in KINDS if means[METRIC_NAME[k]] is not None]
+        scored = [
+            means[METRIC_NAME[k]] for k in KINDS if means[METRIC_NAME[k]] is not None
+        ]
         out[name] = {
             **means,
             "EAR": harmonic(*scored) if len(scored) == len(KINDS) else None,
@@ -366,7 +370,13 @@ def main():
         arr, sr = get_audio(row["audio"])
         with GPU_LOCK:
             resp = run_model(
-                model, processor, family, arr, sr, args.max_new_tokens, args.plain_prompt
+                model,
+                processor,
+                family,
+                arr,
+                sr,
+                args.max_new_tokens,
+                args.plain_prompt,
             )
         score, reason = judge_fn(JUDGE_BY_KIND[row["kind"]], judge_user(row, resp))
         return {"resp": resp, "score": score, "reason": reason}
@@ -469,7 +479,9 @@ def main():
         ("R (repair)", "repair", R),
         ("F (repeat)", "repeat", F),
     ):
-        print(f"{label}: {val if val is None else round(val, 3)}  n={len(scores[kind])}")
+        print(
+            f"{label}: {val if val is None else round(val, 3)}  n={len(scores[kind])}"
+        )
     print(f"EAR:        {EAR:.3f}")
     for title, block in (
         ("by mask", summary["by_mask"]),
