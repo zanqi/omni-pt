@@ -19,8 +19,7 @@ and last in the file, so results/viz.ipynb reads these runs unchanged; `F`
 sits beside them and a two-kind dataset simply has none, which is what keeps
 the v1 result files readable next to these.
 
-  python mask_eval_qwen.py --config configs/mask-crf.yaml \
-      --adapter-path checkpoints/Qwen2.5-Omni-3B-mask-v2-sft
+  python mask_eval_qwen.py --config configs/eval/mask-crf-sft.yaml
 """
 
 import argparse
@@ -251,19 +250,23 @@ def breakdown(bucket_scores):
 
 @dataclass
 class Config:
-    """The track YAML's own key names, which are not this script's older flag
-    names -- the file is shared with mask_data.py, sft_qwen.py, mask_dpo_data.py
-    and dpo_qwen.py, so it spells the dataset `ds_id` and the model
-    `omni_path`. main() maps the pairs onto the parser as defaults, which is
-    what leaves an explicit flag winning over the file. `adapter_path` is
-    deliberately absent: which model a row evaluates is a driver decision
-    (exp/mask-crf.slurm scores base, SFT and DPO off one config), not a
-    property of the track."""
+    """One eval config's key names (configs/eval/*.yaml), spelled the way the
+    track YAML spells the same things -- `ds_id` for the dataset, `omni_path`
+    for the model -- because a run is read beside the track that trained it.
+    main() maps the pairs onto the parser as defaults, which is what leaves an
+    explicit flag winning over the file.
+
+    `adapter_path` belongs here rather than to the track: which model a row
+    evaluates is a per-run decision, so one ladder is three of these files
+    (base, SFT, DPO) over one track config, not one file with a flag."""
 
     omni_path: str = "Qwen/Qwen2.5-Omni-3B"
     ds_id: str = "keylazy/slurp-mask-v1"
     split: str = "test"
     num_rows: int = -1
+    # None scores the plain base model; a comma-separated stack is merged left
+    # to right, like the flag
+    adapter_path: str | None = None
     # names the result file; two tracks scored the same way otherwise
     # overwrite each other
     tag: str = "mask"
@@ -273,8 +276,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--config",
-        help="Track YAML (configs/*.yaml). Its keys become parser defaults, so "
-        "any flag also given on the command line still wins.",
+        help="Eval YAML (configs/eval/*.yaml). Its keys become parser "
+        "defaults, so any flag also given on the command line still wins.",
     )
     ap.add_argument("--dataset", default="keylazy/slurp-mask-v1")
     ap.add_argument("--split", default="test")
@@ -335,6 +338,7 @@ def main():
             dataset=cfg.ds_id,
             split=cfg.split,
             num_rows=cfg.num_rows,
+            adapter_path=cfg.adapter_path,
             tag=cfg.tag,
         )
     args = ap.parse_args()

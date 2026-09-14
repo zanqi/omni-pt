@@ -1,0 +1,23 @@
+# The SFT row of the mask-crf ladder (exp/mask-crf.slurm): the LoRA adapter
+# sft_qwen.py wrote from the track config's repair_repo_name, which is also
+# the checkpoint mask_dpo_data.py sampled its preference pairs from.
+#
+# One eval run is one file, and the three mask-crf-*.yaml differ only in
+# adapter_path -- everything else has to match, or the rows are not a ladder.
+# They restate the dataset and the model rather than reading
+# configs/mask-crf.yaml: a result file outlives the track config, and the
+# eval that produced it should still say what it scored. Bumping a sweep
+# therefore touches the track config AND these three tags.
+#
+# Keys not declared by Config are dropped SILENTLY -- read the "config: ..."
+# line the script prints on start.
+
+omni_path: Qwen/Qwen2.5-Omni-3B
+adapter_path: checkpoints/Qwen2.5-Omni-3B-mask-v2-hn-sft
+
+ds_id: keylazy/slurp-mask-v2
+split: test
+num_rows: -1
+
+# names the result file: results/mask_results_<model-or-adapter>_<tag>.jsonl
+tag: mask-v2-hn

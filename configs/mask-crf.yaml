@@ -7,10 +7,14 @@
 #   ./exp/mask-crf.slurm
 #   sbatch exp/mask-crf.slurm
 #
-# These are mask-all.sh's v2 defaults verbatim, which means re-running a stage
-# overwrites that sweep's files (results/mask_results_*_mask-v2.jsonl,
-# results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-sft.jsonl). Change the four names
-# below to keep them.
+# Every stage's output name carries the sweep suffix -- currently `hn`, the
+# hard-negative pair recipe (mask_dpo_data.py picks `rejected` as the best
+# sample still a rubric step below `chosen`, and mints a negative on only
+# MINT_RATE of the all-good answer rows). Re-running a stage overwrites that
+# sweep's files, so a new recipe bumps the suffix in the four names below --
+# repair_repo_name, sft_adapter, prefs, dpo_run_name -- rather than landing on
+# top of the `hf` sweep the paper tables already read, and in the adapter_path
+# and tag of the three configs/eval/mask-crf-*.yaml that score them.
 #
 # Keys not declared by a stage's Config dataclass are dropped SILENTLY -- read
 # the "config: ..." line each script prints on start.
@@ -28,7 +32,7 @@ n_test: 100
 # and --task picks which half of the repair_*/asr_* keys is read.
 task: repair
 repair_ds_id: keylazy/slurp-mask-v2
-repair_repo_name: Qwen2.5-Omni-3B-mask-v2-sft
+repair_repo_name: Qwen2.5-Omni-3B-mask-v2-hn-sft
 train_kinds: answer,repair,repeat
 repair_epochs: 3
 repair_lr: 2.0e-4
@@ -37,17 +41,13 @@ repair_lr: 2.0e-4
 # read sft_adapter and prefs -- the first writes that file, the second trains
 # on it. dpo_lr is an order below repair_lr: 5e-6, the full-model DPO figure,
 # moved a rank-16 LoRA by ~1% of what SFT moved it and scored exactly SFT.
-sft_adapter: checkpoints/Qwen2.5-Omni-3B-mask-v2-sft
-prefs: results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-sft-hf.jsonl
+sft_adapter: checkpoints/Qwen2.5-Omni-3B-mask-v2-hn-sft
+prefs: results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-hn-sft.jsonl
 dpo_samples: 8
-dpo_run_name: Qwen2.5-Omni-3B-mask-v2-dpo-hf
+dpo_run_name: Qwen2.5-Omni-3B-mask-v2-hn-dpo
 dpo_epochs: 2
 dpo_lr: 2.0e-5
 dpo_beta: 1.0
 
-# the eval (mask_eval_qwen.py). The row's own label picks the rubric and the
-# rubric returns the score, so a confident answer on a repair row cannot score
-# 1.0. tag names the result file.
-split: test
-num_rows: -1
-tag: mask-v2-hf
+# the eval is NOT here: one run per model is one file under configs/eval/, so
+# a ladder is three of them over this one track (configs/eval/mask-crf-*.yaml).

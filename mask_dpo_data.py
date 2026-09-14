@@ -9,10 +9,14 @@ C or R.
 
   1. sample K responses per train row at temperature 1.0
   2. score all K with the per-kind rubric (ANSWER_JUDGE_SYSTEM / REPAIR_JUDGE_SYSTEM)
-  3. chosen = best, rejected = worst, kept only if the margin is >= MIN_MARGIN
-  4. all-K-perfect rows are dropped (no gradient); all-K-zero rows fall back to
-     the dataset's written target as `chosen`, counted separately because a set
-     dominated by those is really just more SFT
+  3. chosen = best, rejected = the HARDEST losing sample -- the best one still
+     a full rubric step (MIN_MARGIN) below `chosen`, so a repair pair is
+     1-vs-0.5 rather than 1-vs-0 wherever the policy produced both
+  4. all-K-perfect rows are dropped, except that MINT_RATE of the answer ones
+     keep a written clarification as `rejected` (holding firm is a behaviour,
+     and the policy never fails at it on its own); rows where every sample tied
+     below 1.0 fall back to the dataset's written target as `chosen`, counted
+     separately because a set dominated by those is really just more SFT
   5. reference log-probs for both sides, computed here while the SFT model is
      already resident -- that is exactly the DPO reference, so dpo_qwen.py
      never has to hold a second model
@@ -56,6 +60,15 @@ MAX_AUDIO_SECONDS = 30
 MIN_MARGIN = 0.5
 JUDGE_WORKERS = 8
 REPEAT_SHARE = 0.7
+# share of all-good `answer` rows that mint a negative. dpo_qwen.py weights
+# pairs so each kind carries a third of the loss no matter how many pairs it
+# has, so capping this does NOT quiet the hold-firm signal -- it decides what
+# that third is made of. Uncapped it was 803 of 1000 answer pairs (42% of the
+# whole set), every one of them dataset text the policy would never emit, and
+# the -hf run separated them to a 3 nats/token margin while repair@1 moved by
+# 3 rows out of 400. At 0.25 the answer third is mostly sampled rows the
+# policy actually got wrong.
+MINT_RATE = 0.25
 
 
 @dataclass
@@ -284,6 +297,8 @@ def main():
             or rng.choice(list(repeat_by_sid.values()))
         )
 
+    # ===
+
     kept, stats = 0, Counter()
     with open(out_path, "w", encoding="utf-8") as fout:
         for row in tqdm(ds, desc="pairs", unit="row", dynamic_ncols=True):
@@ -324,7 +339,16 @@ def main():
                     ),
                     key=lambda d: d["score"],
                 )
-                best, worst = scored[-1], scored[0]
+                best = scored[-1]
+                # the hardest negative, not the worst sample. On the rubric's
+                # {0, 0.5, 1} steps `scored[0]` made most repair pairs 1-vs-0,
+                # a distinction the SFT policy already makes; the pair that is
+                # still open is 1-vs-0.5 -- asks for clarification, but not
+                # about the piece that went missing -- which is where 37% of
+                # the eval's repair rows sit. One rubric step down is still
+                # MIN_MARGIN, so the filter is what picks the side.
+                losing = [s for s in scored if best["score"] - s["score"] >= MIN_MARGIN]
+                worst = losing[-1] if losing else scored[0]
 
                 pair_source = "sampled"
                 if best["score"] - worst["score"] < MIN_MARGIN:
@@ -333,7 +357,7 @@ def main():
                     if worst["score"] >= 1.0:
                         # worst == best == 1.0
                         # the policy already gets this audio right every time
-                        if row["kind"] != "answer":
+                        if row["kind"] != "answer" or rng.random() >= MINT_RATE:
                             stats["all-good"] += 1
                             continue
 
@@ -345,16 +369,16 @@ def main():
                         }
                         pair_source = "mint-negative"
 
-                    elif worst["score"] > 0.0:
-                        # best == worst == 0.5 here
-                        stats["flat"] += 1
+                    elif not row.get("target"):
+                        stats["all-bad-no-target"] += 1
                         continue
                     else:
-                        # every sample failed: the row is worth keeping, but the
-                        # only better answer available is the written target
-                        if not row.get("target"):
-                            stats["all-bad-no-target"] += 1
-                            continue
+                        # every sample landed on the same sub-perfect score:
+                        # all-0 (nothing usable was sampled) or all-0.5 (the
+                        # policy always asks and never on target -- again the
+                        # repair@0.5 bucket the eval is stuck in, which used
+                        # to be dropped as "flat"). Either way the written
+                        # target is the only better reply on hand.
                         best = {
                             "text": row["target"],
                             "score": 1.0,

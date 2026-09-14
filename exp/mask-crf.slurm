@@ -5,8 +5,8 @@
 #SBATCH --partition=gpu-a40
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=188G
+#SBATCH --cpus-per-task=6
+#SBATCH --mem=125G
 #SBATCH --gpus=1
 #SBATCH --time=1-00:00:00
 #SBATCH --chdir=/gscratch/sciencehub/zanqil/projects/omni-pt
@@ -31,8 +31,6 @@ set -eo pipefail
 mkdir -p results logs
 
 CFG=configs/mask-crf.yaml
-SFT=checkpoints/Qwen2.5-Omni-3B-mask-v2-sft
-DPO=checkpoints/Qwen2.5-Omni-3B-mask-v2-dpo-hf
 
 # the build alone runs in qwen3omni: that is where transformers is new enough
 # to carry the forced aligner, and openai-whisper (the mask gate) is installed
@@ -43,19 +41,21 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 conda activate qwen25omni
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-# python -u sft_qwen.py      --config $CFG
+python -u sft_qwen.py      --config $CFG
 python -u mask_dpo_data.py --config $CFG
 python -u dpo_qwen.py      --config $CFG
 
 # one test split, one judge, three lines -- base is what makes the SFT and DPO
-# numbers mean anything. The adapter is a flag, not a config key: which model a
-# row evaluates is this driver's decision.
-python -u mask_eval_qwen.py --config $CFG
-python -u mask_eval_qwen.py --config $CFG --adapter-path $SFT
-python -u mask_eval_qwen.py --config $CFG --adapter-path $DPO
+# numbers mean anything. Which model a row evaluates is not a property of the
+# track, so each row is its own file under configs/eval/; the three differ
+# only in adapter_path.
+python -u mask_eval_qwen.py --config configs/eval/mask-crf-base.yaml
+python -u mask_eval_qwen.py --config configs/eval/mask-crf-sft.yaml
+python -u mask_eval_qwen.py --config configs/eval/mask-crf-dpo.yaml
 
 # cross-track transfer, if wanted: the mask test split was built leak-free
 # against both of these adapters' training sentences (mask_data.py
-# --exclude-ds), which is what makes scoring them here legitimate.
-# python -u mask_eval_qwen.py --config $CFG --adapter-path keylazy/Qwen2.5-Omni-3B-bab-sent4-sft
-# python -u mask_eval_qwen.py --config $CFG --adapter-path keylazy/Qwen2.5-Omni-3B-ear-sft-adapter
+# --exclude-ds), which is what makes scoring them here legitimate. A flag still
+# beats the file, so a transfer row needs no fourth eval config.
+# python -u mask_eval_qwen.py --config configs/eval/mask-crf-base.yaml --adapter-path keylazy/Qwen2.5-Omni-3B-bab-sent4-sft
+# python -u mask_eval_qwen.py --config configs/eval/mask-crf-base.yaml --adapter-path keylazy/Qwen2.5-Omni-3B-ear-sft-adapter

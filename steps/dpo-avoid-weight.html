@@ -1,0 +1,557 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <title>Every row a pair: balancing DPO by construction instead of by weight</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #ffffff;
+      --fg: #1a1a1a;
+      --muted: #5b5b5b;
+      --rule: #ddd;
+      --code-bg: #f4f4f5;
+      --accent: #8a3ffc;
+      --bad: #c0392b;
+      --ok: #1a7f37;
+      --warn: #b8860b;
+      --card: #fafafa;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #15161a;
+        --fg: #e8e8ea;
+        --muted: #a0a0a8;
+        --rule: #33343a;
+        --code-bg: #1e1f25;
+        --accent: #b794ff;
+        --bad: #ff6b6b;
+        --ok: #4fd07a;
+        --warn: #e0b344;
+        --card: #1b1c22;
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 2.5rem 1.5rem 5rem;
+    }
+
+    h1 { font-size: 1.7rem; margin-bottom: .2rem; }
+    h2 { font-size: 1.25rem; margin-top: 2.8rem; border-bottom: 1px solid var(--rule); padding-bottom: .4rem; }
+    h3 { font-size: 1.02rem; margin-top: 1.6rem; color: var(--accent); }
+    .subtitle { color: var(--muted); margin-top: 0; }
+
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .87em; }
+    code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+    pre {
+      background: var(--code-bg);
+      padding: .9rem 1rem;
+      border-radius: 8px;
+      overflow-x: auto;
+      line-height: 1.5;
+      border: 1px solid var(--rule);
+    }
+    pre code { background: none; padding: 0; }
+
+    .add { color: var(--ok); }
+    .del { color: var(--bad); }
+    .cmt { color: var(--muted); }
+
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .92rem; }
+    th, td { border: 1px solid var(--rule); padding: .45rem .6rem; text-align: left; }
+    th { background: var(--code-bg); }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--rule);
+      border-radius: 10px;
+      padding: 1rem 1.2rem;
+      margin: 1rem 0;
+    }
+
+    .step-badge {
+      display: inline-block;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 999px;
+      width: 1.6em;
+      height: 1.6em;
+      line-height: 1.6em;
+      text-align: center;
+      font-weight: 600;
+      font-size: .85em;
+      margin-right: .5em;
+    }
+
+    .risk { border-left: 3px solid var(--bad); padding-left: .9rem; margin: .8rem 0; }
+    .note { border-left: 3px solid var(--warn); padding-left: .9rem; margin: .8rem 0; }
+    .good { color: var(--ok); }
+    .bad { color: var(--bad); }
+    .warn { color: var(--warn); }
+    .muted { color: var(--muted); }
+
+    ul { padding-left: 1.3rem; }
+    li { margin: .3rem 0; }
+
+    .toc { columns: 2; column-gap: 2rem; }
+    .toc a { color: var(--fg); text-decoration: none; }
+    .toc a:hover { color: var(--accent); }
+
+    .pair { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; margin: .7rem 0; }
+    .pair>div { border: 1px solid var(--rule); border-radius: 8px; padding: .6rem .8rem; font-size: .9rem; }
+    .pair .h { font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: .3rem; }
+    .win { border-left: 3px solid var(--ok); }
+    .lose { border-left: 3px solid var(--bad); }
+    .say { font-style: italic; }
+
+    @media (max-width: 620px) {
+      .pair { grid-template-columns: 1fr; }
+      .toc { columns: 1; }
+    }
+  </style>
+</head>
+
+<body>
+
+  <h1>Every row a pair</h1>
+  <p class="subtitle">Balancing the mask-track DPO set by construction instead of by loss weight &mdash;
+    <code>mask_dpo_data.py</code>, <code>dpo_qwen.py</code>, sweep <code>all</code>.</p>
+
+  <div class="card">
+    <strong>The change in one line.</strong> A row whose every sample the judge already scores 1.0 currently
+    makes no pair; instead of dropping it, borrow the policy's own best reply from a <em>sibling row</em> &mdash;
+    same sentence, same <code>slurp_id</code>, a different kind &mdash; as the <code>rejected</code> side. Every
+    one of the 3000 train rows then yields a pair, 1000 per kind, and
+    <code>dpo_qwen.py</code>'s per-kind loss weighting can be deleted rather than tuned.
+  </div>
+
+  <div class="card toc">
+    <a href="#now">1. Where the <code>hn</code> run stands</a><br>
+    <a href="#why">2. Why the weight is the wrong knob</a><br>
+    <a href="#borrow">3. The sibling-borrow rule</a><br>
+    <a href="#twopass">4. <code>mask_dpo_data.py</code>: two passes</a><br>
+    <a href="#dpo">5. <code>dpo_qwen.py</code>: delete the weights</a><br>
+    <a href="#wiring">6. Config and run wiring</a><br>
+    <a href="#expect">7. What the new set should look like</a><br>
+    <a href="#risk">8. Risks and what to watch</a><br>
+    <a href="#order">9. Order of work</a>
+  </div>
+
+  <h2 id="now">1. Where the <code>hn</code> run stands</h2>
+
+  <p>The ladder on <code>keylazy/slurp-mask-v2:test</code>, judged by <code>Qwen/Qwen3.8-27B</code>:</p>
+
+  <table>
+    <tr>
+      <th>model</th>
+      <th class="num">C</th>
+      <th class="num">R</th>
+      <th class="num">F</th>
+      <th class="num">EAR</th>
+    </tr>
+    <tr>
+      <td>base <code>Qwen2.5-Omni-3B</code></td>
+      <td class="num">0.668</td>
+      <td class="num">0.344</td>
+      <td class="num">0.405</td>
+      <td class="num">0.436</td>
+    </tr>
+    <tr>
+      <td><code>mask-v2-hn-sft</code></td>
+      <td class="num">0.840</td>
+      <td class="num">0.668</td>
+      <td class="num">0.915</td>
+      <td class="num">0.793</td>
+    </tr>
+    <tr>
+      <td><code>mask-v2-hn-dpo</code></td>
+      <td class="num">0.838</td>
+      <td class="num">0.723</td>
+      <td class="num">0.926</td>
+      <td class="num"><strong>0.820</strong></td>
+    </tr>
+  </table>
+
+  <p>DPO bought <span class="good">+5.5 R</span> at flat C, on 1309 pairs built from 3000 rows. The 1691 rows
+    that made no pair are not hard rows &mdash; they are the rows the SFT policy already gets right eight times
+    out of eight, and they are distributed very unevenly across the three kinds:</p>
+
+  <table>
+    <tr>
+      <th>kind</th>
+      <th class="num">rows</th>
+      <th class="num">pairs</th>
+      <th class="num">sampled</th>
+      <th class="num">gold-chosen</th>
+      <th class="num">minted</th>
+      <th class="num">dropped all-good</th>
+      <th class="num">loss weight</th>
+    </tr>
+    <tr>
+      <td><code>answer</code></td>
+      <td class="num">1000</td>
+      <td class="num">351</td>
+      <td class="num">146</td>
+      <td class="num">9</td>
+      <td class="num">196</td>
+      <td class="num">~649<sup>*</sup></td>
+      <td class="num">1.24</td>
+    </tr>
+    <tr>
+      <td><code>repair</code></td>
+      <td class="num">1000</td>
+      <td class="num">698</td>
+      <td class="num">653</td>
+      <td class="num">45</td>
+      <td class="num">0</td>
+      <td class="num">302</td>
+      <td class="num">0.63</td>
+    </tr>
+    <tr>
+      <td><code>repeat</code></td>
+      <td class="num">1000</td>
+      <td class="num">260</td>
+      <td class="num">253</td>
+      <td class="num">7</td>
+      <td class="num">0</td>
+      <td class="num">740</td>
+      <td class="num">1.68</td>
+    </tr>
+  </table>
+  <p class="muted"><sup>*</sup> <code>MINT_RATE = 0.25</code> converted 196 of ~845 all-good <code>answer</code>
+    rows into pairs; the rest were dropped.</p>
+
+  <h2 id="why">2. Why the weight is the wrong knob</h2>
+
+  <p>There are two compensations stacked on top of each other today, and each exists only because of the
+    other's blind spot:</p>
+
+  <ul>
+    <li><code>MINT_RATE = 0.25</code> in <code>mask_dpo_data.py</code> &mdash; a cap on how many
+      <em>hold&#8209;firm</em> pairs get made, because every minted negative was off-policy dataset text and the
+      <code>hf</code> run separated those to a 3 nats/token margin while repair@1 moved by three rows.</li>
+    <li>the per-kind weight in <code>dpo_qwen.py</code> &mdash; <code>len(prefs) / (n_kinds * n_kind[k])</code>,
+      because after that cap the surviving set is 53% <code>repair</code> and the run otherwise learns "ask a
+      question" as a prior (the first DPO run took the question rate on answerable rows from 12% to 73% and
+      dropped C from 0.79 to 0.75).</li>
+  </ul>
+
+  <p>A weight rebalances the <em>influence</em> of a kind but not its <em>content</em>. The
+    <code>repeat</code> third is currently built from 260 pairs seen ~4x more often than a <code>repair</code>
+    pair; the <code>answer</code> third is 56% off-policy dataset text. Weighting tells the loss that these
+    thirds are equal. It cannot make them equally informative, and it is a knob that has to be re-justified
+    every time the pair set's composition shifts.</p>
+
+  <div class="card">
+    <strong>The structural fix.</strong> The reason a row drops out is that the policy never fails on it under
+    <em>its own</em> audio. But the same policy, on the <em>sibling</em> audio of the same sentence, produces a
+    reply that is exactly the failure this row is about. That reply is already in hand &mdash; the script
+    samples all 3000 rows today and throws 1691 rows' samples away &mdash; so the negative costs nothing to
+    obtain and is on-policy by construction.
+  </div>
+
+  <h2 id="borrow">3. The sibling-borrow rule</h2>
+
+  <p>A train utterance contributes exactly three rows, one per kind, sharing <code>slurp_id</code>, sentence and
+    background, differing only in what the mask removed. So for any row there are always two siblings, and each
+    sibling's <em>correct</em> behaviour is a <em>wrong</em> behaviour here:</p>
+
+  <table>
+    <tr>
+      <th>this row</th>
+      <th>borrow from</th>
+      <th>why that is the failure that matters</th>
+    </tr>
+    <tr>
+      <td><code>answer</code><br><span class="muted">nothing critical missing</span></td>
+      <td><code>repeat</code> (0.7) else <code>repair</code></td>
+      <td>asking when the command was fully actionable &mdash; the C-drop DPO caused the first time</td>
+    </tr>
+    <tr>
+      <td><code>repair</code><br><span class="muted">one critical slot gone</span></td>
+      <td><code>answer</code> (0.7) else <code>repeat</code></td>
+      <td>acting confidently on a command with a hole in it &mdash; the hallucination the whole project is
+        about</td>
+    </tr>
+    <tr>
+      <td><code>repeat</code><br><span class="muted">two key pieces gone</span></td>
+      <td><code>repair</code> (0.7) else <code>answer</code></td>
+      <td>asking one targeted question when nothing in the utterance can be trusted</td>
+    </tr>
+  </table>
+
+  <p>The 0.7/0.3 split is today's <code>REPEAT_SHARE</code> generalized: the primary sibling is the sharpest
+    contrast, the secondary keeps the negatives from collapsing into one register.</p>
+
+  <div class="pair">
+    <div class="win">
+      <div class="h">chosen &mdash; policy on this <code>repair</code> row</div>
+      <p class="say">"Which city did you want the weather for?"</p>
+      <p class="muted">best of K=8, judge 1.0</p>
+    </div>
+    <div class="lose">
+      <div class="h">rejected &mdash; policy on the <code>answer</code> sibling</div>
+      <p class="say">"It's 18 degrees and cloudy in Seattle right now."</p>
+      <p class="muted">its own row's best sample &mdash; only the text is borrowed; the score is a fresh judge
+        call under this row's rubric (1.0 there, 0.0 here)</p>
+    </div>
+  </div>
+
+  <h3>Fallback chain</h3>
+  <ol>
+    <li>primary sibling's best sample (score 1.0 preferred, else its best)</li>
+    <li>secondary sibling's best sample</li>
+    <li>the sibling's written <code>target</code> from the dataset &mdash; today's behaviour, kept only for
+      utterances whose sibling produced nothing usable</li>
+    <li>nothing usable &rarr; drop the row, counted as <code>stats["no-sibling"]</code></li>
+  </ol>
+
+  <h3>The minted negative is judged, not assumed</h3>
+  <p>A borrowed reply is scored once under <em>this</em> row's rubric before it is written out. Three reasons,
+    and the cost is one extra judge call on a local vLLM box for the ~1800 rows that need it:</p>
+  <ul>
+    <li><code>rejected_score</code> in the JSONL stays a real number, so <code>results/viz.ipynb</code>-style
+      inspection of the pair set is still honest;</li>
+    <li>it enforces <code>MIN_MARGIN</code> uniformly &mdash; a borrowed reply that happens to score 1.0 here too
+      (a <code>repair</code> question that also works on the <code>repeat</code> row, say) is <em>not</em> a
+      negative and the row is dropped;</li>
+    <li>a borrow that scores 0.5 <em>here</em> is kept, and those are the hard negatives the <code>hn</code>
+      recipe was chasing in the first place &mdash; a <code>repair</code> sibling's one targeted question, read
+      under the <code>repeat</code> rubric, asked rather than hallucinated but asked about a single piece when
+      nothing in the utterance can be trusted. That is a 1.0-vs-0.5 pair, where an <code>answer</code> sibling's
+      confident reply borrowed onto a <code>repair</code> row is the easier 1.0-vs-0.0.</li>
+  </ul>
+
+  <h2 id="twopass">4. <code>mask_dpo_data.py</code>: two passes</h2>
+
+  <p>Borrowing a sibling's <em>sample</em> rather than its written target is the one thing that forces a
+    restructure: pass 1 cannot know a row's negative until every row's samples exist. The split is
+    sample/judge first, pair-and-score second.</p>
+
+  <pre><code><span class="cmt"># pass 1 -- unchanged work, new bookkeeping: nothing is dropped yet</span>
+best_by_row = {}          <span class="cmt"># row id -> {"text", "score"}  (for siblings to borrow)</span>
+scored_by_row = {}        <span class="cmt"># row id -> [{"text","score","reason"}, ...] sorted by score</span>
+for row in tqdm(ds, desc="sample"):
+    <span class="cmt"># write wav, sample_k, dedupe, judge K -- exactly today's block</span>
+    scored_by_row[row["id"]] = scored
+    best_by_row[row["id"]] = scored[-1]
+
+<span class="cmt"># sibling index: slurp_id -> kind -> row id. Built from the same</span>
+<span class="cmt"># select_columns scan that builds by_kind today.</span>
+sibling = defaultdict(dict)
+for i, r in enumerate(ds.select_columns(["id", "slurp_id", "kind"])):
+    sibling[r["slurp_id"]][r["kind"]] = r["id"]
+
+<span class="cmt"># pass 2 -- form the pair, judge a borrowed negative, ref-logprob both sides</span>
+for row in tqdm(ds, desc="pairs"):
+    scored = scored_by_row[row["id"]]
+    ...</code></pre>
+
+  <p>Pass 2 needs the audio again, for <code>ref_logprob</code>. Re-decode it from
+    <code>row["audio"]</code> and rewrite the tempfile &mdash; a few milliseconds a row against a generate call,
+    and it avoids parking 3000 wavs (~3 GB) on disk for the length of the run.</p>
+
+  <p>Keeping to the repo's no-single-use-module-function rule, the borrow logic replaces
+    <code>get_ans_negative</code> as a <code>def borrow_negative(row)</code> nested in <code>main()</code>,
+    closing over <code>sibling</code>, <code>best_by_row</code>, <code>rng</code> and the dataset's written
+    targets exactly as <code>get_ans_negative</code> closes over <code>repair_by_sid</code> today.</p>
+
+  <pre><code>BORROW_ORDER = {
+    "answer": ("repeat", "repair"),
+    "repair": ("answer", "repeat"),
+    "repeat": ("repair", "answer"),
+}
+PRIMARY_SHARE = 0.7   <span class="cmt"># was REPEAT_SHARE, now read for every kind</span>
+<span class="del">- MINT_RATE = 0.25    # deleted: every all-good row now mints</span></code></pre>
+
+  <p>The <code>pair_source</code> field gains the values <code>borrow-answer</code> /
+    <code>borrow-repair</code> / <code>borrow-repeat</code> (naming the sibling the text came from) and
+    <code>borrow-target</code> for the fallback-3 case; <code>mint-negative</code> goes away. The final report
+    keeps its shape &mdash; the share that is borrowed rather than sampled is the number that says what kind of
+    run this was &mdash; and the <code>gold-chosen &gt; 50%</code> warning stays as is.</p>
+
+  <div class="note">
+    <strong>Build cost is unchanged.</strong> The script already samples K=8 and judges every one of the 3000
+    rows; the 1691 dropped rows were paid for and thrown away. The only new spend is one judge call per borrowed
+    negative (~1800, parallel, local) and a second <code>ref_logprob</code> pair for rows that previously made no
+    pair.
+  </div>
+
+  <h2 id="dpo">5. <code>dpo_qwen.py</code>: delete the weights</h2>
+
+  <p>With 1000 pairs per kind the weight is 1.0 by construction, so the machinery comes out rather than
+    computing a no-op:</p>
+
+  <pre><code><span class="del">- n_kind = Counter(p["kind"] for p in prefs)</span>
+<span class="del">- for p in prefs:</span>
+<span class="del">-     p["weight"] = len(prefs) / (len(n_kind) * n_kind[p["kind"]])</span>
+<span class="add">+ n_kind = Counter(p["kind"] for p in prefs)   # printed, not applied</span>
+
+<span class="cmt"># PreferenceDataset.__getitem__</span>
+<span class="del">- "weight": pref["weight"],</span>
+
+<span class="cmt"># OmniDPOCollator.__call__</span>
+<span class="del">- batch["pair_weights"] = torch.tensor([ex["weight"] for ex in features], ...)</span>
+
+<span class="cmt"># DPOTrainer.compute_loss</span>
+<span class="del">- weights = inputs.pop("pair_weights").to(model.device)</span>
+<span class="del">- loss = -(weights * F.logsigmoid(self.beta * margin)).sum() / weights.sum()</span>
+<span class="add">+ loss = -F.logsigmoid(self.beta * margin).mean()</span></code></pre>
+
+  <p>The comment block above the deleted weighting carries the reason it existed (the 12% &rarr; 73% question-rate
+    blowup) &mdash; that history moves to a one-line note pointing at this document and at
+    <code>mask_dpo_data.py</code>'s borrow rule, which is where balance is now enforced. The
+    <code>kinds {...}</code> line in the startup print stays: an imbalanced Counter is now a <em>symptom</em>
+    (rows lost to <code>no-sibling</code> / <code>empty</code> / <code>logprob</code>) rather than a thing the
+    loss quietly absorbs. Worth a printed warning if any kind is more than 10% off <code>len(prefs)/3</code>.</p>
+
+  <h2 id="wiring">6. Config and run wiring</h2>
+
+  <p>The SFT adapter is untouched by all of this, so the new sweep suffix <code>all</code> marks the
+    <em>pair recipe</em> only and <code>sft_adapter</code> keeps pointing at the <code>hn</code> checkpoint.
+    In <code>configs/mask-crf.yaml</code>:</p>
+
+  <pre><code>sft_adapter: checkpoints/Qwen2.5-Omni-3B-mask-v2-hn-sft   <span class="cmt"># unchanged, shared with the hn sweep</span>
+<span class="del">- prefs: results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-hn-sft.jsonl</span>
+<span class="add">+ prefs: results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-all.jsonl</span>
+<span class="del">- dpo_run_name: Qwen2.5-Omni-3B-mask-v2-hn-dpo</span>
+<span class="add">+ dpo_run_name: Qwen2.5-Omni-3B-mask-v2-all-dpo</span>
+<span class="del">- dpo_epochs: 2</span>
+<span class="add">+ dpo_epochs: 1     # 3000 pairs at bs4 x accum2 ~= 375 steps, close to hn's 2-epoch count</span></code></pre>
+
+  <p>One new eval row, <code>configs/eval/mask-crf-dpo-all.yaml</code>: a copy of
+    <code>mask-crf-dpo.yaml</code> with <code>adapter_path: checkpoints/Qwen2.5-Omni-3B-mask-v2-all-dpo</code>
+    and <code>tag: mask-v2-hn</code> <em>kept</em> &mdash; the tag names the test set and the ladder, the result
+    filename already carries the adapter name, and changing it would split this row away from the base/SFT rows
+    it has to be read against.</p>
+
+  <p><code>exp/mask-crf.slurm</code> runs only the two stages that changed plus the one new eval; the base and
+    SFT rows are already on disk and re-running them would cost an hour to reproduce two numbers:</p>
+
+  <pre><code>conda activate qwen25omni
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+<span class="del">- python -u sft_qwen.py      --config $CFG</span>
+<span class="add">+ # python -u sft_qwen.py    --config $CFG   # the `all` sweep reuses the hn SFT adapter</span>
+python -u mask_dpo_data.py --config $CFG
+python -u dpo_qwen.py      --config $CFG
+
+<span class="del">- python -u mask_eval_qwen.py --config configs/eval/mask-crf-base.yaml</span>
+<span class="del">- python -u mask_eval_qwen.py --config configs/eval/mask-crf-sft.yaml</span>
+<span class="del">- python -u mask_eval_qwen.py --config configs/eval/mask-crf-dpo.yaml</span>
+<span class="add">+ # base and sft rows are unchanged under this sweep -- results/ already has them</span>
+<span class="add">+ python -u mask_eval_qwen.py --config configs/eval/mask-crf-dpo-all.yaml</span></code></pre>
+
+  <h2 id="expect">7. What the new set should look like</h2>
+
+  <p>Projecting the <code>hn</code> run's own counts forward (sampled and gold-chosen pairs are unaffected by
+    this change; every previously-dropped all-good row becomes a borrow):</p>
+
+  <table>
+    <tr>
+      <th>kind</th>
+      <th class="num">sampled</th>
+      <th class="num">gold-chosen</th>
+      <th class="num">borrowed</th>
+      <th class="num">total</th>
+      <th class="num">on-policy text</th>
+    </tr>
+    <tr>
+      <td><code>answer</code></td>
+      <td class="num">146</td>
+      <td class="num">9</td>
+      <td class="num">~845</td>
+      <td class="num">~1000</td>
+      <td class="num">~99%</td>
+    </tr>
+    <tr>
+      <td><code>repair</code></td>
+      <td class="num">653</td>
+      <td class="num">45</td>
+      <td class="num">~302</td>
+      <td class="num">~1000</td>
+      <td class="num">~96%</td>
+    </tr>
+    <tr>
+      <td><code>repeat</code></td>
+      <td class="num">253</td>
+      <td class="num">7</td>
+      <td class="num">~740</td>
+      <td class="num">~1000</td>
+      <td class="num">~99%</td>
+    </tr>
+  </table>
+
+  <p>Contrast with the alternative that was on the table &mdash; borrowing the sibling's written
+    <code>target</code> instead of its sample. That reaches the same 3000 pairs, but ~1800 of them would be
+    off-policy dataset text: 60% of the set made of exactly the pair the <code>hf</code> post-mortem showed
+    separating to a 3 nats/token margin without moving the metric. Borrowing samples buys the balance without
+    buying that.</p>
+
+  <h2 id="risk">8. Risks and what to watch</h2>
+
+  <div class="risk">
+    <strong>Easy pairs, runaway margin.</strong> A borrowed negative is a fluent, well-formed reply to a
+    <em>different</em> row, so it may be separable on surface cues (does it contain a question mark?) rather than
+    on the judgement the eval scores. <em>Watch:</em> <code>reward_acc</code> pinned at 1.0 inside the first
+    hundred steps, and <code>margin</code> climbing past ~1.5 nats/token. <em>Lever:</em> 1 epoch, half-epoch
+    checkpoints, and <code>dpo_beta</code> / <code>dpo_lr</code> unchanged so the comparison against
+    <code>hn</code> is about pair composition alone.
+  </div>
+
+  <div class="risk">
+    <strong>The pair set becomes a kind classifier.</strong> Two thirds of each kind's pairs now differ only in
+    which sibling the negative came from, which is close to training "pick the register that matches the amount
+    of damage". That is arguably the task &mdash; but if C and R both move while F collapses, the model has
+    learned the register and not the content. <em>Watch:</em> the per-kind C/R/F in the eval summary, not EAR.
+  </div>
+
+  <div class="risk">
+    <strong>Length asymmetry.</strong> <code>repeat</code> replies ("could you say the whole thing again?") are
+    systematically shorter than <code>answer</code> replies. Borrowing across kinds makes chosen/rejected length
+    differ by kind in a fixed direction. The loss is already per-token, which is the defence; a check on mean
+    token counts per side per kind in the finished JSONL is worth one cell.
+  </div>
+
+  <div class="note">
+    <strong>Sanity gate before the full DPO run.</strong> <code>mask_dpo_data.py</code>'s own report answers it:
+    ~3000 kept, ~1000 per kind, borrowed share ~60%, <code>gold-chosen</code> still under 5%. If the kept count
+    lands near 1300 again the sibling index is not joining &mdash; most likely a <code>slurp_id</code> present in
+    only one kind after the build's skips.
+  </div>
+
+  <h2 id="order">9. Order of work</h2>
+
+  <ol>
+    <li><span class="step-badge">1</span><strong>mask_dpo_data.py</strong> &mdash; split into pass 1 / pass 2,
+      add the sibling index, replace <code>get_ans_negative</code> with the nested
+      <code>borrow_negative</code>, judge the borrowed negative, drop <code>MINT_RATE</code>, extend
+      <code>pair_source</code>. Run it on <code>--num-rows 90</code> (30 utterances) first &mdash; enough to see
+      every borrow direction fire and the counts come out thirds.</li>
+    <li><span class="step-badge">2</span><strong>dpo_qwen.py</strong> &mdash; remove <code>weight</code> from the
+      dataset, collator and loss; add the imbalance warning.</li>
+    <li><span class="step-badge">3</span><strong>configs</strong> &mdash; the four <code>all</code> names in
+      <code>configs/mask-crf.yaml</code>, <code>dpo_epochs: 1</code>, new
+      <code>configs/eval/mask-crf-dpo-all.yaml</code>, trimmed <code>exp/mask-crf.slurm</code>.</li>
+    <li><span class="step-badge">4</span><strong>full pair build</strong> over all 3000 rows, then read the
+      report against the gate above.</li>
+    <li><span class="step-badge">5</span><strong>DPO + eval</strong>, and read the new row against
+      <code>hn</code>'s C 0.838 / R 0.723 / F 0.926 / EAR 0.820. The claim to be tested: the same or better EAR
+      with the loss weighting gone, i.e. balance coming from the data rather than from a coefficient.</li>
+  </ol>
+
+  <p class="muted">Decisions recorded: on-policy sibling samples over written targets; weighting deleted rather
+    than kept as a no-op; SFT adapter reused under a new <code>all</code> suffix; 1 epoch over 3000 pairs.</p>
+
+</body>
+
+</html>
