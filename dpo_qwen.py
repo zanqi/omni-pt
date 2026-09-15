@@ -70,7 +70,6 @@ class PreferenceDataset(torch.utils.data.Dataset):
             "rejected": pref["rejected"],
             "ref_logp_chosen": pref["ref_logp_chosen"],
             "ref_logp_rejected": pref["ref_logp_rejected"],
-            "weight": pref["weight"],
         }
 
 
@@ -94,10 +93,6 @@ class OmniDPOCollator(OmniSFTCollator):
             + [ex["ref_logp_rejected"] for ex in features],
             dtype=torch.float32,
         )
-        # one per pair, not per sequence
-        batch["pair_weights"] = torch.tensor(
-            [ex["weight"] for ex in features], dtype=torch.float32
-        )
         return batch
 
 
@@ -116,7 +111,6 @@ class DPOTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         ref_logps = inputs.pop("ref_logps").to(model.device)
-        weights = inputs.pop("pair_weights").to(model.device)
         labels = inputs.pop("labels")
         out = model(**inputs)
         # per-token, not summed: `rejected` is systematically the longer reply,
@@ -133,8 +127,10 @@ class DPOTrainer(Trainer):
         # the implicit reward is how much the policy moved from the reference
         # on each side; DPO only ever compares their difference
         margin = (pi_c - ref_c) - (pi_r - ref_r)
-        # weighted so every kind contributes equally; see main()
-        loss = -(weights * F.logsigmoid(self.beta * margin)).sum() / weights.sum()
+        # a plain mean: the kinds are equal in the pair set itself, one pair per
+        # train row, so there is nothing left for the loss to rebalance (see
+        # mask_dpo_data.py's borrow rule and steps/dpo-avoid-weight.html)
+        loss = -F.logsigmoid(self.beta * margin).mean()
 
         if not self._ref_gap_checked:
             # step 0 has the policy sitting exactly on the reference, so this
@@ -281,22 +277,23 @@ def main():
     if not prefs:
         raise SystemExit(f"no usable pairs in {args.prefs}")
 
-    # repair pairs outnumber answer pairs ~3:1 -- the SFT policy already
-    # answers most answerable rows perfectly, so those rows make no pair --
-    # and every repair `chosen` is a clarifying question. Unweighted, the run
-    # learns "ask a question" as a prior rather than as a response to a gap:
+    # the kinds used to be weighted here, because a set that is half `repair`
+    # teaches "ask a question" as a prior rather than as a response to a gap --
     # the first working DPO run took the question rate on answerable rows from
-    # 12% to 73% and dropped C from 0.79 to 0.75. Weighting by kind gives the
-    # two an equal say without discarding pairs.
+    # 12% to 73% and dropped C from 0.79 to 0.75. mask_dpo_data.py now makes one
+    # pair per train row, so the thirds are equal before the loss ever sees
+    # them, and an imbalance printed here is a symptom (rows lost to
+    # no-sibling / borrow-too-good / empty) rather than something to absorb.
     n_kind = Counter(p["kind"] for p in prefs)
-    for p in prefs:
-        p["weight"] = len(prefs) / (len(n_kind) * n_kind[p["kind"]])
-
     print(
-        f"{len(prefs)} pairs | kinds {n_kind} | "
-        f"weights { {k: round(len(prefs) / (len(n_kind) * v), 2) for k, v in n_kind.items()} } | "
+        f"{len(prefs)} pairs | kinds {dict(n_kind)} | "
         f"sources {Counter(p['pair_source'] for p in prefs)}"
     )
+    if max(n_kind.values()) - min(n_kind.values()) > 0.1 * len(prefs) / len(n_kind):
+        print(
+            "warning: the kinds are more than 10% apart and nothing reweights "
+            "them -- the largest kind carries that much more of the loss."
+        )
 
     processor = load_processor(args.omni_path, family)
     model_cls = get_sft_model_cls(family)

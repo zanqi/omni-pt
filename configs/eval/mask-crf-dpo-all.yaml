@@ -1,0 +1,25 @@
+# The `all`-sweep DPO row of the mask-crf ladder (exp/mask-crf.slurm): the
+# adapter dpo_qwen.py wrote from one preference pair per train row, with the
+# per-kind loss weight gone (steps/dpo-avoid-weight.html). It was trained in
+# place on top of the SFT adapter, so it loads alone onto the plain base.
+#
+# One eval run is one file, and the four mask-crf-*.yaml differ only in
+# adapter_path -- everything else has to match, or the rows are not a ladder.
+# That is also why `tag` stays mask-v2-hn: the tag names the test set the
+# ladder is read on, and the result filename already carries the adapter name.
+# They restate the dataset and the model rather than reading
+# configs/mask-crf.yaml: a result file outlives the track config, and the
+# eval that produced it should still say what it scored.
+#
+# Keys not declared by Config are dropped SILENTLY -- read the "config: ..."
+# line the script prints on start.
+
+omni_path: Qwen/Qwen2.5-Omni-3B
+adapter_path: checkpoints/Qwen2.5-Omni-3B-mask-v2-all-dpo
+
+ds_id: keylazy/slurp-mask-v2
+split: test
+num_rows: -1
+
+# names the result file: results/mask_results_<model-or-adapter>_<tag>.jsonl
+tag: mask-v2-hn

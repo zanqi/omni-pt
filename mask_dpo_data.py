@@ -7,16 +7,25 @@ scores with. The preference signal and the reported metric therefore agree by
 construction -- a pair that teaches the model something is a pair that moves
 C or R.
 
-  1. sample K responses per train row at temperature 1.0
-  2. score all K with the per-kind rubric (ANSWER_JUDGE_SYSTEM / REPAIR_JUDGE_SYSTEM)
-  3. chosen = best, rejected = the HARDEST losing sample -- the best one still
-     a full rubric step (MIN_MARGIN) below `chosen`, so a repair pair is
-     1-vs-0.5 rather than 1-vs-0 wherever the policy produced both
-  4. all-K-perfect rows are dropped, except that MINT_RATE of the answer ones
-     keep a written clarification as `rejected` (holding firm is a behaviour,
-     and the policy never fails at it on its own); rows where every sample tied
-     below 1.0 fall back to the dataset's written target as `chosen`, counted
-     separately because a set dominated by those is really just more SFT
+  1. pass 1 samples K responses per train row at temperature 1.0 and scores
+     all K with the per-kind rubric (ANSWER_/REPAIR_/REPEAT_JUDGE_SYSTEM).
+     Nothing is dropped here: a row the policy never fails on still holds the
+     reply a sibling row needs, and that is only known once every row is in.
+  2. pass 2 pairs them. chosen = best, rejected = the HARDEST losing sample --
+     the best one still a full rubric step (MIN_MARGIN) below `chosen`, so a
+     repair pair is 1-vs-0.5 rather than 1-vs-0 wherever the policy produced
+     both
+  3. a row whose every sample scores 1.0 borrows instead of dropping: the
+     negative is the policy's own best reply to a SIBLING row -- same sentence
+     and slurp_id, a different kind -- which is right there and wrong here (see
+     BORROW_ORDER). Only the text crosses over; it is re-judged under this
+     row's rubric, so `rejected_score` is real and MIN_MARGIN is enforced the
+     same way it is on a sampled pair. Every row then makes a pair and the
+     three kinds come out equal by construction, which is why dpo_qwen.py no
+     longer weights the loss by kind (steps/dpo-avoid-weight.html).
+  4. rows where every sample tied below 1.0 fall back to the dataset's written
+     target as `chosen`, counted separately because a set dominated by those is
+     really just more SFT
   5. reference log-probs for both sides, computed here while the SFT model is
      already resident -- that is exactly the DPO reference, so dpo_qwen.py
      never has to hold a second model
@@ -33,7 +42,7 @@ import json
 import os
 import random
 import tempfile
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -59,16 +68,27 @@ MAX_AUDIO_SECONDS = 30
 # forward pass on both; 0.5 is one rubric step
 MIN_MARGIN = 0.5
 JUDGE_WORKERS = 8
-REPEAT_SHARE = 0.7
-# share of all-good `answer` rows that mint a negative. dpo_qwen.py weights
-# pairs so each kind carries a third of the loss no matter how many pairs it
-# has, so capping this does NOT quiet the hold-firm signal -- it decides what
-# that third is made of. Uncapped it was 803 of 1000 answer pairs (42% of the
-# whole set), every one of them dataset text the policy would never emit, and
-# the -hf run separated them to a 3 nats/token margin while repair@1 moved by
-# 3 rows out of 400. At 0.25 the answer third is mostly sampled rows the
-# policy actually got wrong.
-MINT_RATE = 0.25
+# which sibling kind a borrowed negative is taken from, primary first. Each
+# sibling's correct behaviour is this row's failure: acting confidently on a
+# command with a hole in it (repair borrows from answer), asking when nothing
+# critical was missing (answer borrows from repeat), asking one targeted
+# question when nothing in the utterance can be trusted (repeat borrows from
+# repair).
+BORROW_ORDER = {
+    "answer": ("repeat", "repair"),
+    "repair": ("answer", "repeat"),
+    "repeat": ("repair", "answer"),
+}
+# how often the primary sibling wins; the secondary keeps the negatives of one
+# kind from collapsing into a single register. Was REPEAT_SHARE, which said the
+# same thing for `answer` rows alone.
+PRIMARY_SHARE = 0.7
+# what the borrowed text may cost: the previous recipe capped minted negatives
+# at 25% of the all-good `answer` rows because every one of them was off-policy
+# dataset text, and the -hf run separated those to a 3 nats/token margin while
+# repair@1 moved by 3 rows out of 400. A sibling's SAMPLE is text this policy
+# actually emits, so there is nothing left to cap -- the written target is only
+# the fallback for a sibling that produced nothing usable.
 
 
 @dataclass
@@ -269,140 +289,169 @@ def main():
             )
         ]
 
-    # === get ans negative ===
+    def row_wav(row):
+        """row audio -> a temp wav path the omni processor can read; the caller
+        removes it. Pass 2 re-decodes rather than keeping every wav from pass 1
+        alive, which would be ~3 GB on disk for the length of the run."""
+
+        arr, sr = get_audio(row["audio"])
+        arr = arr[: MAX_AUDIO_SECONDS * AUDIO_SAMPLING_RATE]
+        fd, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        sf.write(wav_path, arr, sr)
+        return wav_path
+
+    # === pass 1: sample and judge every row ===
     #
-    # kind -> slurp_id -> target
-    by_kind = {"repeat": {}, "repair": {}}
-    for r in ds.select_columns(["kind", "slurp_id", "target"]):
-        if r["kind"] in by_kind and r["target"]:
-            by_kind[r["kind"]][r["slurp_id"]] = r["target"]
-    repair_by_sid, repeat_by_sid = by_kind["repair"], by_kind["repeat"]
+    # Nothing is dropped for being easy here. A row the policy never fails on
+    # makes no pair of its own, but its best reply is exactly the negative a
+    # sibling row needs, and which rows those are is not known until the whole
+    # split has been sampled.
+    scored_by_row, stats = {}, Counter()
+    for row in tqdm(ds, desc="sample", unit="row", dynamic_ncols=True):
+        wav_path = row_wav(row)
+        try:
+            samples = sample_k(wav_path, args.samples)
+        finally:
+            os.remove(wav_path)
+
+        # dedupe before judging: identical samples cost a judge call each and
+        # can never form a pair with each other
+        uniq = list(dict.fromkeys(s for s in samples if s))
+        if not uniq:
+            stats["empty"] += 1
+            continue
+
+        with ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as ex:
+            judged = list(
+                ex.map(
+                    lambda s: judge_fn(JUDGE_BY_KIND[row["kind"]], judge_user(row, s)),
+                    uniq,
+                )
+            )
+
+        # score only, and a stable sort, so ties keep sampling order. Breaking
+        # them on length made `chosen` the shortest sample of the top score and
+        # `rejected` the longest of the bottom one, which teaches brevity as
+        # much as it teaches repair.
+        scored_by_row[row["id"]] = sorted(
+            ({"text": s, "score": j[0], "reason": j[1]} for s, j in zip(uniq, judged)),
+            key=lambda d: d["score"],
+        )
+
+    # === pass 2: pair each row, borrowing where the policy never failed ===
+    #
+    # slurp_id -> kind -> row id, plus the written target behind each id: a
+    # borrow falls back to the sibling's dataset text when the sibling itself
+    # sampled empty.
+    sibling, target_of = defaultdict(dict), {}
+    for r in ds.select_columns(["id", "slurp_id", "kind", "target"]):
+        sibling[r["slurp_id"]][r["kind"]] = r["id"]
+        target_of[r["id"]] = r["target"]
     rng = random.Random(0)
 
-    def get_ans_negative(row):
-        sid = row["slurp_id"]
+    def borrow_negative(row, chosen_text):
+        """(text, pair_source) for a row the policy gets right every time.
 
-        want_repeat = rng.random() < REPEAT_SHARE
-        first, second = (
-            (repeat_by_sid, repair_by_sid)
-            if want_repeat
-            else (repair_by_sid, repeat_by_sid)
-        )
+        Only the text crosses over. The caller re-judges it under THIS row's
+        rubric, so a borrow that happens to work here too is thrown out rather
+        than written as a 1-vs-1 pair, and one that lands on 0.5 -- a repair
+        question read under the repeat rubric, say -- is kept as the hard
+        negative it is.
+        """
 
-        # first kind choice > second kind choice
-        # > repeat pool
-        return (
-            first.get(sid)
-            or second.get(sid)
-            or rng.choice(list(repeat_by_sid.values()))
-        )
+        sibs = sibling[row["slurp_id"]]
+        order = BORROW_ORDER[row["kind"]]
+        if rng.random() >= PRIMARY_SHARE:
+            order = order[::-1]
 
-    # ===
+        # the sibling's own best sample first: on-policy text, and the right
+        # reply on its own row, so the pair is "right behaviour, wrong row"
+        # rather than "good reply vs bad reply"
+        for kind in order:
+            cand = scored_by_row.get(sibs.get(kind))
+            if cand and cand[-1]["text"] != chosen_text:
+                return cand[-1]["text"], f"borrow-{kind}"
+        for kind in order:
+            text = target_of.get(sibs.get(kind))
+            if text and text != chosen_text:
+                return text, "borrow-target"
+        return None, None
 
-    kept, stats = 0, Counter()
+    kept = 0
     with open(out_path, "w", encoding="utf-8") as fout:
         for row in tqdm(ds, desc="pairs", unit="row", dynamic_ncols=True):
-            arr, sr = get_audio(row["audio"])
-            arr = arr[: MAX_AUDIO_SECONDS * AUDIO_SAMPLING_RATE]
-            fd, wav_path = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
+            scored = scored_by_row.get(row["id"])
+            if not scored:
+                continue  # sampled empty in pass 1, already counted there
 
-            try:
-                sf.write(wav_path, arr, sr)
-                samples = sample_k(wav_path, args.samples)
+            best = scored[-1]
+            # the hardest negative, not the worst sample. On the rubric's
+            # {0, 0.5, 1} steps `scored[0]` made most repair pairs 1-vs-0,
+            # a distinction the SFT policy already makes; the pair that is
+            # still open is 1-vs-0.5 -- asks for clarification, but not
+            # about the piece that went missing -- which is where 37% of
+            # the eval's repair rows sit. One rubric step down is still
+            # MIN_MARGIN, so the filter is what picks the side.
+            losing = [s for s in scored if best["score"] - s["score"] >= MIN_MARGIN]
+            worst = losing[-1] if losing else scored[0]
 
-                # dedupe before judging: identical samples cost a judge call
-                # each and can never form a pair with each other
-                uniq = list(dict.fromkeys(s for s in samples if s))
-                if not uniq:
-                    stats["empty"] += 1
-                    continue
+            pair_source = "sampled"
+            if best["score"] - worst["score"] < MIN_MARGIN:
+                # this means best == worst when min margin is 0.5
 
-                with ThreadPoolExecutor(max_workers=JUDGE_WORKERS) as ex:
-                    judged = list(
-                        ex.map(
-                            lambda s: judge_fn(
-                                JUDGE_BY_KIND[row["kind"]], judge_user(row, s)
-                            ),
-                            uniq,
-                        )
-                    )
-
-                # score only, and a stable sort, so ties keep sampling order.
-                # Breaking them on length made `chosen` the shortest sample of
-                # the top score and `rejected` the longest of the bottom one,
-                # which teaches brevity as much as it teaches repair.
-                scored = sorted(
-                    (
-                        {"text": s, "score": j[0], "reason": j[1]}
-                        for s, j in zip(uniq, judged)
-                    ),
-                    key=lambda d: d["score"],
-                )
-                best = scored[-1]
-                # the hardest negative, not the worst sample. On the rubric's
-                # {0, 0.5, 1} steps `scored[0]` made most repair pairs 1-vs-0,
-                # a distinction the SFT policy already makes; the pair that is
-                # still open is 1-vs-0.5 -- asks for clarification, but not
-                # about the piece that went missing -- which is where 37% of
-                # the eval's repair rows sit. One rubric step down is still
-                # MIN_MARGIN, so the filter is what picks the side.
-                losing = [s for s in scored if best["score"] - s["score"] >= MIN_MARGIN]
-                worst = losing[-1] if losing else scored[0]
-
-                pair_source = "sampled"
-                if best["score"] - worst["score"] < MIN_MARGIN:
-                    # this means best == worst when min margin is 0.5
-
-                    if worst["score"] >= 1.0:
-                        # worst == best == 1.0
-                        # the policy already gets this audio right every time
-                        if row["kind"] != "answer" or rng.random() >= MINT_RATE:
-                            stats["all-good"] += 1
-                            continue
-
-                        # pick a non-answer resp from the other 2 of the triplet
-                        worst = {
-                            "text": get_ans_negative(row),
-                            "score": 0.0,
-                            "reason": "clarify on an answerable row",
-                        }
-                        pair_source = "mint-negative"
-
-                    elif not row.get("target"):
-                        stats["all-bad-no-target"] += 1
+                if worst["score"] >= 1.0:
+                    # worst == best == 1.0: the policy already gets this audio
+                    # right every time, so the negative has to come from a
+                    # sibling row rather than from this one
+                    text, pair_source = borrow_negative(row, best["text"])
+                    if text is None:
+                        stats["no-sibling"] += 1
                         continue
-                    else:
-                        # every sample landed on the same sub-perfect score:
-                        # all-0 (nothing usable was sampled) or all-0.5 (the
-                        # policy always asks and never on target -- again the
-                        # repair@0.5 bucket the eval is stuck in, which used
-                        # to be dropped as "flat"). Either way the written
-                        # target is the only better reply on hand.
-                        best = {
-                            "text": row["target"],
-                            "score": 1.0,
-                            "reason": "dataset target",
-                        }
-                        pair_source = "gold-chosen"
 
+                    score, reason = judge_fn(
+                        JUDGE_BY_KIND[row["kind"]], judge_user(row, text)
+                    )
+                    if best["score"] - score < MIN_MARGIN:
+                        # the borrowed reply serves this row too -- not a
+                        # negative, whatever it was on its own row
+                        stats["borrow-too-good"] += 1
+                        continue
+                    worst = {"text": text, "score": score, "reason": reason}
+
+                elif not row.get("target"):
+                    stats["all-bad-no-target"] += 1
+                    continue
+                else:
+                    # every sample landed on the same sub-perfect score:
+                    # all-0 (nothing usable was sampled) or all-0.5 (the
+                    # policy always asks and never on target -- again the
+                    # repair@0.5 bucket the eval is stuck in, which used
+                    # to be dropped as "flat"). Either way the written
+                    # target is the only better reply on hand.
+                    best = {
+                        "text": row["target"],
+                        "score": 1.0,
+                        "reason": "dataset target",
+                    }
+                    pair_source = "gold-chosen"
+
+            # the audio is only needed from here: both sides are settled, and a
+            # row dropped above never pays for a decode
+            wav_path = row_wav(row)
+            try:
                 ref_c = ref_logprob(
                     model, processor, wav_path, task_prompt, best["text"], sys_prompt
                 )
                 ref_r = ref_logprob(
-                    model,
-                    processor,
-                    wav_path,
-                    task_prompt,
-                    worst["text"],
-                    sys_prompt,
+                    model, processor, wav_path, task_prompt, worst["text"], sys_prompt
                 )
-
-                if ref_c is None or ref_r is None:
-                    stats["logprob"] += 1
-                    continue
             finally:
                 os.remove(wav_path)
+
+            if ref_c is None or ref_r is None:
+                stats["logprob"] += 1
+                continue
 
             fout.write(
                 json.dumps(
@@ -422,7 +471,7 @@ def main():
                         "ref_logp_chosen": ref_c,
                         "ref_logp_rejected": ref_r,
                         "pair_source": pair_source,
-                        "n_sampled": len(uniq),
+                        "n_sampled": len(scored),
                     },
                     ensure_ascii=False,
                 )
@@ -435,16 +484,25 @@ def main():
 
     print(f"\nkept {kept}/{len(ds)} pairs -> {out_path}")
     print(f"breakdown: {dict(stats)}")
-    # the minted share is the fix itself, so report it rather than leaving it
-    # to a grep over the JSONL: a run that mints nothing has silently fallen
-    # back to the old pair set, and one dominated by them is a different kind
-    # of run -- every minted negative is off-policy dataset text
+    # the two numbers that say what kind of run this was. dpo_qwen.py no longer
+    # weights by kind, so a set that is not thirds is not balanced by anything
+    # downstream -- and the borrowed share is the recipe itself: near zero means
+    # the sibling index never joined (a slurp_id left with one kind after the
+    # build's skips), near 100% means the policy failed nowhere on its own.
     if kept:
+        borrowed = sum(v for k, v in stats.items() if k.startswith("borrow-"))
+        by_kind = {k: stats[f"{k}-pair"] for k in BORROW_ORDER}
         print(
-            f"mint-negative: {stats['mint-negative']}/{kept} "
-            f"({stats['mint-negative'] / kept:.0%}) of pairs hold firm on an "
-            "answerable row the policy never gets wrong"
+            f"borrowed: {borrowed}/{kept} ({borrowed / kept:.0%}) of pairs take "
+            "their negative from a sibling row the policy never fails on"
         )
+        print(f"kinds: {by_kind}")
+        if max(by_kind.values()) - min(by_kind.values()) > 0.1 * kept / 3:
+            print(
+                "warning: the kinds are more than 10% apart. DPO weights them "
+                "equally per pair, so an imbalance here is an imbalance in the "
+                "loss -- check the no-sibling / borrow-too-good / empty counts."
+            )
     if stats["gold-chosen"] > kept * 0.5:
         print(
             "warning: over half the pairs use the written target as `chosen`. "

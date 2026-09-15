@@ -41,7 +41,10 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 conda activate qwen25omni
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-python -u sft_qwen.py      --config $CFG
+# the `all` sweep changes the pair recipe, not the SFT adapter: sft_adapter in
+# the config still names the -hn-sft checkpoint, and retraining it would cost
+# an hour to reproduce the same weights.
+# python -u sft_qwen.py    --config $CFG
 python -u mask_dpo_data.py --config $CFG
 python -u dpo_qwen.py      --config $CFG
 
@@ -49,9 +52,12 @@ python -u dpo_qwen.py      --config $CFG
 # numbers mean anything. Which model a row evaluates is not a property of the
 # track, so each row is its own file under configs/eval/; the three differ
 # only in adapter_path.
-python -u mask_eval_qwen.py --config configs/eval/mask-crf-base.yaml
-python -u mask_eval_qwen.py --config configs/eval/mask-crf-sft.yaml
-python -u mask_eval_qwen.py --config configs/eval/mask-crf-dpo.yaml
+# base, sft and the `hn` dpo row are already in results/ and are unchanged by
+# this sweep -- only the new adapter needs scoring.
+# python -u mask_eval_qwen.py --config configs/eval/mask-crf-base.yaml
+# python -u mask_eval_qwen.py --config configs/eval/mask-crf-sft.yaml
+# python -u mask_eval_qwen.py --config configs/eval/mask-crf-dpo.yaml
+python -u mask_eval_qwen.py --config configs/eval/mask-crf-dpo-all.yaml
 
 # cross-track transfer, if wanted: the mask test split was built leak-free
 # against both of these adapters' training sentences (mask_data.py

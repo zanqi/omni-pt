@@ -7,14 +7,16 @@
 #   ./exp/mask-crf.slurm
 #   sbatch exp/mask-crf.slurm
 #
-# Every stage's output name carries the sweep suffix -- currently `hn`, the
-# hard-negative pair recipe (mask_dpo_data.py picks `rejected` as the best
-# sample still a rubric step below `chosen`, and mints a negative on only
-# MINT_RATE of the all-good answer rows). Re-running a stage overwrites that
-# sweep's files, so a new recipe bumps the suffix in the four names below --
-# repair_repo_name, sft_adapter, prefs, dpo_run_name -- rather than landing on
-# top of the `hf` sweep the paper tables already read, and in the adapter_path
-# and tag of the three configs/eval/mask-crf-*.yaml that score them.
+# Every stage's output name carries the sweep suffix. The build and the SFT
+# adapter are still `hn`; the pair set and the DPO adapter are `all`, the
+# every-row recipe (steps/dpo-avoid-weight.html): a row the policy never fails
+# on borrows its negative from a sibling row instead of dropping, so all 3000
+# train rows make a pair, 1000 per kind, and dpo_qwen.py no longer weights the
+# loss by kind. The suffix names the stage's own recipe, which is why
+# sft_adapter below still reads -hn-: this sweep reuses that checkpoint rather
+# than retraining an identical one. Re-running a stage overwrites that sweep's
+# files, so a new recipe bumps the suffix here and in the adapter_path and tag
+# of the configs/eval/mask-crf-*.yaml that score it.
 #
 # Keys not declared by a stage's Config dataclass are dropped SILENTLY -- read
 # the "config: ..." line each script prints on start.
@@ -42,10 +44,13 @@ repair_lr: 2.0e-4
 # on it. dpo_lr is an order below repair_lr: 5e-6, the full-model DPO figure,
 # moved a rank-16 LoRA by ~1% of what SFT moved it and scored exactly SFT.
 sft_adapter: checkpoints/Qwen2.5-Omni-3B-mask-v2-hn-sft
-prefs: results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-hn-sft.jsonl
+prefs: results/mask_prefs_Qwen2.5-Omni-3B-mask-v2-all.jsonl
 dpo_samples: 8
-dpo_run_name: Qwen2.5-Omni-3B-mask-v2-hn-dpo
-dpo_epochs: 2
+dpo_run_name: Qwen2.5-Omni-3B-mask-v2-all-dpo
+# 1, not 2: the pair set went 1309 -> ~3000, so one epoch is ~375 optimizer
+# steps -- about what the `hn` run took in two -- and the comparison stays about
+# pair composition rather than training length
+dpo_epochs: 1
 dpo_lr: 2.0e-5
 dpo_beta: 1.0
 
